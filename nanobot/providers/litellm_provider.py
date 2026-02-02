@@ -13,7 +13,7 @@ class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
     
-    Supports OpenRouter, Anthropic, OpenAI, and many other providers through
+    Supports OpenRouter, Anthropic, OpenAI, Gemini, and many other providers through
     a unified interface.
     """
     
@@ -32,15 +32,23 @@ class LiteLLMProvider(LLMProvider):
             (api_base and "openrouter" in api_base)
         )
         
+        # Track if using custom endpoint (vLLM, etc.)
+        self.is_vllm = bool(api_base) and not self.is_openrouter
+        
         # Configure LiteLLM based on provider
         if api_key:
             if self.is_openrouter:
                 # OpenRouter mode - set key
                 os.environ["OPENROUTER_API_KEY"] = api_key
+            elif self.is_vllm:
+                # vLLM/custom endpoint - uses OpenAI-compatible API
+                os.environ["OPENAI_API_KEY"] = api_key
             elif "anthropic" in default_model:
                 os.environ.setdefault("ANTHROPIC_API_KEY", api_key)
             elif "openai" in default_model or "gpt" in default_model:
                 os.environ.setdefault("OPENAI_API_KEY", api_key)
+            elif "gemini" in default_model.lower():
+                os.environ.setdefault("GEMINI_API_KEY", api_key)
         
         if api_base:
             litellm.api_base = api_base
@@ -75,12 +83,25 @@ class LiteLLMProvider(LLMProvider):
         if self.is_openrouter and not model.startswith("openrouter/"):
             model = f"openrouter/{model}"
         
+        # For vLLM, use hosted_vllm/ prefix per LiteLLM docs
+        # Convert openai/ prefix to hosted_vllm/ if user specified it
+        if self.is_vllm:
+            model = f"hosted_vllm/{model}"
+        
+        # For Gemini, ensure gemini/ prefix if not already present
+        if "gemini" in model.lower() and not model.startswith("gemini/"):
+            model = f"gemini/{model}"
+        
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        
+        # Pass api_base directly for custom endpoints (vLLM, etc.)
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
         
         if tools:
             kwargs["tools"] = tools

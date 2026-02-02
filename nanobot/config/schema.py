@@ -19,10 +19,20 @@ class TelegramConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
 
 
+class DiscordConfig(BaseModel):
+    """Discord channel configuration."""
+    enabled: bool = False
+    token: str = ""  # Bot token from Discord Developer Portal
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
+    gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+    intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    discord: DiscordConfig = Field(default_factory=DiscordConfig)
 
 
 class AgentDefaults(BaseModel):
@@ -50,12 +60,14 @@ class ProvidersConfig(BaseModel):
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
+    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
+    gemini: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
 class GatewayConfig(BaseModel):
     """Gateway/server configuration."""
     host: str = "0.0.0.0"
-    port: int = 18790
+    port: int = 18789
 
 
 class WebSearchConfig(BaseModel):
@@ -88,18 +100,22 @@ class Config(BaseSettings):
         return Path(self.agents.defaults.workspace).expanduser()
     
     def get_api_key(self) -> str | None:
-        """Get API key in priority order: OpenRouter > Anthropic > OpenAI."""
+        """Get API key in priority order: OpenRouter > Anthropic > OpenAI > Gemini > vLLM."""
         return (
             self.providers.openrouter.api_key or
             self.providers.anthropic.api_key or
             self.providers.openai.api_key or
+            self.providers.gemini.api_key or
+            self.providers.vllm.api_key or
             None
         )
     
     def get_api_base(self) -> str | None:
-        """Get API base URL if using OpenRouter."""
+        """Get API base URL if using OpenRouter or vLLM."""
         if self.providers.openrouter.api_key:
             return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
+        if self.providers.vllm.api_base:
+            return self.providers.vllm.api_base
         return None
     
     class Config:

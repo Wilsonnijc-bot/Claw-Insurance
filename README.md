@@ -116,13 +116,51 @@ nanobot agent -m "What is 2+2?"
 
 That's it! You have a working AI assistant in 2 minutes.
 
+## 🖥️ Local Models (vLLM)
+
+Run nanobot with your own local models using vLLM or any OpenAI-compatible server.
+
+**1. Start your vLLM server**
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000
+```
+
+**2. Configure** (`~/.nanobot/config.json`)
+
+```json
+{
+  "providers": {
+    "vllm": {
+      "apiKey": "dummy",
+      "apiBase": "http://localhost:8000/v1"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "meta-llama/Llama-3.1-8B-Instruct"
+    }
+  }
+}
+```
+
+**3. Chat**
+
+```bash
+nanobot agent -m "Hello from my local LLM!"
+```
+
+> [!TIP]
+> The `apiKey` can be any non-empty string for local servers that don't require authentication.
+
 ## 💬 Chat Apps
 
-Talk to your nanobot through Telegram or WhatsApp — anytime, anywhere.
+Talk to your nanobot through Telegram, Discord, or WhatsApp — anytime, anywhere.
 
 | Channel | Setup |
 |---------|-------|
 | **Telegram** | Easy (just a token) |
+| **Discord** | Easy (bot token + intents) |
 | **WhatsApp** | Medium (scan QR) |
 
 <details>
@@ -150,6 +188,51 @@ Talk to your nanobot through Telegram or WhatsApp — anytime, anywhere.
 > Get your user ID from `@userinfobot` on Telegram.
 
 **3. Run**
+
+```bash
+nanobot gateway
+```
+
+</details>
+
+<details>
+<summary><b>Discord</b></summary>
+
+**1. Create a bot**
+- Go to https://discord.com/developers/applications
+- Create an application → Bot → Add Bot
+- Copy the bot token
+
+**2. Enable intents**
+- In the Bot settings, enable **MESSAGE CONTENT INTENT**
+- (Optional) Enable **SERVER MEMBERS INTENT** if you plan to use allow lists based on member data
+
+**3. Configure**
+
+```json
+{
+  "channels": {
+    "discord": {
+      "enabled": true,
+      "token": "YOUR_BOT_TOKEN",
+      "allowFrom": ["YOUR_USER_ID"]
+    }
+  }
+}
+```
+
+**Limitations (current implementation)**
+- Global allowlist only (`allowFrom`); no `groupPolicy`, `dm.policy`, or per-guild/per-channel rules
+- No `requireMention` or per-channel enable/disable
+- Outbound messages are text only (no file uploads)
+
+**4. Invite the bot**
+- OAuth2 → URL Generator
+- Scopes: `bot`
+- Bot Permissions: `Send Messages`, `Read Message History`
+- Open the generated invite URL and add the bot to your server
+
+**5. Run**
 
 ```bash
 nanobot gateway
@@ -216,6 +299,11 @@ nanobot gateway
       "enabled": true,
       "token": "123456:ABC...",
       "allowFrom": ["123456789"]
+    },
+    "discord": {
+      "enabled": false,
+      "token": "YOUR_DISCORD_BOT_TOKEN",
+      "allowFrom": ["YOUR_USER_ID"]
     },
     "whatsapp": {
       "enabled": false
@@ -293,6 +381,24 @@ nanobot/
 - [ ] **Self-improvement** — Learn from feedback and mistakes
 
 **Want to help?** Pick an item and [open a PR](https://github.com/HKUDS/nanobot/pulls)!
+
+---
+
+## ⭐ Star History
+
+*Community Growth Trajectory*
+
+<div align="center">
+  <a href="https://star-history.com/#HKUDS/nanobot&Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=HKUDS/nanobot&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=HKUDS/nanobot&type=Date" />
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=HKUDS/nanobot&type=Date" style="border-radius: 15px; box-shadow: 0 0 30px rgba(0, 217, 255, 0.3);" />
+    </picture>
+  </a>
+</div>
+
+---
 
 ## 🤝 Contribute
 
