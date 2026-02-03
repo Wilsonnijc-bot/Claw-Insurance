@@ -154,7 +154,7 @@ This file stores important information that should persist across sessions.
 
 @app.command()
 def gateway(
-    port: int = typer.Option(18789, "--port", "-p", help="Gateway port"),
+    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
@@ -362,20 +362,6 @@ def channels_status():
         "✓" if wa.enabled else "✗",
         wa.bridge_url
     )
-
-    tg = config.channels.telegram
-    table.add_row(
-        "Telegram",
-        "✓" if tg.enabled else "✗",
-        "polling"
-    )
-
-    dc = config.channels.discord
-    table.add_row(
-        "Discord",
-        "✓" if dc.enabled else "✗",
-        dc.gateway_url
-    )
     
     console.print(table)
 
@@ -520,6 +506,7 @@ def cron_add(
     at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
     deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel"),
     to: str = typer.Option(None, "--to", help="Recipient for delivery"),
+    channel: str = typer.Option(None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"),
 ):
     """Add a scheduled job."""
     from nanobot.config.loader import get_data_dir
@@ -548,6 +535,7 @@ def cron_add(
         message=message,
         deliver=deliver,
         to=to,
+        channel=channel,
     )
     
     console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")

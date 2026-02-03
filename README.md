@@ -60,6 +60,12 @@
 
 ## 📦 Install
 
+**Install with [uv](https://github.com/astral-sh/uv)** (recommended for speed)
+
+```bash
+uv tool install nanobot-ai
+```
+
 **Install from PyPi**
 
 ```bash
@@ -74,12 +80,19 @@ cd nanobot
 pip install -e .
 ```
 
+**Install with uv**
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install nanobot-ai
+```
+
 ## 🚀 Quick Start
 
 > [!TIP]
 > Set your API key in `~/.nanobot/config.json`.
-> Get API keys: [OpenRouter](https://openrouter.ai/keys) (LLM) · [Brave Search](https://brave.com/search/api/) (optional, for web search)
-> You can also change the model to `minimax/minimax-m2` for lower cost.
+> Get API keys: [DashScope](https://dashscope.console.aliyun.com) (China) · [OpenRouter](https://openrouter.ai/keys) (Global) · [Brave Search](https://brave.com/search/api/) (optional, for web search)
 
 **1. Initialize**
 
@@ -89,6 +102,7 @@ nanobot onboard
 
 **2. Configure** (`~/.nanobot/config.json`)
 
+For OpenRouter - recommended for global users:
 ```json
 {
   "providers": {
@@ -100,9 +114,22 @@ nanobot onboard
     "defaults": {
       "model": "anthropic/claude-opus-4-5"
     }
+  }
+}
+```
+
+For DashScope - recommended for China users:
+```json
+{
+  "providers": {
+    "dashscope": {
+      "apiKey": "sk-xxx"
+    }
   },
-  "webSearch": {
-    "apiKey": "BSA-xxx"
+  "agents": {
+    "defaults": {
+      "model": "qwen-plus"
+    }
   }
 }
 ```
@@ -155,12 +182,11 @@ nanobot agent -m "Hello from my local LLM!"
 
 ## 💬 Chat Apps
 
-Talk to your nanobot through Telegram, Discord, or WhatsApp — anytime, anywhere.
+Talk to your nanobot through Telegram or WhatsApp — anytime, anywhere.
 
 | Channel | Setup |
 |---------|-------|
 | **Telegram** | Easy (just a token) |
-| **Discord** | Easy (bot token + intents) |
 | **WhatsApp** | Medium (scan QR) |
 
 <details>
@@ -188,51 +214,6 @@ Talk to your nanobot through Telegram, Discord, or WhatsApp — anytime, anywher
 > Get your user ID from `@userinfobot` on Telegram.
 
 **3. Run**
-
-```bash
-nanobot gateway
-```
-
-</details>
-
-<details>
-<summary><b>Discord</b></summary>
-
-**1. Create a bot**
-- Go to https://discord.com/developers/applications
-- Create an application → Bot → Add Bot
-- Copy the bot token
-
-**2. Enable intents**
-- In the Bot settings, enable **MESSAGE CONTENT INTENT**
-- (Optional) Enable **SERVER MEMBERS INTENT** if you plan to use allow lists based on member data
-
-**3. Configure**
-
-```json
-{
-  "channels": {
-    "discord": {
-      "enabled": true,
-      "token": "YOUR_BOT_TOKEN",
-      "allowFrom": ["YOUR_USER_ID"]
-    }
-  }
-}
-```
-
-**Limitations (current implementation)**
-- Global allowlist only (`allowFrom`); no `groupPolicy`, `dm.policy`, or per-guild/per-channel rules
-- No `requireMention` or per-channel enable/disable
-- Outbound messages are text only (no file uploads)
-
-**4. Invite the bot**
-- OAuth2 → URL Generator
-- Scopes: `bot`
-- Bot Permissions: `Send Messages`, `Read Message History`
-- Open the generated invite URL and add the bot to your server
-
-**5. Run**
 
 ```bash
 nanobot gateway
@@ -279,6 +260,22 @@ nanobot gateway
 
 ## ⚙️ Configuration
 
+Config file: `~/.nanobot/config.json`
+
+### Providers
+
+| Provider | Purpose | Models | Get API Key |
+|----------|---------|--------|-------------|
+| `dashscope` | LLM (China recommended) | `qwen-turbo`, `qwen-plus`, `qwen-max` | [dashscope.console.aliyun.com](https://dashscope.console.aliyun.com) |
+| `openrouter` | LLM (access to all models) | All major models | [openrouter.ai](https://openrouter.ai) |
+| `anthropic` | LLM (Claude direct) | `claude-opus-4-5`, `claude-sonnet-4-5` | [console.anthropic.com](https://console.anthropic.com) |
+| `openai` | LLM (GPT direct) | `gpt-4o`, `gpt-4-turbo` | [platform.openai.com](https://platform.openai.com) |
+| `zhipu` | LLM (China) | `glm-4`, `glm-4-flash` | [open.bigmodel.cn](https://open.bigmodel.cn) |
+| `groq` | LLM + **Voice transcription** | Llama, Whisper | [console.groq.com](https://console.groq.com) |
+| `gemini` | LLM (Gemini direct) | `gemini-pro`, `gemini-ultra` | [aistudio.google.com](https://aistudio.google.com) |
+
+> **Note**: Groq provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
+
 <details>
 <summary><b>Full config example</b></summary>
 
@@ -292,6 +289,9 @@ nanobot gateway
   "providers": {
     "openrouter": {
       "apiKey": "sk-or-v1-xxx"
+    },
+    "groq": {
+      "apiKey": "gsk_xxx"
     }
   },
   "channels": {
@@ -299,11 +299,6 @@ nanobot gateway
       "enabled": true,
       "token": "123456:ABC...",
       "allowFrom": ["123456789"]
-    },
-    "discord": {
-      "enabled": false,
-      "token": "YOUR_DISCORD_BOT_TOKEN",
-      "allowFrom": ["YOUR_USER_ID"]
     },
     "whatsapp": {
       "enabled": false
@@ -350,6 +345,30 @@ nanobot cron remove <job_id>
 
 </details>
 
+## 🐳 Docker
+
+Build and run nanobot in a container:
+
+```bash
+# Build the image
+docker build -t nanobot .
+
+# Initialize config (first time only)
+docker run -v ~/.nanobot:/root/.nanobot --rm nanobot onboard
+
+# Edit config on host to add API keys
+vim ~/.nanobot/config.json
+
+# Run gateway (connects to Telegram/WhatsApp)
+docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
+
+# Or run a single command
+docker run -v ~/.nanobot:/root/.nanobot --rm nanobot agent -m "Hello!"
+docker run -v ~/.nanobot:/root/.nanobot --rm nanobot status
+```
+
+> **Tip**: Mount `~/.nanobot` so your config and workspace persist across container restarts.
+
 ## 📁 Project Structure
 
 ```
@@ -372,21 +391,28 @@ nanobot/
 └── cli/            # 🖥️ Commands
 ```
 
-## 🗺️ Roadmap
+## 🤝 Contribute & Roadmap
 
+PRs welcome! The codebase is intentionally small and readable. 🤗
+
+**Roadmap** — Pick an item and [open a PR](https://github.com/HKUDS/nanobot/pulls)!
+
+- [x] **Voice Transcription** — Support for Groq Whisper (Issue #13)
 - [ ] **Multi-modal** — See and hear (images, voice, video)
 - [ ] **Long-term memory** — Never forget important context
 - [ ] **Better reasoning** — Multi-step planning and reflection
 - [ ] **More integrations** — Discord, Slack, email, calendar
 - [ ] **Self-improvement** — Learn from feedback and mistakes
 
-**Want to help?** Pick an item and [open a PR](https://github.com/HKUDS/nanobot/pulls)!
+### Contributors
+
+<a href="https://github.com/HKUDS/nanobot/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=HKUDS/nanobot" />
+</a>
 
 ---
 
 ## ⭐ Star History
-
-*Community Growth Trajectory*
 
 <div align="center">
   <a href="https://star-history.com/#HKUDS/nanobot&Date">
@@ -397,12 +423,6 @@ nanobot/
     </picture>
   </a>
 </div>
-
----
-
-## 🤝 Contribute
-
-PRs welcome! The codebase is intentionally small and readable. 🤗
 
 <p align="center">
   <em> Thanks for visiting ✨ nanobot!</em><br><br>
