@@ -8,6 +8,7 @@
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
     <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/Feishu-Group-E9DBFC?style=flat&logo=feishu&logoColor=white" alt="Feishu"></a>
     <a href="./COMMUNICATION.md"><img src="https://img.shields.io/badge/WeChat-Group-C5EAB4?style=flat&logo=wechat&logoColor=white" alt="WeChat"></a>
+    <a href="https://discord.gg/MnCvHqpUGB"><img src="https://img.shields.io/badge/Discord-Community-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
   </p>
 </div>
 
@@ -17,7 +18,12 @@
 
 ## 📢 News
 
+- **2025-02-03** 🔒 Security audit completed! See [SECURITY_AUDIT.md](./SECURITY_AUDIT.md) and [SECURITY.md](./SECURITY.md) for details.
 - **2025-02-01** 🎉 nanobot launched! Welcome to try 🐈 nanobot!
+
+> [!IMPORTANT]
+> **Security Notice**: If you're using nanobot in production, please review [SECURITY.md](./SECURITY.md) for security best practices.
+> Key actions: Configure `allowFrom` lists, secure your API keys, and keep dependencies updated.
 
 ## Key Features of nanobot:
 
@@ -60,19 +66,7 @@
 
 ## 📦 Install
 
-**Install with [uv](https://github.com/astral-sh/uv)** (recommended for speed)
-
-```bash
-uv tool install nanobot-ai
-```
-
-**Install from PyPi**
-
-```bash
-pip install nanobot-ai
-```
-
-**Install from source** (recommended for development)
+**Install from source** (latest features, recommended for development)
 
 ```bash
 git clone https://github.com/HKUDS/nanobot.git
@@ -80,19 +74,24 @@ cd nanobot
 pip install -e .
 ```
 
-**Install with uv**
+**Install with [uv](https://github.com/astral-sh/uv)** (stable, fast)
 
 ```bash
-uv venv
-source .venv/bin/activate
-uv pip install nanobot-ai
+uv tool install nanobot-ai
+```
+
+**Install from PyPI** (stable)
+
+```bash
+pip install nanobot-ai
 ```
 
 ## 🚀 Quick Start
 
 > [!TIP]
 > Set your API key in `~/.nanobot/config.json`.
-> Get API keys: [DashScope](https://dashscope.console.aliyun.com) (China) · [OpenRouter](https://openrouter.ai/keys) (Global) · [Brave Search](https://brave.com/search/api/) (optional, for web search)
+> Get API keys: [OpenRouter](https://openrouter.ai/keys) (LLM) · [Brave Search](https://brave.com/search/api/) (optional, for web search)
+> You can also change the model to `minimax/minimax-m2` for lower cost.
 
 **1. Initialize**
 
@@ -102,7 +101,6 @@ nanobot onboard
 
 **2. Configure** (`~/.nanobot/config.json`)
 
-For OpenRouter - recommended for global users:
 ```json
 {
   "providers": {
@@ -114,22 +112,9 @@ For OpenRouter - recommended for global users:
     "defaults": {
       "model": "anthropic/claude-opus-4-5"
     }
-  }
-}
-```
-
-For DashScope - recommended for China users:
-```json
-{
-  "providers": {
-    "dashscope": {
-      "apiKey": "sk-xxx"
-    }
   },
-  "agents": {
-    "defaults": {
-      "model": "qwen-plus"
-    }
+  "webSearch": {
+    "apiKey": "BSA-xxx"
   }
 }
 ```
@@ -264,17 +249,17 @@ Config file: `~/.nanobot/config.json`
 
 ### Providers
 
-| Provider | Purpose | Models | Get API Key |
-|----------|---------|--------|-------------|
-| `dashscope` | LLM (China recommended) | `qwen-turbo`, `qwen-plus`, `qwen-max` | [dashscope.console.aliyun.com](https://dashscope.console.aliyun.com) |
-| `openrouter` | LLM (access to all models) | All major models | [openrouter.ai](https://openrouter.ai) |
-| `anthropic` | LLM (Claude direct) | `claude-opus-4-5`, `claude-sonnet-4-5` | [console.anthropic.com](https://console.anthropic.com) |
-| `openai` | LLM (GPT direct) | `gpt-4o`, `gpt-4-turbo` | [platform.openai.com](https://platform.openai.com) |
-| `zhipu` | LLM (China) | `glm-4`, `glm-4-flash` | [open.bigmodel.cn](https://open.bigmodel.cn) |
-| `groq` | LLM + **Voice transcription** | Llama, Whisper | [console.groq.com](https://console.groq.com) |
-| `gemini` | LLM (Gemini direct) | `gemini-pro`, `gemini-ultra` | [aistudio.google.com](https://aistudio.google.com) |
+> [!NOTE]
+> Groq provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
 
-> **Note**: Groq provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
+| Provider | Purpose | Get API Key |
+|----------|---------|-------------|
+| `openrouter` | LLM (recommended, access to all models) | [openrouter.ai](https://openrouter.ai) |
+| `anthropic` | LLM (Claude direct) | [console.anthropic.com](https://console.anthropic.com) |
+| `openai` | LLM (GPT direct) | [platform.openai.com](https://platform.openai.com) |
+| `groq` | LLM + **Voice transcription** (Whisper) | [console.groq.com](https://console.groq.com) |
+| `gemini` | LLM (Gemini direct) | [aistudio.google.com](https://aistudio.google.com) |
+
 
 <details>
 <summary><b>Full config example</b></summary>
@@ -347,6 +332,9 @@ nanobot cron remove <job_id>
 
 ## 🐳 Docker
 
+> [!TIP]
+> The `-v ~/.nanobot:/root/.nanobot` flag mounts your local config directory into the container, so your config and workspace persist across container restarts.
+
 Build and run nanobot in a container:
 
 ```bash
@@ -366,8 +354,6 @@ docker run -v ~/.nanobot:/root/.nanobot -p 18790:18790 nanobot gateway
 docker run -v ~/.nanobot:/root/.nanobot --rm nanobot agent -m "Hello!"
 docker run -v ~/.nanobot:/root/.nanobot --rm nanobot status
 ```
-
-> **Tip**: Mount `~/.nanobot` so your config and workspace persist across container restarts.
 
 ## 📁 Project Structure
 
@@ -410,7 +396,6 @@ PRs welcome! The codebase is intentionally small and readable. 🤗
   <img src="https://contrib.rocks/image?repo=HKUDS/nanobot" />
 </a>
 
----
 
 ## ⭐ Star History
 
@@ -427,4 +412,9 @@ PRs welcome! The codebase is intentionally small and readable. 🤗
 <p align="center">
   <em> Thanks for visiting ✨ nanobot!</em><br><br>
   <img src="https://visitor-badge.laobi.icu/badge?page_id=HKUDS.nanobot&style=for-the-badge&color=00d4ff" alt="Views">
+</p>
+
+
+<p align="center">
+  <sub>nanobot is for educational, research, and technical exchange purposes only</sub>
 </p>
