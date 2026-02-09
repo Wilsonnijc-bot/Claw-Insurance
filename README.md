@@ -16,10 +16,11 @@
 
 ⚡️ Delivers core agent functionality in just **~4,000** lines of code — **99% smaller** than Clawdbot's 430k+ lines.
 
-📏 Real-time line count: **3,448 lines** (run `bash core_agent_lines.sh` to verify anytime)
+📏 Real-time line count: **3,510 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
 ## 📢 News
 
+- **2026-02-09** 💬 Added Slack, Email, and QQ support — nanobot now supports multiple chat platforms!
 - **2026-02-08** 🔧 Refactored Providers—adding a new LLM provider now takes just 2 simple steps! Check [here](#providers).
 - **2026-02-07** 🚀 Released v0.1.3.post5 with Qwen support & several key improvements! Check [here](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post5) for details.
 - **2026-02-06** ✨ Added Moonshot/Kimi provider, Discord integration, and enhanced security hardening!
@@ -166,7 +167,7 @@ nanobot agent -m "Hello from my local LLM!"
 
 ## 💬 Chat Apps
 
-Talk to your nanobot through Telegram, Discord, WhatsApp, or Feishu — anytime, anywhere.
+Talk to your nanobot through Telegram, Discord, WhatsApp, Feishu, DingTalk, Slack, Email, or QQ — anytime, anywhere.
 
 | Channel | Setup |
 |---------|-------|
@@ -174,6 +175,10 @@ Talk to your nanobot through Telegram, Discord, WhatsApp, or Feishu — anytime,
 | **Discord** | Easy (bot token + intents) |
 | **WhatsApp** | Medium (scan QR) |
 | **Feishu** | Medium (app credentials) |
+| **DingTalk** | Medium (app credentials) |
+| **Slack** | Medium (bot + app tokens) |
+| **Email** | Medium (IMAP/SMTP credentials) |
+| **QQ** | Easy (app credentials) |
 
 <details>
 <summary><b>Telegram</b> (Recommended)</summary>
@@ -197,7 +202,9 @@ Talk to your nanobot through Telegram, Discord, WhatsApp, or Feishu — anytime,
 }
 ```
 
-> Get your user ID from `@userinfobot` on Telegram.
+> You can find your **User ID** in Telegram settings. It is shown as `@yourUserId`.
+> Copy this value **without the `@` symbol** and paste it into the config file.
+
 
 **3. Run**
 
@@ -334,6 +341,45 @@ nanobot gateway
 </details>
 
 <details>
+<summary><b>QQ (QQ私聊)</b></summary>
+
+Uses **botpy SDK** with WebSocket — no public IP required.
+
+**1. Create a QQ bot**
+- Visit [QQ Open Platform](https://q.qq.com)
+- Create a new bot application
+- Get **AppID** and **Secret** from "Developer Settings"
+
+**2. Configure**
+
+```json
+{
+  "channels": {
+    "qq": {
+      "enabled": true,
+      "appId": "YOUR_APP_ID",
+      "secret": "YOUR_APP_SECRET",
+      "allowFrom": []
+    }
+  }
+}
+```
+
+> `allowFrom`: Leave empty for public access, or add user openids to restrict access.
+> Example: `"allowFrom": ["user_openid_1", "user_openid_2"]`
+
+**3. Run**
+
+```bash
+nanobot gateway
+```
+
+> [!TIP]
+> QQ bot currently supports **private messages only**. Group chat support coming soon!
+
+</details>
+
+<details>
 <summary><b>DingTalk (钉钉)</b></summary>
 
 Uses **Stream Mode** — no public IP required.
@@ -372,14 +418,102 @@ nanobot gateway
 
 </details>
 
+<details>
+<summary><b>Slack</b></summary>
+
+Uses **Socket Mode** — no public URL required.
+
+**1. Create a Slack app**
+- Go to [Slack API](https://api.slack.com/apps) → Create New App
+- **OAuth & Permissions**: Add bot scopes: `chat:write`, `reactions:write`, `app_mentions:read`
+- Install to your workspace and copy the **Bot Token** (`xoxb-...`)
+- **Socket Mode**: Enable it and generate an **App-Level Token** (`xapp-...`) with `connections:write` scope
+- **Event Subscriptions**: Subscribe to `message.im`, `message.channels`, `app_mention`
+
+**2. Configure**
+
+```json
+{
+  "channels": {
+    "slack": {
+      "enabled": true,
+      "botToken": "xoxb-...",
+      "appToken": "xapp-...",
+      "groupPolicy": "mention"
+    }
+  }
+}
+```
+
+> `groupPolicy`: `"mention"` (respond only when @mentioned), `"open"` (respond to all messages), or `"allowlist"` (restrict to specific channels).
+> DM policy defaults to open. Set `"dm": {"enabled": false}` to disable DMs.
+
+**3. Run**
+
+```bash
+nanobot gateway
+```
+
+</details>
+
+<details>
+<summary><b>Email</b></summary>
+
+Uses **IMAP** polling for inbound + **SMTP** for outbound. Requires explicit consent before accessing mailbox data.
+
+**1. Get credentials (Gmail example)**
+- Enable 2-Step Verification in Google account security
+- Create an [App Password](https://myaccount.google.com/apppasswords)
+- Use this app password for both IMAP and SMTP
+
+**2. Configure**
+
+> [!TIP]
+> Set `"autoReplyEnabled": false` if you only want to read/analyze emails without sending automatic replies.
+
+```json
+{
+  "channels": {
+    "email": {
+      "enabled": true,
+      "consentGranted": true,
+      "imapHost": "imap.gmail.com",
+      "imapPort": 993,
+      "imapUsername": "you@gmail.com",
+      "imapPassword": "your-app-password",
+      "imapUseSsl": true,
+      "smtpHost": "smtp.gmail.com",
+      "smtpPort": 587,
+      "smtpUsername": "you@gmail.com",
+      "smtpPassword": "your-app-password",
+      "smtpUseTls": true,
+      "fromAddress": "you@gmail.com",
+      "allowFrom": ["trusted@example.com"]
+    }
+  }
+}
+```
+
+> `consentGranted`: Must be `true` to allow mailbox access. Set to `false` to disable reading and sending entirely.
+> `allowFrom`: Leave empty to accept emails from anyone, or restrict to specific sender addresses.
+
+**3. Run**
+
+```bash
+nanobot gateway
+```
+
+</details>
+
 ## ⚙️ Configuration
 
 Config file: `~/.nanobot/config.json`
 
 ### Providers
 
-> [!NOTE]
-> Groq provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
+> [!TIP]
+> - **Groq** provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
+> - **Zhipu Coding Plan**: If you're on Zhipu's coding plan, set `"apiBase": "https://open.bigmodel.cn/api/coding/paas/v4"` in your zhipu provider config.
 
 | Provider | Purpose | Get API Key |
 |----------|---------|-------------|
@@ -442,7 +576,6 @@ That's it! Environment variables, model prefixing, config matching, and `nanobot
 
 ### Security
 
-> [!TIP]
 > For production deployments, set `"restrictToWorkspace": true` in your config to sandbox the agent.
 
 | Option | Default | Description |
@@ -458,10 +591,14 @@ That's it! Environment variables, model prefixing, config matching, and `nanobot
 | `nanobot onboard` | Initialize config & workspace |
 | `nanobot agent -m "..."` | Chat with the agent |
 | `nanobot agent` | Interactive chat mode |
+| `nanobot agent --no-markdown` | Show plain-text replies |
+| `nanobot agent --logs` | Show runtime logs during chat |
 | `nanobot gateway` | Start the gateway |
 | `nanobot status` | Show status |
 | `nanobot channels login` | Link WhatsApp (scan QR) |
 | `nanobot channels status` | Show channel status |
+
+Interactive mode exits: `exit`, `quit`, `/exit`, `/quit`, `:q`, or `Ctrl+D`.
 
 <details>
 <summary><b>Scheduled Tasks (Cron)</b></summary>
@@ -537,7 +674,7 @@ PRs welcome! The codebase is intentionally small and readable. 🤗
 - [ ] **Multi-modal** — See and hear (images, voice, video)
 - [ ] **Long-term memory** — Never forget important context
 - [ ] **Better reasoning** — Multi-step planning and reflection
-- [ ] **More integrations** — Discord, Slack, email, calendar
+- [ ] **More integrations** — Calendar and more
 - [ ] **Self-improvement** — Learn from feedback and mistakes
 
 ### Contributors
