@@ -105,9 +105,8 @@ class BaseChannel(ABC):
         """
         if not self.is_allowed(sender_id):
             logger.warning(
-                "Access denied for sender {} on channel {}. "
-                "Add them to allowFrom list in config to grant access.",
-                sender_id, self.name,
+                f"Access denied for sender {sender_id} on channel {self.name}. "
+                f"Add them to allowFrom list in config to grant access."
             )
             return
         

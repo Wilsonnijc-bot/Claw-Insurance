@@ -16,7 +16,7 @@
 
 ⚡️ Delivers core agent functionality in just **~4,000** lines of code — **99% smaller** than Clawdbot's 430k+ lines.
 
-📏 Real-time line count: **3,827 lines** (run `bash core_agent_lines.sh` to verify anytime)
+📏 Real-time line count: **3,761 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
 ## 📢 News
 
@@ -302,6 +302,70 @@ nanobot gateway
 </details>
 
 <details>
+<summary><b>Matrix (Element)</b></summary>
+
+Uses Matrix sync via `matrix-nio` (including inbound media support).
+
+**1. Create/choose a Matrix account**
+
+- Create or reuse a Matrix account on your homeserver (for example `matrix.org`).
+- Confirm you can log in with Element.
+
+**2. Get credentials**
+
+- You need:
+  - `userId` (example: `@nanobot:matrix.org`)
+  - `accessToken`
+  - `deviceId` (recommended so sync tokens can be restored across restarts)
+- You can obtain these from your homeserver login API (`/_matrix/client/v3/login`) or from your client's advanced session settings.
+
+**3. Configure**
+
+```json
+{
+  "channels": {
+    "matrix": {
+      "enabled": true,
+      "homeserver": "https://matrix.org",
+      "userId": "@nanobot:matrix.org",
+      "accessToken": "syt_xxx",
+      "deviceId": "NANOBOT01",
+      "e2eeEnabled": true,
+      "allowFrom": [],
+      "groupPolicy": "open",
+      "groupAllowFrom": [],
+      "allowRoomMentions": false,
+      "maxInboundMediaBytes": 20971520
+    }
+  }
+}
+```
+
+> `allowFrom`: Empty allows all senders; set user IDs to restrict access.
+> `groupPolicy`: `open`, `mention`, or `allowlist`.
+> `groupAllowFrom`: Room allowlist used when `groupPolicy` is `allowlist`.
+> `allowRoomMentions`: If `true`, accepts `@room` (`m.mentions.room`) in mention mode.
+> `e2eeEnabled`: Enables Matrix E2EE support (default `true`); set `false` only for plaintext-only setups.
+> `maxInboundMediaBytes`: Max inbound attachment size in bytes (default `20MB`).
+
+> [!NOTE]
+> Matrix E2EE implications:
+>
+> - Keep a persistent `matrix-store` and stable `deviceId`; otherwise encrypted session state can be lost after restart.
+> - In newly joined encrypted rooms, initial messages may fail until Olm/Megolm sessions are established.
+> - With `e2eeEnabled=false`, encrypted room messages may be undecryptable and E2EE send safeguards are not applied.
+> - With `e2eeEnabled=true`, the bot sends with `ignore_unverified_devices=true` (more compatible, less strict than verified-only sending).
+> - Changing `accessToken`/`deviceId` effectively creates a new device and may require session re-establishment.
+
+**4. Run**
+
+```bash
+nanobot gateway
+```
+
+</details>
+
+<details>
 <summary><b>WhatsApp</b></summary>
 
 Requires **Node.js ≥18**.
@@ -578,7 +642,6 @@ Config file: `~/.nanobot/config.json`
 > - **Groq** provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
 > - **Zhipu Coding Plan**: If you're on Zhipu's coding plan, set `"apiBase": "https://open.bigmodel.cn/api/coding/paas/v4"` in your zhipu provider config.
 > - **MiniMax (Mainland China)**: If your API key is from MiniMax's mainland China platform (minimaxi.com), set `"apiBase": "https://api.minimaxi.com/v1"` in your minimax provider config.
-> - **VolcEngine Coding Plan**: If you're on VolcEngine's coding plan, set `"apiBase": "https://ark.cn-beijing.volces.com/api/coding/v3"` in your volcengine provider config.
 
 | Provider | Purpose | Get API Key |
 |----------|---------|-------------|
@@ -591,8 +654,7 @@ Config file: `~/.nanobot/config.json`
 | `gemini` | LLM (Gemini direct) | [aistudio.google.com](https://aistudio.google.com) |
 | `minimax` | LLM (MiniMax direct) | [platform.minimax.io](https://platform.minimax.io) |
 | `aihubmix` | LLM (API gateway, access to all models) | [aihubmix.com](https://aihubmix.com) |
-| `siliconflow` | LLM (SiliconFlow/硅基流动) | [siliconflow.cn](https://siliconflow.cn) |
-| `volcengine` | LLM (VolcEngine/火山引擎) | [volcengine.com](https://www.volcengine.com) |
+| `siliconflow` | LLM (SiliconFlow/硅基流动, API gateway) | [siliconflow.cn](https://siliconflow.cn) |
 | `dashscope` | LLM (Qwen) | [dashscope.console.aliyun.com](https://dashscope.console.aliyun.com) |
 | `moonshot` | LLM (Moonshot/Kimi) | [platform.moonshot.cn](https://platform.moonshot.cn) |
 | `zhipu` | LLM (Zhipu GLM) | [open.bigmodel.cn](https://open.bigmodel.cn) |
@@ -753,12 +815,6 @@ Add MCP servers to your `config.json`:
       "filesystem": {
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
-      },
-      "my-remote-mcp": {
-        "url": "https://example.com/mcp/",
-        "headers": {
-          "Authorization": "Bearer xxxxx"
-        }
       }
     }
   }
@@ -770,7 +826,7 @@ Two transport modes are supported:
 | Mode | Config | Example |
 |------|--------|---------|
 | **Stdio** | `command` + `args` | Local process via `npx` / `uvx` |
-| **HTTP** | `url` + `headers` (optional) | Remote endpoint (`https://mcp.example.com/sse`) |
+| **HTTP** | `url` | Remote endpoint (`https://mcp.example.com/sse`) |
 
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
 

@@ -3,7 +3,6 @@
 from contextlib import AsyncExitStack
 from typing import Any
 
-import httpx
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
@@ -60,22 +59,11 @@ async def connect_mcp_servers(
                 read, write = await stack.enter_async_context(stdio_client(params))
             elif cfg.url:
                 from mcp.client.streamable_http import streamable_http_client
-                if cfg.headers:
-                    http_client = await stack.enter_async_context(
-                        httpx.AsyncClient(
-                            headers=cfg.headers,
-                            follow_redirects=True
-                        )
-                    )
-                    read, write, _ = await stack.enter_async_context(
-                        streamable_http_client(cfg.url, http_client=http_client)
-                    )
-                else:
-                    read, write, _ = await stack.enter_async_context(
-                        streamable_http_client(cfg.url)
-                    )
+                read, write, _ = await stack.enter_async_context(
+                    streamable_http_client(cfg.url)
+                )
             else:
-                logger.warning("MCP server '{}': no command or url configured, skipping", name)
+                logger.warning(f"MCP server '{name}': no command or url configured, skipping")
                 continue
 
             session = await stack.enter_async_context(ClientSession(read, write))
@@ -85,8 +73,8 @@ async def connect_mcp_servers(
             for tool_def in tools.tools:
                 wrapper = MCPToolWrapper(session, name, tool_def)
                 registry.register(wrapper)
-                logger.debug("MCP: registered tool '{}' from server '{}'", wrapper.name, name)
+                logger.debug(f"MCP: registered tool '{wrapper.name}' from server '{name}'")
 
-            logger.info("MCP server '{}': connected, {} tools registered", name, len(tools.tools))
+            logger.info(f"MCP server '{name}': connected, {len(tools.tools)} tools registered")
         except Exception as e:
-            logger.error("MCP server '{}': failed to connect: {}", name, e)
+            logger.error(f"MCP server '{name}': failed to connect: {e}")
