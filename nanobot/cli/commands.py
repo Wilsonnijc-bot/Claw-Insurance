@@ -292,7 +292,9 @@ def _make_provider(config: Config):
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
         return OpenAICodexProvider(default_model=model)
 
-    if not model.startswith("bedrock/") and not (p and p.api_key):
+    from nanobot.providers.registry import find_by_name
+    spec = find_by_name(provider_name)
+    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
@@ -439,15 +441,20 @@ def agent(
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
     """Interact with the agent directly."""
-    from nanobot.config.loader import load_config
+    from nanobot.config.loader import load_config, get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
+    from nanobot.cron.service import CronService
     from loguru import logger
     
     config = load_config()
     
     bus = MessageBus()
     provider = _make_provider(config)
+
+    # Create cron service for tool usage (no callback needed for CLI unless running)
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
 
     if logs:
         logger.enable("nanobot")
@@ -465,6 +472,7 @@ def agent(
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
+        cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
     )
@@ -719,17 +727,15 @@ def cron_list(
     table.add_column("Status")
     table.add_column("Next Run")
     
-    import datetime
     import time
+    from datetime import datetime as _dt
     from zoneinfo import ZoneInfo
     for job in jobs:
         # Format schedule
         if job.schedule.kind == "every":
             sched = f"every {(job.schedule.every_ms or 0) // 1000}s"
         elif job.schedule.kind == "cron":
-            sched = job.schedule.expr or ""
-            if job.schedule.tz:
-                sched = f"{sched} ({job.schedule.tz})"
+            sched = f"{job.schedule.expr or ''} ({job.schedule.tz})" if job.schedule.tz else (job.schedule.expr or "")
         else:
             sched = "one-time"
         
@@ -737,13 +743,10 @@ def cron_list(
         next_run = ""
         if job.state.next_run_at_ms:
             ts = job.state.next_run_at_ms / 1000
-            if job.schedule.kind == "cron" and job.schedule.tz:
-                try:
-                    dt = datetime.fromtimestamp(ts, ZoneInfo(job.schedule.tz))
-                    next_run = dt.strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    next_run = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-            else:
+            try:
+                tz = ZoneInfo(job.schedule.tz) if job.schedule.tz else None
+                next_run = _dt.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
+            except Exception:
                 next_run = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
         
         status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
