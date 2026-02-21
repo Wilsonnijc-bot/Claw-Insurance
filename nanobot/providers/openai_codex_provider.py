@@ -176,7 +176,7 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
 
         if role == "tool":
             call_id, _ = _split_tool_call_id(msg.get("tool_call_id"))
-            output_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            output_text = content if isinstance(content, str) else json.dumps(content)
             input_items.append(
                 {
                     "type": "function_call_output",
