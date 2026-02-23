@@ -16,7 +16,7 @@
 
 ⚡️ Delivers core agent functionality in just **~4,000** lines of code — **99% smaller** than Clawdbot's 430k+ lines.
 
-📏 Real-time line count: **3,806 lines** (run `bash core_agent_lines.sh` to verify anytime)
+📏 Real-time line count: **3,897 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
 ## 📢 News
 
@@ -593,7 +593,7 @@ Config file: `~/.nanobot/config.json`
 | `deepseek` | LLM (DeepSeek direct) | [platform.deepseek.com](https://platform.deepseek.com) |
 | `groq` | LLM + **Voice transcription** (Whisper) | [console.groq.com](https://console.groq.com) |
 | `gemini` | LLM (Gemini direct) | [aistudio.google.com](https://aistudio.google.com) |
-| `minimax` | LLM (MiniMax direct) | [platform.minimax.io](https://platform.minimax.io) |
+| `minimax` | LLM (MiniMax direct) | [platform.minimaxi.com](https://platform.minimaxi.com) |
 | `aihubmix` | LLM (API gateway, access to all models) | [aihubmix.com](https://aihubmix.com) |
 | `siliconflow` | LLM (SiliconFlow/硅基流动) | [siliconflow.cn](https://siliconflow.cn) |
 | `volcengine` | LLM (VolcEngine/火山引擎) | [volcengine.com](https://www.volcengine.com) |
@@ -776,6 +776,21 @@ Two transport modes are supported:
 | **Stdio** | `command` + `args` | Local process via `npx` / `uvx` |
 | **HTTP** | `url` + `headers` (optional) | Remote endpoint (`https://mcp.example.com/sse`) |
 
+Use `toolTimeout` to override the default 30s per-call timeout for slow servers:
+
+```json
+{
+  "tools": {
+    "mcpServers": {
+      "my-slow-server": {
+        "url": "https://example.com/mcp/",
+        "toolTimeout": 120
+      }
+    }
+  }
+}
+```
+
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
 
 
@@ -823,6 +838,26 @@ nanobot cron list
 # Remove a job
 nanobot cron remove <job_id>
 ```
+
+</details>
+
+<details>
+<summary><b>Heartbeat (Periodic Tasks)</b></summary>
+
+The gateway wakes up every 30 minutes and checks `HEARTBEAT.md` in your workspace (`~/.nanobot/workspace/HEARTBEAT.md`). If the file has tasks, the agent executes them and delivers results to your most recently active chat channel.
+
+**Setup:** edit `~/.nanobot/workspace/HEARTBEAT.md` (created automatically by `nanobot onboard`):
+
+```markdown
+## Periodic Tasks
+
+- [ ] Check weather forecast and send a summary
+- [ ] Scan inbox for urgent emails
+```
+
+The agent can also manage this file itself — ask it to "add a periodic task" and it will update `HEARTBEAT.md` for you.
+
+> **Note:** The gateway must be running (`nanobot gateway`) and you must have chatted with the bot at least once so it knows which channel to deliver to.
 
 </details>
 
