@@ -163,7 +163,8 @@ class AgentLoop:
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         def _fmt(tc):
-            val = next(iter(tc.arguments.values()), None) if tc.arguments else None
+            args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
+            val = next(iter(args.values()), None) if isinstance(args, dict) else None
             if not isinstance(val, str):
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
@@ -224,6 +225,12 @@ class AgentLoop:
                     )
             else:
                 clean = self._strip_think(response.content)
+                # Don't persist error responses to session history — they can
+                # poison the context and cause permanent 400 loops (#1303).
+                if response.finish_reason == "error":
+                    logger.error("LLM returned error: {}", (clean or "")[:200])
+                    final_content = clean or "Sorry, I encountered an error calling the AI model."
+                    break
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
                 )
@@ -444,24 +451,21 @@ class AgentLoop:
         from datetime import datetime
         for m in messages[skip:]:
             entry = {k: v for k, v in m.items() if k != "reasoning_content"}
-            if entry.get("role") == "tool" and isinstance(entry.get("content"), str):
-                content = entry["content"]
-                if len(content) > self._TOOL_RESULT_MAX_CHARS:
-                    entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-            if (
-                entry.get("role") == "user"
-                and isinstance(entry.get("content"), str)
-                and entry["content"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG)
-            ):
-                continue
-            if entry.get("role") == "user" and isinstance(entry.get("content"), list):
-                entry["content"] = [
-                    {"type": "text", "text": "[image]"} if (
-                        c.get("type") == "image_url"
-                        and c.get("image_url", {}).get("url", "").startswith("data:image/")
-                    ) else c
-                    for c in entry["content"]
-                ]
+            role, content = entry.get("role"), entry.get("content")
+            if role == "assistant" and not content and not entry.get("tool_calls"):
+                continue  # skip empty assistant messages — they poison session context
+            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
+                entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            elif role == "user":
+                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                    continue
+                if isinstance(content, list):
+                    entry["content"] = [
+                        {"type": "text", "text": "[image]"} if (
+                            c.get("type") == "image_url"
+                            and c.get("image_url", {}).get("url", "").startswith("data:image/")
+                        ) else c for c in content
+                    ]
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
