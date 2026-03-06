@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings
 
 
 class Base(BaseModel):
@@ -66,6 +66,7 @@ class DiscordConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
+    group_policy: Literal["mention", "open"] = "mention"
 
 
 class MatrixConfig(Base):
@@ -198,6 +199,23 @@ class QQConfig(Base):
     )  # Allowed user openids (empty = public access)
 
 
+class MatrixConfig(Base):
+    """Matrix (Element) channel configuration."""
+
+    enabled: bool = False
+    homeserver: str = "https://matrix.org"
+    access_token: str = ""
+    user_id: str = ""  # e.g. @bot:matrix.org
+    device_id: str = ""
+    e2ee_enabled: bool = True  # end-to-end encryption support
+    sync_stop_grace_seconds: int = 2  # graceful sync_forever shutdown timeout
+    max_media_bytes: int = 20 * 1024 * 1024  # inbound + outbound attachment limit
+    allow_from: list[str] = Field(default_factory=list)
+    group_policy: Literal["open", "mention", "allowlist"] = "open"
+    group_allow_from: list[str] = Field(default_factory=list)
+    allow_room_mentions: bool = False
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
@@ -255,9 +273,6 @@ class ProvidersConfig(Base):
     groq: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
-    dashscope_coding_plan: ProviderConfig = Field(
-        default_factory=ProviderConfig
-    )  # 阿里云百炼Coding Plan
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -314,26 +329,13 @@ class ExecToolConfig(Base):
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
+    type: Literal["stdio", "sse", "streamableHttp"] | None = None  # auto-detected if omitted
     command: str = ""  # Stdio: command to run (e.g. "npx")
     args: list[str] = Field(default_factory=list)  # Stdio: command arguments
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
-    url: str = ""  # HTTP: streamable HTTP endpoint URL
-    headers: dict[str, str] = Field(default_factory=dict)  # HTTP: Custom HTTP Headers
-    tool_timeout: int = 30  # Seconds before a tool call is cancelled
-
-
-class TTSConfig(Base):
-    """Text-to-Speech configuration."""
-
-    provider: str = "edge_tts"  # Default TTS provider
-    voice: str = "en-US-ChristopherNeural"  # Default voice
-    speed: float = 1.0  # Voice speed multiplier
-
-
-class AudioConfig(Base):
-    """Audio configuration."""
-
-    tts: TTSConfig = Field(default_factory=TTSConfig)
+    url: str = ""  # HTTP/SSE: endpoint URL
+    headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
+    tool_timeout: int = 30  # seconds before a tool call is cancelled
 
 
 class ToolsConfig(Base):
@@ -353,7 +355,6 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    audio: AudioConfig = Field(default_factory=AudioConfig)
 
     @property
     def workspace_path(self) -> Path:
