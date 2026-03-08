@@ -4,8 +4,11 @@ import asyncio
 import os
 import select
 import signal
+import socket
 import sys
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -293,6 +296,7 @@ def gateway(
     config = load_config(config_path)
     if workspace:
         config.agents.defaults.workspace = workspace
+    bridge_proc = _start_whatsapp_bridge(config)
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     sync_workspace_templates(config.workspace_path)
@@ -448,6 +452,7 @@ def gateway(
             cron.stop()
             agent.stop()
             await channels.stop_all()
+            _stop_whatsapp_bridge(bridge_proc)
 
     asyncio.run(run())
 
@@ -646,6 +651,10 @@ def agent(
 
 channels_app = typer.Typer(help="Manage channels")
 app.add_typer(channels_app, name="channels")
+whatsapp_contacts_app = typer.Typer(help="Manage WhatsApp local contacts")
+channels_app.add_typer(whatsapp_contacts_app, name="whatsapp-contacts")
+whatsapp_groups_app = typer.Typer(help="Manage WhatsApp group-member allowlist")
+channels_app.add_typer(whatsapp_groups_app, name="whatsapp-groups")
 
 
 @channels_app.command("status")
@@ -749,10 +758,6 @@ def _get_bridge_dir() -> Path:
     # User's bridge location
     user_bridge = Path.home() / ".nanobot" / "bridge"
 
-    # Check if already built
-    if (user_bridge / "dist" / "index.js").exists():
-        return user_bridge
-
     # Check for npm
     if not shutil.which("npm"):
         console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
@@ -772,6 +777,10 @@ def _get_bridge_dir() -> Path:
         console.print("[red]Bridge source not found.[/red]")
         console.print("Try reinstalling: pip install --force-reinstall nanobot")
         raise typer.Exit(1)
+
+    # Reuse the cached bridge only when it exists and matches the current source.
+    if (user_bridge / "dist" / "index.js").exists() and not _bridge_needs_refresh(source, user_bridge):
+        return user_bridge
 
     console.print(f"{__logo__} Setting up bridge...")
 
@@ -799,6 +808,171 @@ def _get_bridge_dir() -> Path:
     return user_bridge
 
 
+def _bridge_needs_refresh(source: Path, cached: Path) -> bool:
+    """Return True when the cached bridge should be recopied and rebuilt."""
+    cached_entry = cached / "dist" / "index.js"
+    if not cached_entry.exists():
+        return True
+
+    def latest_mtime(root: Path) -> float:
+        latest = 0.0
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            if rel.parts and rel.parts[0] in {"node_modules", "dist"}:
+                continue
+            latest = max(latest, path.stat().st_mtime)
+        return latest
+
+    source_latest = latest_mtime(source)
+    cached_latest = latest_mtime(cached)
+    return source_latest > cached_latest
+
+
+def _build_whatsapp_bridge_env(config: Config) -> dict[str, str]:
+    """Build environment variables for the local WhatsApp bridge."""
+    env = {**os.environ}
+    wa = config.channels.whatsapp
+    if wa.bridge_token:
+        env["BRIDGE_TOKEN"] = wa.bridge_token
+    if wa.web_profile_dir:
+        env["WEB_PROFILE_DIR"] = wa.web_profile_dir
+
+    parsed = urlparse(wa.bridge_url)
+    if parsed.port:
+        env["BRIDGE_PORT"] = str(parsed.port)
+    return env
+
+
+def _ensure_whatsapp_bridge_browser(bridge_dir: Path, config: Config, env: dict[str, str]) -> None:
+    """Install Playwright browser runtime when draft mode needs it."""
+    import subprocess
+
+    if config.channels.whatsapp.delivery_mode != "draft":
+        return
+
+    console.print("Ensuring Playwright Chromium is installed for WhatsApp draft mode...")
+    try:
+        subprocess.run(
+            ["npx", "playwright", "install", "chromium"],
+            cwd=bridge_dir,
+            check=True,
+            env=env,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Playwright browser install failed: {e}[/red]")
+        if e.stderr:
+            console.print(f"[dim]{e.stderr.decode()[:500]}[/dim]")
+        raise typer.Exit(1)
+
+
+def _whatsapp_bridge_running(config: Config) -> bool:
+    """Return True when the local WhatsApp bridge accepts a stable WebSocket connection."""
+    bridge_url = config.channels.whatsapp.bridge_url
+
+    async def _probe() -> bool:
+        import websockets
+
+        try:
+            async with websockets.connect(
+                bridge_url,
+                open_timeout=0.5,
+                close_timeout=0.5,
+                ping_interval=None,
+            ):
+                await asyncio.sleep(0.2)
+                return True
+        except Exception:
+            return False
+
+    try:
+        return asyncio.run(_probe())
+    except RuntimeError:
+        parsed = urlparse(bridge_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 3001
+        try:
+            with socket.create_connection((host, port), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+
+def _start_whatsapp_bridge(config: Config):
+    """Start the local WhatsApp bridge in the background when needed."""
+    import subprocess
+
+    if not config.channels.whatsapp.enabled:
+        return None
+
+    if _whatsapp_bridge_running(config):
+        console.print("[green]✓[/green] WhatsApp bridge already running")
+        return None
+
+    bridge_dir = _get_bridge_dir()
+    env = _build_whatsapp_bridge_env(config)
+    _ensure_whatsapp_bridge_browser(bridge_dir, config, env)
+
+    console.print(f"{__logo__} Starting WhatsApp bridge...")
+    proc = subprocess.Popen(
+        ["npm", "start"],
+        cwd=bridge_dir,
+        env=env,
+        start_new_session=True,
+    )
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            console.print(f"[red]WhatsApp bridge exited early with code {proc.returncode}[/red]")
+            raise typer.Exit(1)
+        if _whatsapp_bridge_running(config):
+            console.print("[green]✓[/green] WhatsApp bridge ready")
+            return proc
+        time.sleep(0.2)
+
+    console.print("[red]WhatsApp bridge did not become ready in time[/red]")
+    _stop_whatsapp_bridge(proc)
+    raise typer.Exit(1)
+
+
+def _stop_whatsapp_bridge(proc) -> None:
+    """Stop a background WhatsApp bridge process started by this CLI."""
+    if proc is None or proc.poll() is not None:
+        return
+
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:
+            pass
+
+
+def _get_whatsapp_contacts_file(config: Config) -> Path:
+    """Return the local WhatsApp contacts file path."""
+    from nanobot.channels.whatsapp_contacts import contacts_path
+
+    return contacts_path(config.channels.whatsapp.contacts_file)
+
+
+def _get_whatsapp_group_members_file(config: Config) -> Path:
+    """Return the local WhatsApp group-members CSV path."""
+    from nanobot.channels.whatsapp_group_members import group_members_path
+
+    return group_members_path(config.channels.whatsapp.group_members_file)
+
+
 @channels_app.command("login")
 def channels_login():
     """Link device via QR code."""
@@ -812,9 +986,8 @@ def channels_login():
     console.print(f"{__logo__} Starting bridge...")
     console.print("Scan the QR code to connect.\n")
 
-    env = {**os.environ}
-    if config.channels.whatsapp.bridge_token:
-        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token
+    env = _build_whatsapp_bridge_env(config)
+    _ensure_whatsapp_bridge_browser(bridge_dir, config, env)
 
     try:
         subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
@@ -822,6 +995,240 @@ def channels_login():
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+
+
+@whatsapp_contacts_app.command("init")
+def whatsapp_contacts_init():
+    """Create the local WhatsApp contacts store."""
+    from nanobot.channels.whatsapp_contacts import init_contacts_store, load_contacts
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    path = init_contacts_store(config.channels.whatsapp.contacts_file)
+    count = len(load_contacts(config.channels.whatsapp.contacts_file))
+    console.print(f"[green]✓[/green] WhatsApp contacts store ready at {path} ({count} contacts)")
+
+
+@whatsapp_contacts_app.command("list")
+def whatsapp_contacts_list():
+    """List locally allowed WhatsApp contacts."""
+    from nanobot.channels.whatsapp_contacts import load_contacts
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    path = _get_whatsapp_contacts_file(config)
+    contacts = load_contacts(config.channels.whatsapp.contacts_file)
+
+    console.print(f"{__logo__} WhatsApp Contacts\n")
+    console.print(f"Store: {path}")
+    if not contacts:
+        console.print("[yellow]No local WhatsApp contacts configured[/yellow]")
+        return
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Phone")
+    table.add_column("Label")
+    table.add_column("Enabled")
+    for contact in contacts:
+        table.add_row(contact.phone, contact.label or "-", "✓" if contact.enabled else "✗")
+    console.print(table)
+
+
+@whatsapp_contacts_app.command("add")
+def whatsapp_contacts_add(
+    phone: str = typer.Argument(..., help="Phone number to allow, e.g. +85212345678"),
+    label: str = typer.Option("", "--label", "-l", help="Optional local label"),
+):
+    """Add one WhatsApp contact to the local allowlist."""
+    from nanobot.channels.whatsapp_contacts import (
+        WhatsAppContact,
+        init_contacts_store,
+        load_contacts,
+        normalize_contact_id,
+        save_contacts,
+    )
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    init_contacts_store(config.channels.whatsapp.contacts_file)
+    contacts = load_contacts(config.channels.whatsapp.contacts_file)
+    target = normalize_contact_id(phone)
+    if not target:
+        console.print("[red]Invalid phone number[/red]")
+        raise typer.Exit(1)
+
+    updated = [c for c in contacts if normalize_contact_id(c.phone) != target]
+    updated.append(WhatsAppContact(phone=phone, label=label, enabled=True))
+    updated.sort(key=lambda c: normalize_contact_id(c.phone))
+    path = save_contacts(config.channels.whatsapp.contacts_file, updated)
+    console.print(f"[green]✓[/green] Added WhatsApp contact {phone} to {path}")
+
+
+@whatsapp_contacts_app.command("remove")
+def whatsapp_contacts_remove(
+    phone: str = typer.Argument(..., help="Phone number to remove"),
+):
+    """Remove one WhatsApp contact from the local allowlist."""
+    from nanobot.channels.whatsapp_contacts import load_contacts, normalize_contact_id, save_contacts
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    contacts = load_contacts(config.channels.whatsapp.contacts_file)
+    target = normalize_contact_id(phone)
+    updated = [c for c in contacts if normalize_contact_id(c.phone) != target]
+
+    if len(updated) == len(contacts):
+        console.print(f"[yellow]Contact not found: {phone}[/yellow]")
+        raise typer.Exit(1)
+
+    path = save_contacts(config.channels.whatsapp.contacts_file, updated)
+    console.print(f"[green]✓[/green] Removed WhatsApp contact {phone} from {path}")
+
+
+@whatsapp_groups_app.command("init")
+def whatsapp_groups_init():
+    """Create the local WhatsApp group-member CSV store."""
+    from nanobot.channels.whatsapp_group_members import init_group_members_store, load_group_members
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    path = init_group_members_store(config.channels.whatsapp.group_members_file)
+    count = len(load_group_members(config.channels.whatsapp.group_members_file))
+    console.print(f"[green]✓[/green] WhatsApp group-member store ready at {path} ({count} rows)")
+
+
+@whatsapp_groups_app.command("list")
+def whatsapp_groups_list():
+    """List locally allowed WhatsApp group-member rules."""
+    from nanobot.channels.whatsapp_group_members import load_group_members
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    path = _get_whatsapp_group_members_file(config)
+    rows = load_group_members(config.channels.whatsapp.group_members_file)
+
+    console.print(f"{__logo__} WhatsApp Groups\n")
+    console.print(f"Store: {path}")
+    if not rows:
+        console.print("[yellow]No local WhatsApp group-member rules configured[/yellow]")
+        return
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Group ID")
+    table.add_column("Group Name")
+    table.add_column("Member ID")
+    table.add_column("Phone")
+    table.add_column("Label")
+    table.add_column("Enabled")
+    for row in rows:
+        table.add_row(
+            row.group_id,
+            row.group_name or "-",
+            row.member_id or "-",
+            row.member_pn or "-",
+            row.member_label or "-",
+            "✓" if row.enabled else "✗",
+        )
+    console.print(table)
+
+
+@whatsapp_groups_app.command("add")
+def whatsapp_groups_add(
+    group_id: str = typer.Option("", "--group-id", help="WhatsApp group ID, optional for bootstrap rows"),
+    group_name: str = typer.Option("", "--group-name", help="Group name for matching or bootstrap"),
+    member_id: str = typer.Option("", "--member-id", help="Exact group member ID, e.g. 123456789@lid"),
+    member_pn: str = typer.Option("", "--member-pn", help="Member phone number, e.g. +85212345678"),
+    label: str = typer.Option("", "--label", "-l", help="Optional local label"),
+):
+    """Add one allowed group-member rule."""
+    from nanobot.channels.whatsapp_contacts import normalize_contact_id
+    from nanobot.channels.whatsapp_group_members import (
+        WhatsAppGroupMember,
+        init_group_members_store,
+        load_group_members,
+        normalize_group_id,
+        normalize_group_name,
+        normalize_member_id,
+        save_group_members,
+    )
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    if not normalize_group_id(group_id) and not normalize_group_name(group_name):
+        console.print("[red]Provide at least one of --group-id or --group-name[/red]")
+        raise typer.Exit(1)
+    if not normalize_member_id(member_id) and not normalize_contact_id(member_pn):
+        console.print("[red]Provide at least one of --member-id or --member-pn[/red]")
+        raise typer.Exit(1)
+
+    init_group_members_store(config.channels.whatsapp.group_members_file)
+    rows = load_group_members(config.channels.whatsapp.group_members_file)
+    updated = [
+        row for row in rows
+        if not (
+            normalize_group_id(row.group_id) == normalize_group_id(group_id)
+            and normalize_group_name(row.group_name) == normalize_group_name(group_name)
+            and normalize_member_id(row.member_id) == normalize_member_id(member_id)
+            and normalize_contact_id(row.member_pn) == normalize_contact_id(member_pn)
+        )
+    ]
+    updated.append(
+        WhatsAppGroupMember(
+            group_id=group_id,
+            group_name=group_name,
+            member_id=member_id,
+            member_pn=member_pn,
+            member_label=label,
+            enabled=True,
+        )
+    )
+    updated.sort(key=lambda row: (row.group_id, row.member_id, row.member_pn))
+    path = save_group_members(config.channels.whatsapp.group_members_file, updated)
+    console.print(f"[green]✓[/green] Added WhatsApp group-member rule to {path}")
+
+
+@whatsapp_groups_app.command("remove")
+def whatsapp_groups_remove(
+    group_id: str = typer.Argument(..., help="WhatsApp group ID"),
+    member_id: str = typer.Option("", "--member-id", help="Exact group member ID to remove"),
+    member_pn: str = typer.Option("", "--member-pn", help="Member phone number to remove"),
+):
+    """Remove one allowed group-member rule."""
+    from nanobot.channels.whatsapp_contacts import normalize_contact_id
+    from nanobot.channels.whatsapp_group_members import (
+        load_group_members,
+        normalize_group_id,
+        normalize_member_id,
+        save_group_members,
+    )
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    if not normalize_member_id(member_id) and not normalize_contact_id(member_pn):
+        console.print("[red]Provide at least one of --member-id or --member-pn[/red]")
+        raise typer.Exit(1)
+
+    rows = load_group_members(config.channels.whatsapp.group_members_file)
+    updated = [
+        row for row in rows
+        if not (
+            normalize_group_id(row.group_id) == normalize_group_id(group_id)
+            and (
+                (normalize_member_id(member_id) and normalize_member_id(row.member_id) == normalize_member_id(member_id))
+                or (
+                    normalize_contact_id(member_pn)
+                    and normalize_contact_id(row.member_pn) == normalize_contact_id(member_pn)
+                )
+            )
+        )
+    ]
+
+    if len(updated) == len(rows):
+        console.print("[yellow]Group-member rule not found[/yellow]")
+        raise typer.Exit(1)
+
+    path = save_group_members(config.channels.whatsapp.group_members_file, updated)
+    console.print(f"[green]✓[/green] Removed WhatsApp group-member rule from {path}")
 
 
 # ============================================================================

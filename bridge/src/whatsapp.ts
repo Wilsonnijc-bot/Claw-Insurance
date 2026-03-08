@@ -30,7 +30,18 @@ export interface InboundMessage {
   content: string;
   timestamp: number;
   isGroup: boolean;
+  participant?: string;
+  participantPn?: string;
+  groupId?: string;
+  groupName?: string;
+  pushName?: string;
   media?: string[];
+}
+
+export interface ChatTarget {
+  chatId: string;
+  phone?: string;
+  searchTerms: string[];
 }
 
 export interface WhatsAppClientOptions {
@@ -40,10 +51,35 @@ export interface WhatsAppClientOptions {
   onStatus: (status: string) => void;
 }
 
+export function extractPhoneFromJid(value: string): string {
+  const text = value.trim();
+  if (!text) {
+    return '';
+  }
+
+  const match = text.match(/^(\+?\d+)@(s\.whatsapp\.net|c\.us)$/);
+  return match ? match[1] : '';
+}
+
+export function resolvePhoneIdentifier(pn: string, sender: string): string {
+  const direct = pn.trim();
+  if (direct) {
+    if (direct.includes('@')) {
+      return extractPhoneFromJid(direct);
+    }
+    const cleaned = direct.replace(/[^\d+]/g, '');
+    return /\d/.test(cleaned) ? cleaned : '';
+  }
+
+  return extractPhoneFromJid(sender);
+}
+
 export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  private chatTargets: Map<string, ChatTarget> = new Map();
+  private groupNames: Map<string, string> = new Map();
 
   constructor(options: WhatsAppClientOptions) {
     this.options = options;
@@ -114,14 +150,24 @@ export class WhatsAppClient {
 
     // Handle incoming messages
     this.sock.ev.on('messages.upsert', async ({ messages, type }: { messages: any[]; type: string }) => {
+      console.log(`📩 messages.upsert type=${type} count=${messages.length}`);
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (msg.key.fromMe) continue;
-        if (msg.key.remoteJid === 'status@broadcast') continue;
+        if (msg.key.fromMe) {
+          console.log(`↪️ Ignoring outbound/self message ${msg.key.id || ''}`);
+          continue;
+        }
+        if (msg.key.remoteJid === 'status@broadcast') {
+          console.log(`↪️ Ignoring status broadcast ${msg.key.id || ''}`);
+          continue;
+        }
 
         const unwrapped = baileysExtractMessageContent(msg.message);
-        if (!unwrapped) continue;
+        if (!unwrapped) {
+          console.log(`↪️ Ignoring unsupported message ${msg.key.id || ''} from ${msg.key.remoteJid || '<unknown>'}`);
+          continue;
+        }
 
         const content = this.getTextContent(unwrapped);
         let fallbackContent: string | null = null;
@@ -146,14 +192,32 @@ export class WhatsAppClient {
         if (!finalContent && mediaPaths.length === 0) continue;
 
         const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
+        const sender = msg.key.remoteJid || '';
+        const pn = resolvePhoneIdentifier(msg.key.remoteJidAlt || '', sender);
+        const participant = isGroup ? (msg.key.participant || '') : '';
+        const participantPn = isGroup ? resolvePhoneIdentifier(msg.key.participantAlt || '', participant) : '';
+        const groupName = isGroup && sender ? await this.getGroupName(sender) : '';
+
+        console.log(
+          `📨 inbound ${isGroup ? 'group' : 'direct'} chat=${sender || '<unknown>'} participant=${participant || '-'} pn=${participantPn || pn || '-'} text=${(finalContent || '[media]').slice(0, 80)}`,
+        );
+
+        if (!isGroup && sender) {
+          this.rememberChatTarget(sender, pn, msg.pushName);
+        }
 
         this.options.onMessage({
           id: msg.key.id || '',
-          sender: msg.key.remoteJid || '',
-          pn: msg.key.remoteJidAlt || '',
+          sender,
+          pn,
           content: finalContent,
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          ...(participant ? { participant } : {}),
+          ...(participantPn ? { participantPn } : {}),
+          ...(sender && isGroup ? { groupId: sender } : {}),
+          ...(groupName ? { groupName } : {}),
+          ...(msg.pushName ? { pushName: msg.pushName } : {}),
           ...(mediaPaths.length > 0 ? { media: mediaPaths } : {}),
         });
       }
@@ -231,10 +295,62 @@ export class WhatsAppClient {
     await this.sock.sendMessage(to, { text });
   }
 
+  getChatTarget(chatId: string): ChatTarget | null {
+    return this.chatTargets.get(chatId) || null;
+  }
+
   async disconnect(): Promise<void> {
     if (this.sock) {
       this.sock.end(undefined);
       this.sock = null;
+    }
+  }
+
+  private rememberChatTarget(chatId: string, pn: string, pushName?: string): void {
+    const existing = this.chatTargets.get(chatId);
+    const searchTerms = new Set(existing?.searchTerms || []);
+    const bareChatId = chatId.includes('@') ? chatId.split('@')[0] : chatId;
+    const phone = this.normalizePhone(pn) || this.normalizePhone(bareChatId) || existing?.phone;
+
+    for (const candidate of [pushName, pn, bareChatId, phone]) {
+      const normalized = typeof candidate === 'string' ? candidate.trim() : '';
+      if (normalized) {
+        searchTerms.add(normalized);
+      }
+    }
+
+    this.chatTargets.set(chatId, {
+      chatId,
+      ...(phone ? { phone } : {}),
+      searchTerms: Array.from(searchTerms),
+    });
+  }
+
+  private normalizePhone(value: string): string | undefined {
+    const digits = value.replace(/\D/g, '');
+    return digits ? digits : undefined;
+  }
+
+  private async getGroupName(groupId: string): Promise<string> {
+    const cached = this.groupNames.get(groupId);
+    if (cached) {
+      return cached;
+    }
+
+    if (!this.sock) {
+      return '';
+    }
+
+    try {
+      const metadata = await this.sock.groupMetadata(groupId);
+      const subject = typeof metadata?.subject === 'string' ? metadata.subject.trim() : '';
+      if (subject) {
+        this.groupNames.set(groupId, subject);
+      }
+      return subject;
+    } catch (error) {
+      console.warn(`Failed to load WhatsApp group metadata for ${groupId}:`, error);
+      return '';
     }
   }
 }

@@ -18,8 +18,13 @@ class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
 
     enabled: bool = False
+    delivery_mode: Literal["send", "draft"] = "send"
     bridge_url: str = "ws://localhost:3001"
     bridge_token: str = ""  # Shared token for bridge auth (optional, recommended)
+    web_profile_dir: str = "~/.nanobot/whatsapp-web"
+    contacts_file: str = "~/.nanobot/contacts/whatsapp.json"
+    group_members_file: str = "~/.nanobot/contacts/whatsapp_groups.csv"
+    storage_dir: str = ""
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 

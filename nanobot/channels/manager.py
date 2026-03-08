@@ -52,7 +52,7 @@ class ChannelManager:
             try:
                 from nanobot.channels.whatsapp import WhatsAppChannel
                 self.channels["whatsapp"] = WhatsAppChannel(
-                    self.config.channels.whatsapp, self.bus
+                    self.config.channels.whatsapp, self.bus, workspace=self.config.workspace_path
                 )
                 logger.info("WhatsApp channel enabled")
             except ImportError as e:
@@ -154,6 +154,10 @@ class ChannelManager:
 
     def _validate_allow_from(self) -> None:
         for name, ch in self.channels.items():
+            if name == "whatsapp" and (
+                getattr(ch.config, "contacts_file", "") or getattr(ch.config, "group_members_file", "")
+            ):
+                continue
             if getattr(ch.config, "allow_from", None) == []:
                 raise SystemExit(
                     f'Error: "{name}" has empty allowFrom (denies all). '

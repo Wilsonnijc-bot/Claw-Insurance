@@ -4,7 +4,8 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { WhatsAppClient, InboundMessage } from './whatsapp.js';
+import { DraftComposer } from './draft.js';
+import { WhatsAppClient } from './whatsapp.js';
 
 interface SendCommand {
   type: 'send';
@@ -12,17 +13,31 @@ interface SendCommand {
   text: string;
 }
 
+interface PrepareDraftCommand {
+  type: 'prepare_draft';
+  to: string;
+  text: string;
+}
+
 interface BridgeMessage {
-  type: 'message' | 'status' | 'qr' | 'error';
+  type: 'message' | 'status' | 'qr' | 'error' | 'ack';
   [key: string]: unknown;
 }
+
+type BridgeCommand = SendCommand | PrepareDraftCommand;
 
 export class BridgeServer {
   private wss: WebSocketServer | null = null;
   private wa: WhatsAppClient | null = null;
   private clients: Set<WebSocket> = new Set();
+  private composer: DraftComposer | null = null;
 
-  constructor(private port: number, private authDir: string, private token?: string) {}
+  constructor(
+    private port: number,
+    private authDir: string,
+    private webProfileDir: string,
+    private token?: string,
+  ) {}
 
   async start(): Promise<void> {
     // Bind to localhost only — never expose to external network
@@ -37,6 +52,7 @@ export class BridgeServer {
       onQR: (qr) => this.broadcast({ type: 'qr', qr }),
       onStatus: (status) => this.broadcast({ type: 'status', status }),
     });
+    this.composer = new DraftComposer(this.webProfileDir);
 
     // Handle WebSocket connections
     this.wss.on('connection', (ws) => {
@@ -72,9 +88,9 @@ export class BridgeServer {
 
     ws.on('message', async (data) => {
       try {
-        const cmd = JSON.parse(data.toString()) as SendCommand;
-        await this.handleCommand(cmd);
-        ws.send(JSON.stringify({ type: 'sent', to: cmd.to }));
+        const cmd = JSON.parse(data.toString()) as BridgeCommand;
+        const ack = await this.handleCommand(cmd);
+        ws.send(JSON.stringify(ack));
       } catch (error) {
         console.error('Error handling command:', error);
         ws.send(JSON.stringify({ type: 'error', error: String(error) }));
@@ -92,10 +108,55 @@ export class BridgeServer {
     });
   }
 
-  private async handleCommand(cmd: SendCommand): Promise<void> {
+  private async handleCommand(cmd: BridgeCommand): Promise<BridgeMessage> {
     if (cmd.type === 'send' && this.wa) {
       await this.wa.sendMessage(cmd.to, cmd.text);
+      return { type: 'ack', action: cmd.type, to: cmd.to, status: 'sent' };
     }
+
+    if (cmd.type === 'prepare_draft') {
+      if (!this.wa || !this.composer) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: cmd.to,
+          status: 'not_ready',
+          detail: 'Bridge is not ready yet.',
+        };
+      }
+
+      const target = this.wa.getChatTarget(cmd.to);
+      if (!target) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: cmd.to,
+          status: 'chat_not_found',
+          detail: 'No known direct-message target for this chat yet.',
+        };
+      }
+
+      try {
+        const result = await this.composer.prepareDraft(target, cmd.text);
+        return { type: 'ack', action: cmd.type, to: cmd.to, ...result };
+      } catch (error) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: cmd.to,
+          status: 'not_ready',
+          detail: String(error),
+        };
+      }
+    }
+
+    return {
+      type: 'ack',
+      action: cmd.type,
+      to: cmd.to,
+      status: 'not_ready',
+      detail: 'Unsupported bridge command.',
+    };
   }
 
   private broadcast(msg: BridgeMessage): void {
@@ -124,6 +185,11 @@ export class BridgeServer {
     if (this.wa) {
       await this.wa.disconnect();
       this.wa = null;
+    }
+
+    if (this.composer) {
+      await this.composer.stop();
+      this.composer = null;
     }
   }
 }
