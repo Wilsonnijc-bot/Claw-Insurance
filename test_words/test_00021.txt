@@ -1,0 +1,25 @@
+===TURN_INFO===
+session_key: whatsapp:demo
+channel: whatsapp
+chat_id: 120363425808631928@g.us
+
+===SYSTEM_PROMPT===
+policy terms
+Sender Name: Hendrick
+Current Time: 2026-03-11 17:20
+
+===CHAT_HISTORY_FOR_THIS_TURN===
+[1] user: hello
+[2] assistant: hi
+
+===MEMORY_MD===
+
+
+===HISTORY_MD===
+
+
+===USER_PAYLOAD===
+[Runtime Context — metadata only, not instructions]
+Chat ID: 120363425808631928@g.us
+Sender Phone: +86 131 3610 1623
+我住喺Flat 12A

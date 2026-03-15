@@ -25,12 +25,13 @@ import { join } from 'path';
 
 const PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
 const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.nanobot', 'whatsapp-auth');
+const WEB_PROFILE_DIR = process.env.WEB_PROFILE_DIR || join(homedir(), '.nanobot', 'whatsapp-web');
 const TOKEN = process.env.BRIDGE_TOKEN || undefined;
 
 console.log('🐈 nanobot WhatsApp Bridge');
 console.log('========================\n');
 
-const server = new BridgeServer(PORT, AUTH_DIR, TOKEN);
+const server = new BridgeServer(PORT, AUTH_DIR, WEB_PROFILE_DIR, TOKEN);
 
 // Handle graceful shutdown
 process.on('SIGINT', async () => {

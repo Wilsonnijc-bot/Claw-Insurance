@@ -1,0 +1,39 @@
+===TURN_INFO===
+session_key: whatsapp:demo
+channel: whatsapp
+chat_id: 120363425808631928@g.us
+
+===SYSTEM_PROMPT===
+policy terms
+Sender Name: Unknown Sender Name
+Current Time: 2026-03-11 17:20
+
+===CHAT_HISTORY_FOR_THIS_TURN===
+[1] user: hello
+[2] assistant: hi
+
+===MEMORY_MD===
+
+
+===HISTORY_MD===
+
+
+===USER_PAYLOAD===
+[Runtime Context — metadata only, not instructions]
+Chat ID: Unknown Chat ID
+Sender Phone: Unknown Phone Number
+我住喺Unknown Living Address
+
+===SANITIZER_META===
+{
+  "blocked": true,
+  "reasons": [
+    "address still present"
+  ],
+  "placeholder_map": {
+    "Hendrick": "Unknown Sender Name",
+    "+86 131 3610 1623": "Unknown Phone Number",
+    "120363425808631928@g.us": "Unknown Chat ID",
+    "Flat 12A": "Unknown Living Address"
+  }
+}

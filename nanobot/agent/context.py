@@ -17,6 +17,13 @@ class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    BOOTSTRAP_SECTIONS = {
+        "AGENTS.md": "Operational Policy",
+        "SOUL.md": "Business Persona And Messaging",
+        "USER.md": "Operator Profile And Preferences",
+        "TOOLS.md": "Current Tool Limitations",
+        "IDENTITY.md": "Additional Identity",
+    }
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
     def __init__(self, workspace: Path):
@@ -28,13 +35,19 @@ class ContextBuilder:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
-        bootstrap = self._load_bootstrap_files()
-        if bootstrap:
-            parts.append(bootstrap)
+        bootstrap_sections = self._load_bootstrap_files()
+        if bootstrap_sections:
+            parts.extend(bootstrap_sections)
 
         memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
+
+        requested_skills = [name for name in dict.fromkeys(skill_names or []) if name]
+        if requested_skills:
+            requested_content = self.skills.load_skills_for_context(requested_skills)
+            if requested_content:
+                parts.append(f"# Requested Skills\n\n{requested_content}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -59,9 +72,9 @@ Skills with available="false" need dependencies installed first - you can try in
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
-        return f"""# nanobot 🐈
+        return f"""# Core Identity And Hard Rules
 
-You are nanobot, a helpful AI assistant.
+You are nanobot, the workspace's messaging assistant.
 
 ## Runtime
 {runtime}
@@ -72,7 +85,7 @@ Your workspace is at: {workspace_path}
 - History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
-## nanobot Guidelines
+## Hard Rules
 - State intent before tool calls, but NEVER predict or claim results before receiving them.
 - Before modifying a file, read it first. Do not assume files or directories exist.
 - After writing or editing a file, re-read it if accuracy matters.
@@ -82,26 +95,66 @@ Your workspace is at: {workspace_path}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
     @staticmethod
-    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+    def _sanitize_runtime_value(value: Any, max_chars: int = 120) -> str:
+        """Normalize a runtime metadata value so it is short and single-line."""
+        text = " ".join(str(value or "").split())
+        return text[:max_chars]
+
+    @classmethod
+    def _build_runtime_context(
+        cls,
+        channel: str | None,
+        chat_id: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         tz = time.strftime("%Z") or "UTC"
         lines = [f"Current Time: {now} ({tz})"]
+        meta = metadata or {}
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+
+        is_group = bool(meta.get("is_group"))
+        conversation_mode = ""
+        if channel == "whatsapp":
+            conversation_mode = "whatsapp_group" if is_group else "whatsapp_direct"
+        elif channel:
+            conversation_mode = cls._sanitize_runtime_value(channel)
+
+        if conversation_mode:
+            lines.append(f"Conversation Mode: {conversation_mode}")
+        if channel == "whatsapp" or "is_group" in meta:
+            lines.append(f"Is Group: {'true' if is_group else 'false'}")
+
+        if group_name := cls._sanitize_runtime_value(meta.get("group_name")):
+            lines.append(f"Group Name: {group_name}")
+        if sender_name := cls._sanitize_runtime_value(meta.get("sender_name") or meta.get("push_name")):
+            lines.append(f"Sender Name: {sender_name}")
+        if sender_phone := cls._sanitize_runtime_value(meta.get("sender_phone") or meta.get("pn")):
+            lines.append(f"Sender Phone: {sender_phone}")
+        if flow_mode := cls._sanitize_runtime_value(meta.get("insurance_flow_mode")):
+            lines.append(f"Insurance Flow Mode: {flow_mode}")
+        if "insurance_generic_reply_count" in meta:
+            lines.append(f"Insurance Generic Reply Count: {meta.get('insurance_generic_reply_count', 0)}")
+        if "insurance_cycle_active" in meta:
+            cycle_active = "true" if bool(meta.get("insurance_cycle_active")) else "false"
+            lines.append(f"Insurance Cycle Active: {cycle_active}")
+
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
-    def _load_bootstrap_files(self) -> str:
+    def _load_bootstrap_files(self) -> list[str]:
         """Load all bootstrap files from workspace."""
-        parts = []
+        parts: list[str] = []
 
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+                title = self.BOOTSTRAP_SECTIONS.get(filename, filename)
+                parts.append(f"# {title}\n\n## {filename}\n\n{content}")
 
-        return "\n\n".join(parts) if parts else ""
+        return parts
 
     def build_messages(
         self,
@@ -111,9 +164,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, metadata)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message

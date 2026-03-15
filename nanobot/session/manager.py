@@ -68,6 +68,55 @@ class Session:
         self.last_consolidated = 0
         self.updated_at = datetime.now()
 
+    def mark_message_deleted(
+        self,
+        *,
+        message_id: str,
+        deleted_by_sender: bool = True,
+        deleted_at: str | None = None,
+        deleter_id: str | None = None,
+        chat_id: str | None = None,
+    ) -> bool:
+        """Annotate a previously stored message as deleted without removing it."""
+        target = str(message_id or "").strip()
+        if not target:
+            return False
+
+        matched = False
+        for message in reversed(self.messages):
+            if str(message.get("message_id") or "").strip() != target:
+                continue
+            message["deleted_by_sender"] = deleted_by_sender
+            message["deleted_at"] = deleted_at or datetime.now().isoformat()
+            if deleter_id:
+                message["deleted_by"] = deleter_id
+            matched = True
+            break
+
+        event = {
+            "message_id": target,
+            "deleted_by_sender": deleted_by_sender,
+            "deleted_at": deleted_at or datetime.now().isoformat(),
+            "matched_message": matched,
+        }
+        if deleter_id:
+            event["deleted_by"] = deleter_id
+        if chat_id:
+            event["chat_id"] = chat_id
+
+        deleted_events = list(self.metadata.get("deleted_messages") or [])
+        replaced = False
+        for index, existing in enumerate(deleted_events):
+            if str(existing.get("message_id") or "").strip() == target:
+                deleted_events[index] = event
+                replaced = True
+                break
+        if not replaced:
+            deleted_events.append(event)
+        self.metadata["deleted_messages"] = deleted_events
+        self.updated_at = datetime.now()
+        return matched
+
 
 class SessionManager:
     """
@@ -80,7 +129,10 @@ class SessionManager:
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = Path.home() / ".nanobot" / "sessions"
+        self.project_root = Path(__file__).resolve().parents[2]
+        self.chat_histories_dir = ensure_dir(self.project_root / "Chathistories")
         self._cache: dict[str, Session] = {}
+        self._backfill_chat_history_bundles()
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -176,7 +228,59 @@ class SessionManager:
             for msg in session.messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
+        self._write_chat_history_bundle(session)
         self._cache[session.key] = session
+
+    def _write_chat_history_bundle(self, session: Session) -> None:
+        """Write a human-readable session bundle under project ./Chathistories."""
+        bundle_name = safe_filename(session.key.replace(":", "__"))
+        bundle_dir = ensure_dir(self.chat_histories_dir / bundle_name)
+
+        meta_payload = {
+            "key": session.key,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "last_consolidated": session.last_consolidated,
+            "message_count": len(session.messages),
+            "metadata": session.metadata,
+            "source_session_file": str(self._get_session_path(session.key)),
+        }
+        (bundle_dir / "meta.json").write_text(
+            json.dumps(meta_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        history_file = bundle_dir / "history.jsonl"
+        with open(history_file, "w", encoding="utf-8") as f:
+            for msg in session.messages:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+    def _backfill_chat_history_bundles(self) -> None:
+        """Populate Chathistories for existing session files if missing."""
+        for session_file in self.sessions_dir.glob("*.jsonl"):
+            try:
+                with open(session_file, encoding="utf-8") as f:
+                    first = f.readline().strip()
+                    if not first:
+                        continue
+                    first_data = json.loads(first)
+                    if first_data.get("_type") != "metadata":
+                        continue
+                    key = str(first_data.get("key", "")).strip()
+                    if not key:
+                        continue
+                    bundle_name = safe_filename(key.replace(":", "__"))
+                    bundle_dir = self.chat_histories_dir / bundle_name
+                    meta_path = bundle_dir / "meta.json"
+                    history_path = bundle_dir / "history.jsonl"
+                    if meta_path.exists() and history_path.exists():
+                        continue
+
+                session = self._load(key)
+                if session is not None:
+                    self._write_chat_history_bundle(session)
+            except Exception:
+                logger.exception("Failed to backfill chat history bundle from {}", session_file)
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
