@@ -1,0 +1,29 @@
+===TURN_INFO===
+prompt_generated_at: 2026-03-11 17:49:09 (Wednesday) (HKT)
+session_key: whatsapp:demo
+channel: whatsapp
+chat_id: x@g.us
+system_prompt_chars: 17
+
+===SYSTEM_PROMPT_FULL===
+line1
+line2
+line3
+
+===CHAT_HISTORY_FOR_THIS_TURN===
+
+===MEMORY_MD===
+
+
+===HISTORY_MD===
+
+
+===USER_PAYLOAD===
+u1
+
+===SANITIZER_META===
+{
+  "blocked": false,
+  "reasons": [],
+  "placeholder_map": {}
+}

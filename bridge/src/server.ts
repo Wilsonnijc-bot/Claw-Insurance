@@ -20,7 +20,7 @@ interface PrepareDraftCommand {
 }
 
 interface BridgeMessage {
-  type: 'message' | 'status' | 'qr' | 'error' | 'ack';
+  type: 'message' | 'deleted' | 'status' | 'qr' | 'error' | 'ack';
   [key: string]: unknown;
 }
 
@@ -49,6 +49,7 @@ export class BridgeServer {
     this.wa = new WhatsAppClient({
       authDir: this.authDir,
       onMessage: (msg) => this.broadcast({ type: 'message', ...msg }),
+      onDelete: (msg) => this.broadcast({ type: 'deleted', ...msg }),
       onQR: (qr) => this.broadcast({ type: 'qr', qr }),
       onStatus: (status) => this.broadcast({ type: 'status', status }),
     });

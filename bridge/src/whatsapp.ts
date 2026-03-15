@@ -30,12 +30,27 @@ export interface InboundMessage {
   content: string;
   timestamp: number;
   isGroup: boolean;
+  isSelfChat?: boolean;
   participant?: string;
   participantPn?: string;
   groupId?: string;
   groupName?: string;
   pushName?: string;
   media?: string[];
+}
+
+export interface DeletedMessage {
+  deletedMessageId: string;
+  sender: string;
+  pn: string;
+  timestamp: number;
+  isGroup: boolean;
+  participant?: string;
+  participantPn?: string;
+  groupId?: string;
+  groupName?: string;
+  pushName?: string;
+  deletedBySender: boolean;
 }
 
 export interface ChatTarget {
@@ -47,6 +62,7 @@ export interface ChatTarget {
 export interface WhatsAppClientOptions {
   authDir: string;
   onMessage: (msg: InboundMessage) => void;
+  onDelete: (msg: DeletedMessage) => void;
   onQR: (qr: string) => void;
   onStatus: (status: string) => void;
 }
@@ -72,6 +88,29 @@ export function resolvePhoneIdentifier(pn: string, sender: string): string {
   }
 
   return extractPhoneFromJid(sender);
+}
+
+function normalizeJidLocal(value: string): string {
+  const text = value.trim().toLowerCase();
+  if (!text) {
+    return '';
+  }
+  const localWithDevice = text.includes('@') ? text.split('@', 1)[0] : text;
+  const local = localWithDevice.includes(':') ? localWithDevice.split(':', 1)[0] : localWithDevice;
+  const digits = local.replace(/\D/g, '');
+  return digits || local;
+}
+
+export function isSelfDirectChat(remoteJid: string, selfJid: string): boolean {
+  const remote = remoteJid.trim().toLowerCase();
+  const self = selfJid.trim().toLowerCase();
+  if (!remote || !self) {
+    return false;
+  }
+  if (remote.endsWith('@g.us')) {
+    return false;
+  }
+  return normalizeJidLocal(remote) === normalizeJidLocal(self);
 }
 
 export class WhatsAppClient {
@@ -154,9 +193,13 @@ export class WhatsAppClient {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (msg.key.fromMe) {
+        const isSelfChat = this.isSelfChatMessage(msg);
+        if (msg.key.fromMe && !isSelfChat) {
           console.log(`↪️ Ignoring outbound/self message ${msg.key.id || ''}`);
           continue;
+        }
+        if (msg.key.fromMe && isSelfChat) {
+          console.log(`🗂️ Capturing self-chat message ${msg.key.id || ''}`);
         }
         if (msg.key.remoteJid === 'status@broadcast') {
           console.log(`↪️ Ignoring status broadcast ${msg.key.id || ''}`);
@@ -213,6 +256,7 @@ export class WhatsAppClient {
           content: finalContent,
           timestamp: msg.messageTimestamp as number,
           isGroup,
+          ...(isSelfChat ? { isSelfChat: true } : {}),
           ...(participant ? { participant } : {}),
           ...(participantPn ? { participantPn } : {}),
           ...(sender && isGroup ? { groupId: sender } : {}),
@@ -220,6 +264,24 @@ export class WhatsAppClient {
           ...(msg.pushName ? { pushName: msg.pushName } : {}),
           ...(mediaPaths.length > 0 ? { media: mediaPaths } : {}),
         });
+      }
+    });
+
+    this.sock.ev.on('messages.delete', async ({ keys }: { keys: any[] }) => {
+      for (const key of keys || []) {
+        const deleted = await this.toDeletedMessage(key);
+        if (deleted) {
+          this.options.onDelete(deleted);
+        }
+      }
+    });
+
+    this.sock.ev.on('messages.update', async (updates: any[]) => {
+      for (const update of updates || []) {
+        const deleted = await this.deletedMessageFromUpdate(update);
+        if (deleted) {
+          this.options.onDelete(deleted);
+        }
       }
     });
   }
@@ -352,5 +414,69 @@ export class WhatsAppClient {
       console.warn(`Failed to load WhatsApp group metadata for ${groupId}:`, error);
       return '';
     }
+  }
+
+  private isSelfChatMessage(msg: any): boolean {
+    const remoteJid = String(msg?.key?.remoteJid || '');
+    if (!remoteJid || remoteJid.endsWith('@g.us') || !this.sock?.user) {
+      return false;
+    }
+
+    const candidates = [
+      String(this.sock.user.id || ''),
+      String(this.sock.user.lid || ''),
+      String(this.sock.user.pn || ''),
+      String(this.sock.user.phone || ''),
+    ].filter(Boolean);
+
+    return candidates.some((candidate) => isSelfDirectChat(remoteJid, candidate));
+  }
+
+  private async deletedMessageFromUpdate(update: any): Promise<DeletedMessage | null> {
+    const protocolMessage = update?.update?.message?.protocolMessage;
+    const deletedKey = protocolMessage?.key;
+    if (!deletedKey?.id) {
+      return null;
+    }
+
+    const type = protocolMessage?.type;
+    if (type !== undefined && type !== 0 && type !== 'REVOKE') {
+      return null;
+    }
+
+    return this.toDeletedMessage({
+      ...deletedKey,
+      remoteJid: deletedKey.remoteJid || update?.key?.remoteJid,
+      participant: deletedKey.participant || update?.key?.participant,
+      participantAlt: deletedKey.participantAlt || update?.key?.participantAlt,
+      remoteJidAlt: deletedKey.remoteJidAlt || update?.key?.remoteJidAlt,
+    });
+  }
+
+  private async toDeletedMessage(key: any): Promise<DeletedMessage | null> {
+    const deletedMessageId = String(key?.id || '').trim();
+    const sender = String(key?.remoteJid || '').trim();
+    if (!deletedMessageId || !sender || sender === 'status@broadcast') {
+      return null;
+    }
+
+    const isGroup = sender.endsWith('@g.us');
+    const pn = resolvePhoneIdentifier(String(key?.remoteJidAlt || ''), sender);
+    const participant = isGroup ? String(key?.participant || '') : '';
+    const participantPn = isGroup ? resolvePhoneIdentifier(String(key?.participantAlt || ''), participant) : '';
+    const groupName = isGroup ? await this.getGroupName(sender) : '';
+
+    return {
+      deletedMessageId,
+      sender,
+      pn,
+      timestamp: Math.floor(Date.now() / 1000),
+      isGroup,
+      ...(participant ? { participant } : {}),
+      ...(participantPn ? { participantPn } : {}),
+      ...(isGroup ? { groupId: sender } : {}),
+      ...(groupName ? { groupName } : {}),
+      deletedBySender: true,
+    };
   }
 }

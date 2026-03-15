@@ -266,6 +266,19 @@ def _make_provider(config: Config):
     )
 
 
+def _maybe_enable_privacy_gateway(config: Config):
+    """Route custom-provider traffic through the local privacy gateway when enabled."""
+    model = config.agents.defaults.model
+    provider_name = config.get_provider_name(model)
+    if provider_name != "custom" or not config.privacy_gateway.enabled:
+        return None
+
+    upstream_base = config.get_api_base(model) or "http://localhost:8000/v1"
+    proc = _start_privacy_gateway(config, upstream_base)
+    config.providers.custom.api_base = _privacy_gateway_url(config)
+    return proc
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -297,6 +310,7 @@ def gateway(
     if workspace:
         config.agents.defaults.workspace = workspace
     bridge_proc = _start_whatsapp_bridge(config)
+    privacy_proc = _maybe_enable_privacy_gateway(config)
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     sync_workspace_templates(config.workspace_path)
@@ -328,6 +342,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        privacy_config=config.privacy_gateway,
     )
 
     # Set cron callback (needs agent)
@@ -453,6 +468,7 @@ def gateway(
             agent.stop()
             await channels.stop_all()
             _stop_whatsapp_bridge(bridge_proc)
+            _stop_background_process(privacy_proc)
 
     asyncio.run(run())
 
@@ -481,6 +497,7 @@ def agent(
 
     config = load_config()
     sync_workspace_templates(config.workspace_path)
+    privacy_proc = _maybe_enable_privacy_gateway(config)
 
     bus = MessageBus()
     provider = _make_provider(config)
@@ -511,6 +528,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        privacy_config=config.privacy_gateway,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -532,10 +550,13 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.close_mcp()
+            try:
+                with _thinking_ctx():
+                    response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
+                _print_agent_response(response, render_markdown=markdown)
+            finally:
+                await agent_loop.close_mcp()
+                _stop_background_process(privacy_proc)
 
         asyncio.run(run_once())
     else:
@@ -640,6 +661,7 @@ def agent(
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
                 await agent_loop.close_mcp()
+                _stop_background_process(privacy_proc)
 
         asyncio.run(run_interactive())
 
@@ -845,6 +867,27 @@ def _build_whatsapp_bridge_env(config: Config) -> dict[str, str]:
     return env
 
 
+def _privacy_gateway_url(config: Config) -> str:
+    """Return the local privacy gateway URL."""
+    privacy = config.privacy_gateway
+    return f"http://{privacy.listen_host}:{privacy.listen_port}/v1"
+
+
+def _build_privacy_gateway_env(config: Config, upstream_base: str) -> dict[str, str]:
+    """Build environment variables for the local privacy gateway."""
+    env = {**os.environ}
+    privacy = config.privacy_gateway
+    env["NANOBOT_PRIVACY_UPSTREAM_BASE"] = upstream_base
+    env["NANOBOT_PRIVACY_WORKSPACE"] = str(config.workspace_path)
+    env["NANOBOT_PRIVACY_LISTEN_HOST"] = privacy.listen_host
+    env["NANOBOT_PRIVACY_LISTEN_PORT"] = str(privacy.listen_port)
+    env["NANOBOT_PRIVACY_FAIL_CLOSED"] = "true" if privacy.fail_closed else "false"
+    env["NANOBOT_PRIVACY_SAVE_REDACTED_DEBUG"] = "true" if privacy.save_redacted_debug else "false"
+    env["NANOBOT_PRIVACY_TEXT_ONLY_SCOPE"] = "true" if privacy.text_only_scope else "false"
+    env["NANOBOT_PRIVACY_ENABLE_NER_ASSIST"] = "true" if privacy.enable_ner_assist else "false"
+    return env
+
+
 def _ensure_whatsapp_bridge_browser(bridge_dir: Path, config: Config, env: dict[str, str]) -> None:
     """Install Playwright browser runtime when draft mode needs it."""
     import subprocess
@@ -900,6 +943,33 @@ def _whatsapp_bridge_running(config: Config) -> bool:
             return False
 
 
+def _privacy_gateway_running(config: Config) -> bool:
+    """Return True when the local privacy gateway accepts a stable health check."""
+    gateway_url = _privacy_gateway_url(config).removesuffix("/v1") + "/healthz"
+
+    async def _probe() -> bool:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=0.5) as client:
+                resp = await client.get(gateway_url)
+                return resp.status_code == 200
+        except Exception:
+            return False
+
+    try:
+        return asyncio.run(_probe())
+    except RuntimeError:
+        parsed = urlparse(gateway_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 8787
+        try:
+            with socket.create_connection((host, port), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+
 def _start_whatsapp_bridge(config: Config):
     """Start the local WhatsApp bridge in the background when needed."""
     import subprocess
@@ -938,8 +1008,48 @@ def _start_whatsapp_bridge(config: Config):
     raise typer.Exit(1)
 
 
+def _start_privacy_gateway(config: Config, upstream_base: str):
+    """Start the local privacy gateway when custom cloud provider routing needs privacy filtering."""
+    import subprocess
+
+    if not config.privacy_gateway.enabled:
+        return None
+
+    if _privacy_gateway_running(config):
+        console.print("[green]✓[/green] Privacy gateway already running")
+        return None
+
+    env = _build_privacy_gateway_env(config, upstream_base)
+
+    console.print("Starting privacy gateway...")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "nanobot.privacy.gateway_server"],
+        env=env,
+        start_new_session=True,
+    )
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            console.print(f"[red]Privacy gateway exited early with code {proc.returncode}[/red]")
+            raise typer.Exit(1)
+        if _privacy_gateway_running(config):
+            console.print("[green]✓[/green] Privacy gateway ready")
+            return proc
+        time.sleep(0.2)
+
+    console.print("[red]Privacy gateway did not become ready in time[/red]")
+    _stop_background_process(proc)
+    raise typer.Exit(1)
+
+
 def _stop_whatsapp_bridge(proc) -> None:
     """Stop a background WhatsApp bridge process started by this CLI."""
+    _stop_background_process(proc)
+
+
+def _stop_background_process(proc) -> None:
+    """Stop a background subprocess started by this CLI."""
     if proc is None or proc.poll() is not None:
         return
 

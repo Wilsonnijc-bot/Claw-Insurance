@@ -31,6 +31,12 @@ from nanobot.channels.whatsapp_storage import (
     sync_direct_contact_storage,
     sync_group_row_storage,
 )
+from nanobot.channels.whatsapp_reply_targets import (
+    init_reply_targets_store,
+    observe_direct_identification,
+    observe_group_identification,
+    reply_targets_path,
+)
 from nanobot.config.schema import WhatsAppConfig
 
 
@@ -49,6 +55,9 @@ class WhatsAppChannel(BaseChannel):
         self.config: WhatsAppConfig = config
         self._workspace = Path(workspace).expanduser() if workspace else Path.home() / ".nanobot" / "workspace"
         self._storage_dir = storage_path(self.config.storage_dir, self._workspace)
+        self._project_root = Path(__file__).resolve().parents[2]
+        self._reply_targets_file = reply_targets_path(self.config.reply_targets_file, self._project_root)
+        init_reply_targets_store(self._reply_targets_file)
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
@@ -188,10 +197,11 @@ class WhatsAppChannel(BaseChannel):
             return None
 
         command_type = "prepare_draft" if self.config.delivery_mode == "draft" else "send"
+        text = self._restore_sender_name(msg.content, metadata)
         return {
             "type": command_type,
             "to": msg.chat_id,
-            "text": msg.content,
+            "text": text,
         }
 
     async def send(self, msg: OutboundMessage) -> None:
@@ -233,6 +243,7 @@ class WhatsAppChannel(BaseChannel):
             group_id = str(data.get("groupId", "") or sender)
             group_name = str(data.get("groupName", "") or "")
             push_name = str(data.get("pushName", "") or "")
+            is_self_chat = bool(data.get("isSelfChat", False))
 
             if message_id:
                 if message_id in self._processed_message_ids:
@@ -308,6 +319,17 @@ class WhatsAppChannel(BaseChannel):
                     )
                 except Exception:
                     logger.exception("Failed to update WhatsApp group storage for row {}", row_number + 1)
+                try:
+                    observe_group_identification(
+                        self._reply_targets_file,
+                        group_name=row.group_name or group_name,
+                        member_phone=row.member_pn or member_pn,
+                        group_id=row.group_id or group_id,
+                        member_id=row.member_id or member_id,
+                        member_label=row.member_label or push_name,
+                    )
+                except Exception:
+                    logger.exception("Failed to update reply-target JSON group identification")
                 await self._publish_inbound(
                     sender_id=member_id,
                     chat_id=group_id,
@@ -318,7 +340,9 @@ class WhatsAppChannel(BaseChannel):
                         "timestamp": data.get("timestamp"),
                         "is_group": True,
                         "pn": member_pn,
+                        "sender_phone": member_pn,
                         "sender": member_id,
+                        "sender_name": push_name,
                         "group_id": group_id,
                         "group_name": group_name,
                         "push_name": push_name,
@@ -333,14 +357,17 @@ class WhatsAppChannel(BaseChannel):
             session_identity = normalize_contact_id(resolved_pn) or sender
             logger.info("Sender {} pn {}", sender, resolved_pn or "<missing>")
 
-            contact = self.get_allowed_contact(sender_id)
-            if contact is None:
-                logger.warning(
-                    "Access denied for sender {} on channel {}. Add them to allowFrom or the local contacts store.",
-                    sender_id,
-                    self.name,
-                )
-                return
+            if is_self_chat:
+                contact = WhatsAppContact(phone=resolved_pn or sender_id, label=push_name or "self-chat", enabled=True)
+            else:
+                contact = self.get_allowed_contact(sender_id)
+                if contact is None:
+                    logger.warning(
+                        "Access denied for sender {} on channel {}. Add them to allowFrom or the local contacts store.",
+                        sender_id,
+                        self.name,
+                    )
+                    return
 
             session_key = f"{self.name}:{session_identity}" if session_identity else None
             try:
@@ -353,6 +380,16 @@ class WhatsAppChannel(BaseChannel):
                 )
             except Exception:
                 logger.exception("Failed to update WhatsApp direct storage for {}", sender_id)
+            try:
+                observe_direct_identification(
+                    self._reply_targets_file,
+                    phone=resolved_pn or sender_id,
+                    chat_id=sender,
+                    sender_id=sender,
+                    push_name=push_name,
+                )
+            except Exception:
+                logger.exception("Failed to update reply-target JSON direct identification")
             await self._publish_inbound(
                 sender_id=sender_id,
                 chat_id=sender,  # Use full chat ID for replies
@@ -363,8 +400,12 @@ class WhatsAppChannel(BaseChannel):
                     "timestamp": data.get("timestamp"),
                     "is_group": False,
                     "pn": resolved_pn,
+                    "sender_phone": resolved_pn,
                     "sender": sender,
+                    "sender_name": push_name,
                     "push_name": push_name,
+                    "is_self_chat": is_self_chat,
+                    "capture_only": is_self_chat,
                 },
                 session_key=session_key,
             )
@@ -383,6 +424,92 @@ class WhatsAppChannel(BaseChannel):
             # QR code for authentication
             logger.info("Scan QR code in the bridge terminal to connect WhatsApp")
 
+        elif msg_type == "deleted":
+            deleted_message_id = str(data.get("deletedMessageId", "") or "")
+            sender = str(data.get("sender", "") or "")
+            pn = str(data.get("pn", "") or "")
+            is_group = bool(data.get("isGroup", False))
+            participant = str(data.get("participant", "") or "")
+            participant_pn = str(data.get("participantPn", "") or "")
+            group_id = str(data.get("groupId", "") or sender)
+            group_name = str(data.get("groupName", "") or "")
+            push_name = str(data.get("pushName", "") or "")
+            deleted_at = data.get("timestamp")
+
+            if not deleted_message_id:
+                logger.warning("Ignoring WhatsApp deleted event without message id for {}", sender or "<unknown>")
+                return
+
+            if is_group:
+                member_id = participant
+                member_pn = participant_pn or self._extract_phone_from_sender(participant)
+                if not member_id:
+                    logger.warning("Ignoring WhatsApp group deletion without participant id in {}", group_id)
+                    return
+
+                group_match = self.get_allowed_group_member(group_id, group_name, member_id, member_pn)
+                if group_match is None:
+                    logger.warning(
+                        "Ignoring delete event for unmatched WhatsApp group {} member {}",
+                        group_id,
+                        member_id,
+                    )
+                    return
+
+                _row_number, row = group_match
+                session_identity = normalize_contact_id(member_pn) or normalize_member_id(member_id)
+                session_key = f"{self.name}:{group_id}:{session_identity}" if session_identity else None
+                await self._publish_inbound(
+                    sender_id=member_id,
+                    chat_id=group_id,
+                    content="",
+                    metadata={
+                        "event_type": "message_deleted",
+                        "capture_only": True,
+                        "deleted_message_id": deleted_message_id,
+                        "deleted_by_sender": True,
+                        "deleted_at": deleted_at,
+                        "is_group": True,
+                        "pn": row.member_pn or member_pn,
+                        "sender_phone": row.member_pn or member_pn,
+                        "sender": row.member_id or member_id,
+                        "sender_name": row.member_label or push_name,
+                        "group_id": row.group_id or group_id,
+                        "group_name": row.group_name or group_name,
+                    },
+                    session_key=session_key,
+                )
+                return
+
+            resolved_pn = pn or self._extract_phone_from_sender(sender)
+            user_id = resolved_pn if resolved_pn else sender
+            sender_id = user_id.split("@")[0] if "@" in user_id else user_id
+            contact = self.get_allowed_contact(sender_id)
+            if contact is None:
+                logger.warning("Ignoring delete event for unlisted WhatsApp sender {}", sender_id)
+                return
+
+            session_identity = normalize_contact_id(resolved_pn) or sender
+            session_key = f"{self.name}:{session_identity}" if session_identity else None
+            await self._publish_inbound(
+                sender_id=sender_id,
+                chat_id=sender,
+                content="",
+                metadata={
+                    "event_type": "message_deleted",
+                    "capture_only": True,
+                    "deleted_message_id": deleted_message_id,
+                    "deleted_by_sender": True,
+                    "deleted_at": deleted_at,
+                    "is_group": False,
+                    "pn": resolved_pn,
+                    "sender_phone": resolved_pn,
+                    "sender": sender,
+                    "sender_name": push_name,
+                },
+                session_key=session_key,
+            )
+
         elif msg_type == "ack":
             action = data.get("action", "unknown")
             status = data.get("status", "unknown")
@@ -395,3 +522,14 @@ class WhatsAppChannel(BaseChannel):
 
         elif msg_type == "error":
             logger.error("WhatsApp bridge error: {}", data.get('error'))
+
+    @staticmethod
+    def _restore_sender_name(text: str, metadata: dict | None = None) -> str:
+        """Restore only the sender-name placeholder before outbound chat delivery."""
+        if not isinstance(text, str) or "Unknown Sender Name" not in text:
+            return text
+        meta = metadata or {}
+        sender_name = " ".join(str(meta.get("sender_name") or meta.get("push_name") or "").split())
+        if not sender_name:
+            return text
+        return text.replace("Unknown Sender Name", sender_name)

@@ -7,6 +7,7 @@ import json
 import re
 import weakref
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -24,11 +25,12 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.privacy.sanitizer import TextPrivacySanitizer
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, PrivacyGatewayConfig
     from nanobot.cron.service import CronService
 
 
@@ -45,6 +47,116 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
+    _INSURANCE_FLOW_MODE_KEY = "insurance_flow_mode"
+    _INSURANCE_GENERIC_REPLY_COUNT_KEY = "insurance_generic_reply_count"
+    _INSURANCE_CYCLE_ACTIVE_KEY = "insurance_cycle_active"
+    _INSURANCE_WAITING_FOR_ANSWER_KEY = "insurance_waiting_for_answer"
+    _INSURANCE_GENERIC_LIMIT = 2
+    _INSURANCE_SKILL_NAME = "insurance-product-advisor"
+    _INSURANCE_TOPIC_KEYWORDS = (
+        "insurance",
+        "insured",
+        "medical",
+        "health",
+        "critical illness",
+        "life protection",
+        "life insurance",
+        "savings",
+        "retirement",
+        "dental",
+        "premium",
+        "coverage",
+        "benefit",
+        "recommend",
+        "recommendation",
+        "compare",
+        "comparison",
+        "plan",
+        "policy",
+        "牙科",
+        "醫療",
+        "医疗",
+        "危疾",
+        "重疾",
+        "人壽",
+        "人寿",
+        "保障",
+        "保險",
+        "保险",
+        "儲蓄",
+        "储蓄",
+        "退休",
+        "推薦",
+        "推荐",
+        "比較",
+        "比较",
+        "產品",
+        "产品",
+        "保費",
+        "保费",
+    )
+    _INSURANCE_FOLLOWUP_KEYWORDS = (
+        "hong kong",
+        "hk",
+        "macau",
+        "macao",
+        "香港",
+        "澳門",
+        "澳门",
+        "牙科",
+        "醫療",
+        "医疗",
+        "危疾",
+        "重疾",
+        "人壽",
+        "人寿",
+        "儲蓄",
+        "储蓄",
+        "退休",
+        "個人",
+        "个人",
+        "團體",
+        "团体",
+        "公司",
+        "僱員",
+        "雇员",
+        "學生",
+        "学生",
+        "工作",
+        "家庭",
+        "配偶",
+        "beneficiary",
+        "single",
+        "family",
+        "coverage",
+        "amount",
+        "budget",
+        "yes",
+        "no",
+        "第一種",
+        "第一种",
+        "第二種",
+        "第二种",
+    )
+    _INSURANCE_DOMAIN_KEYWORDS = {
+        "dental": ("dental", "牙科"),
+        "health_medical": ("health insurance", "medical", "hospital", "醫療", "医疗", "住院"),
+        "critical_illness": ("critical illness", "ci", "危疾", "重疾"),
+        "life_protection": ("life protection", "life insurance", "term life", "whole life", "人壽", "人寿", "壽險", "寿险"),
+        "savings_retirement": ("savings", "retirement", "annuity", "deferred annuity", "儲蓄", "储蓄", "退休", "年金"),
+        "general_protection_non_life": ("non-life", "non life", "general protection", "accident", "liability", "helper", "maid", "golf", "意外", "責任", "责任", "外傭", "外佣", "高爾夫"),
+    }
+    _INSURANCE_DOMAIN_REQUIRED_FACTS = {
+        "dental": ("age", "residence_location", "coverage_context"),
+        "health_medical": ("age", "health_conditions", "residence_location"),
+        "critical_illness": ("age", "health_conditions", "desired_coverage_amount"),
+        "life_protection": ("age", "health_conditions", "family_structure", "income_role", "desired_payout", "beneficiaries"),
+        "savings_retirement": ("location_of_funds", "investment_amount", "wealth_goals", "growth_expectations"),
+        "general_protection_non_life": ("subtype", "asset_details", "asset_usage", "asset_location"),
+    }
+    _INSURANCE_DOMAIN_ACTIVATION_REQUIRED_FACTS = {
+        "general_protection_non_life": {"subtype"},
+    }
 
     def __init__(
         self,
@@ -65,8 +177,9 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        privacy_config: PrivacyGatewayConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, PrivacyGatewayConfig
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
@@ -110,6 +223,11 @@ class AgentLoop:
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
+        self._project_root = Path(__file__).resolve().parents[2]
+        self._test_words_dir = self._project_root / "test_words"
+        self._test_counter_file = self._test_words_dir / ".counter"
+        self._privacy_sanitizer = TextPrivacySanitizer(privacy_config or PrivacyGatewayConfig())
+        self._ensure_test_words_dir()
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -129,6 +247,216 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+    def _ensure_test_words_dir(self) -> None:
+        """Create the test_words folder at repo root if needed."""
+        self._test_words_dir.mkdir(parents=True, exist_ok=True)
+        if not self._test_counter_file.exists():
+            self._test_counter_file.write_text("0\n", encoding="utf-8")
+
+    def _next_test_file_paths(self) -> tuple[Path, Path]:
+        """Return the next sequential raw+sanitized test_words file paths."""
+        try:
+            raw = self._test_counter_file.read_text(encoding="utf-8").strip()
+            current = int(raw) if raw else 0
+        except (OSError, ValueError):
+            current = 0
+        next_index = current + 1
+        self._test_counter_file.write_text(f"{next_index}\n", encoding="utf-8")
+        raw_path = self._test_words_dir / f"test_{next_index:05d}.txt"
+        sanitized_path = self._test_words_dir / f"test_{next_index:05d}_sanitized.txt"
+        return raw_path, sanitized_path
+
+    @staticmethod
+    def _render_snapshot_text(
+        *,
+        generated_at: str,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        system_prompt: str,
+        history: list[dict[str, Any]],
+        memory_text: str,
+        history_text: str,
+        user_payload: str,
+        sanitizer_meta: dict[str, Any] | None = None,
+    ) -> str:
+        """Render one debug snapshot in the established text format."""
+        lines: list[str] = [
+            "===TURN_INFO===",
+            f"prompt_generated_at: {generated_at}",
+            f"session_key: {session_key}",
+            f"channel: {channel}",
+            f"chat_id: {chat_id}",
+            "",
+            "===SYSTEM_PROMPT===",
+            str(system_prompt),
+            "",
+            "===CHAT_HISTORY_FOR_THIS_TURN===",
+        ]
+        for index, item in enumerate(history, start=1):
+            lines.append(f"[{index}] {item.get('role')}: {item.get('content')}")
+
+        lines.extend(
+            [
+                "",
+                "===MEMORY_MD===",
+                memory_text,
+                "",
+                "===HISTORY_MD===",
+                history_text,
+                "",
+                "===USER_PAYLOAD===",
+                str(user_payload),
+                "",
+            ]
+        )
+        if sanitizer_meta is not None:
+            lines.extend(
+                [
+                    "===SANITIZER_META===",
+                    json.dumps(sanitizer_meta, ensure_ascii=False, indent=2),
+                    "",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _write_turn_snapshot(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        initial_messages: list[dict[str, Any]],
+        history: list[dict[str, Any]],
+    ) -> None:
+        """Write per-turn prompt/memory/history snapshot for debugging."""
+        if not initial_messages:
+            return
+
+        try:
+            out_raw, out_sanitized = self._next_test_file_paths()
+            generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S (%A) (%Z)")
+            system_prompt = self._stringify_message_content(initial_messages[0].get("content", ""))
+            user_payload = initial_messages[-1].get("content", "")
+            memory_file = self.workspace / "memory" / "MEMORY.md"
+            history_file = self.workspace / "memory" / "HISTORY.md"
+            memory_text = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
+            history_text = history_file.read_text(encoding="utf-8") if history_file.exists() else ""
+
+            raw_text = self._render_snapshot_text(
+                generated_at=generated_at,
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                system_prompt=system_prompt,
+                history=history,
+                memory_text=memory_text,
+                history_text=history_text,
+                user_payload=str(user_payload),
+            )
+            out_raw.write_text(raw_text, encoding="utf-8")
+
+            sanitized_result = self._privacy_sanitizer.sanitize_chat_payload(
+                {"messages": initial_messages},
+                headers={"x-session-affinity": session_key},
+            )
+            sanitized_messages = sanitized_result.sanitized_payload.get("messages", [])
+            sanitized_system = self._stringify_message_content(sanitized_messages[0].get("content", "")) if sanitized_messages else ""
+            sanitized_user_payload = str(sanitized_messages[-1].get("content", "")) if sanitized_messages else ""
+            sanitized_history: list[dict[str, Any]] = []
+            for item in sanitized_messages[1:-1]:
+                if isinstance(item, dict):
+                    sanitized_history.append(
+                        {
+                            "role": item.get("role", "unknown"),
+                            "content": item.get("content"),
+                        }
+                    )
+
+            sanitized_memory, _, _ = self._privacy_sanitizer.redact_text_for_debug(memory_text, session_key=session_key)
+            sanitized_history_md, _, _ = self._privacy_sanitizer.redact_text_for_debug(history_text, session_key=session_key)
+            sanitized_text = self._render_snapshot_text(
+                generated_at=generated_at,
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                system_prompt=sanitized_system,
+                history=sanitized_history,
+                memory_text=sanitized_memory,
+                history_text=sanitized_history_md,
+                user_payload=sanitized_user_payload,
+                sanitizer_meta={
+                    "blocked": sanitized_result.blocked,
+                    "reasons": sanitized_result.reasons,
+                    "placeholder_map": sanitized_result.placeholder_map,
+                },
+            )
+            out_sanitized.write_text(sanitized_text, encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to write test_words snapshot")
+
+    @staticmethod
+    def _stringify_message_content(content: Any) -> str:
+        """Convert message content to readable full text for debug snapshots."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            return "\n".join(parts)
+        if isinstance(content, dict):
+            return json.dumps(content, ensure_ascii=False, indent=2)
+        return str(content)
+
+    def _apply_whatsapp_self_routing_from_message(self, content: str) -> None:
+        """Apply self-chat routing commands to WhatsApp local allowlists."""
+        if self.channels_config is None:
+            return
+        wa_cfg = getattr(self.channels_config, "whatsapp", None)
+        if wa_cfg is None:
+            return
+
+        from nanobot.channels.whatsapp_self_control import (
+            apply_self_routing_instruction,
+            parse_self_routing_instruction,
+        )
+        from nanobot.channels.whatsapp_reply_targets import (
+            reply_targets_path,
+            rewrite_from_self_instruction,
+        )
+
+        instruction = parse_self_routing_instruction(content)
+        if instruction is None:
+            return
+
+        try:
+            stats = apply_self_routing_instruction(
+                workspace=self.workspace,
+                contacts_file=wa_cfg.contacts_file,
+                group_members_file=wa_cfg.group_members_file,
+                storage_dir=wa_cfg.storage_dir,
+                instruction=instruction,
+            )
+            targets_file = reply_targets_path(wa_cfg.reply_targets_file, self._project_root)
+            target_stats = rewrite_from_self_instruction(
+                targets_file,
+                individuals=instruction.individuals,
+                groups=instruction.groups,
+            )
+            logger.info(
+                "Updated WhatsApp routing from self-chat command: contacts={}, groups_csv={}, direct_json={}, group_json={}",
+                stats.get("individual_count", -1),
+                stats.get("group_member_count", -1),
+                target_stats.get("direct_reply_target_count", -1),
+                target_stats.get("group_reply_target_count", -1),
+            )
+        except Exception:
+            logger.exception("Failed to apply WhatsApp self-chat routing command")
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -158,6 +486,322 @@ class AgentLoop:
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+
+    @classmethod
+    def _default_insurance_state(cls) -> dict[str, Any]:
+        return {
+            cls._INSURANCE_FLOW_MODE_KEY: "generic",
+            cls._INSURANCE_GENERIC_REPLY_COUNT_KEY: 0,
+            cls._INSURANCE_CYCLE_ACTIVE_KEY: False,
+            cls._INSURANCE_WAITING_FOR_ANSWER_KEY: False,
+        }
+
+    @classmethod
+    def _get_insurance_state(cls, session: Session) -> dict[str, Any]:
+        """Return normalized insurance flow state from session metadata."""
+        current = cls._default_insurance_state()
+        meta = session.metadata or {}
+
+        mode = meta.get(cls._INSURANCE_FLOW_MODE_KEY)
+        if mode in {"generic", "skill"}:
+            current[cls._INSURANCE_FLOW_MODE_KEY] = mode
+
+        try:
+            count = int(meta.get(cls._INSURANCE_GENERIC_REPLY_COUNT_KEY, 0))
+        except (TypeError, ValueError):
+            count = 0
+        current[cls._INSURANCE_GENERIC_REPLY_COUNT_KEY] = max(0, count)
+        current[cls._INSURANCE_CYCLE_ACTIVE_KEY] = bool(meta.get(cls._INSURANCE_CYCLE_ACTIVE_KEY, False))
+        current[cls._INSURANCE_WAITING_FOR_ANSWER_KEY] = bool(meta.get(cls._INSURANCE_WAITING_FOR_ANSWER_KEY, False))
+        return current
+
+    @classmethod
+    def _write_insurance_state(cls, session: Session, state: dict[str, Any]) -> None:
+        """Persist insurance flow state into session metadata."""
+        session.metadata[cls._INSURANCE_FLOW_MODE_KEY] = state[cls._INSURANCE_FLOW_MODE_KEY]
+        session.metadata[cls._INSURANCE_GENERIC_REPLY_COUNT_KEY] = state[cls._INSURANCE_GENERIC_REPLY_COUNT_KEY]
+        session.metadata[cls._INSURANCE_CYCLE_ACTIVE_KEY] = state[cls._INSURANCE_CYCLE_ACTIVE_KEY]
+        session.metadata[cls._INSURANCE_WAITING_FOR_ANSWER_KEY] = state[cls._INSURANCE_WAITING_FOR_ANSWER_KEY]
+
+    @classmethod
+    def _insurance_runtime_metadata(cls, state: dict[str, Any]) -> dict[str, Any]:
+        """Expose the current insurance flow state to runtime context."""
+        return {
+            cls._INSURANCE_FLOW_MODE_KEY: state[cls._INSURANCE_FLOW_MODE_KEY],
+            cls._INSURANCE_GENERIC_REPLY_COUNT_KEY: state[cls._INSURANCE_GENERIC_REPLY_COUNT_KEY],
+            cls._INSURANCE_CYCLE_ACTIVE_KEY: state[cls._INSURANCE_CYCLE_ACTIVE_KEY],
+        }
+
+    @staticmethod
+    def _looks_like_question(text: str | None) -> bool:
+        if not text:
+            return False
+        lowered = text.casefold()
+        return any(
+            marker in text or marker in lowered
+            for marker in ("?", "？", "想問", "方便講", "可唔可以", "可以講下", "which", "what", "how")
+        )
+
+    @classmethod
+    def _looks_insurance_related(cls, text: str | None) -> bool:
+        lowered = (text or "").casefold()
+        if not lowered.strip():
+            return False
+        return any(keyword.casefold() in lowered for keyword in cls._INSURANCE_TOPIC_KEYWORDS)
+
+    @classmethod
+    def _looks_like_insurance_followup_answer(cls, text: str | None) -> bool:
+        lowered = (text or "").casefold().strip()
+        if not lowered:
+            return False
+        if any(keyword.casefold() in lowered for keyword in cls._INSURANCE_FOLLOWUP_KEYWORDS):
+            return True
+        if re.search(r"\d", lowered):
+            return True
+        return bool(re.fullmatch(r"(yes|no|係|是|好|可以|得|ok|okay|第一種|第一种|第二種|第二种)", lowered))
+
+    @classmethod
+    def _recent_insurance_context(cls, session: Session, max_messages: int = 6) -> bool:
+        for message in reversed(session.messages[-max_messages:]):
+            content = message.get("content")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item.get("text", ""))
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                )
+            if isinstance(content, str) and cls._looks_insurance_related(content):
+                return True
+        return False
+
+    @staticmethod
+    def _session_text_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return ""
+
+    @classmethod
+    def _recent_user_text(cls, session: Session, max_messages: int = 6) -> str:
+        parts: list[str] = []
+        for message in session.messages[-max_messages:]:
+            if message.get("role") != "user":
+                continue
+            text = cls._session_text_content(message.get("content"))
+            if text.strip():
+                parts.append(text)
+        return "\n".join(parts)
+
+    @classmethod
+    def _detect_insurance_domain(cls, text: str) -> str | None:
+        lowered = text.casefold()
+        best_domain: str | None = None
+        best_score = 0
+        for domain, keywords in cls._INSURANCE_DOMAIN_KEYWORDS.items():
+            score = sum(1 for keyword in keywords if keyword.casefold() in lowered)
+            if score > best_score:
+                best_domain = domain
+                best_score = score
+        return best_domain
+
+    @classmethod
+    def _extract_fact_signals(cls, text: str) -> set[str]:
+        lowered = text.casefold()
+        signals: set[str] = set()
+
+        if re.search(r"(?:(?:age|aged)\s*\d{1,3})|(?:\d{1,3}\s*(?:歲|岁|yo|yrs?|years? old))", lowered):
+            signals.add("age")
+
+        if (
+            any(token in lowered for token in ("hong kong", "香港", "macau", "macao", "澳門", "澳门", "china", "中國", "中国"))
+            or re.search(r"\bhk\b", lowered)
+        ):
+            signals.update({"residence_location", "asset_location", "location_of_funds"})
+
+        if any(token in lowered for token in ("individual", "personal", "employee", "employer", "company", "group", "staff", "個人", "个人", "公司", "團體", "团体", "僱員", "雇员")):
+            signals.add("coverage_context")
+
+        if any(token in lowered for token in ("healthy", "health condition", "medical history", "health history", "smoker", "diabetes", "cancer", "bp", "高血壓", "高血压", "糖尿", "病歷", "病历", "健康狀況", "健康状况", "身體健康", "身体健康")):
+            signals.add("health_conditions")
+
+        if re.search(r"(?:hk\$|usd|rmb|cny|¥|￥|萬|万|million|m\b|sum assured|coverage amount|保障額|保障额|賠償額|赔偿额|保額|保额|投資額|投资额)", lowered):
+            signals.update({"desired_coverage_amount", "desired_payout", "investment_amount"})
+
+        if any(token in lowered for token in ("married", "single", "wife", "husband", "spouse", "kid", "kids", "child", "children", "parents", "family", "已婚", "單身", "单身", "配偶", "小朋友", "子女", "父母", "家庭")):
+            signals.add("family_structure")
+
+        if any(token in lowered for token in ("breadwinner", "main income", "sole income", "income role", "收入支柱", "經濟支柱", "经济支柱", "養家", "养家")):
+            signals.add("income_role")
+
+        if any(token in lowered for token in ("beneficiary", "beneficiaries", "受益人", "配偶", "子女", "父母")):
+            signals.add("beneficiaries")
+
+        if any(token in lowered for token in ("retirement", "education fund", "legacy", "wealth growth", "asset transfer", "退休", "教育金", "傳承", "传承", "增值")):
+            signals.add("wealth_goals")
+
+        if any(token in lowered for token in ("conservative", "balanced", "aggressive", "growth", "穩健", "稳健", "平衡", "進取", "进取", "增長", "增长")):
+            signals.add("growth_expectations")
+
+        if any(token in lowered for token in ("accident", "liability", "helper", "maid", "domestic worker", "golf", "意外", "責任", "责任", "外傭", "外佣", "高爾夫")):
+            signals.add("subtype")
+
+        if any(token in lowered for token in ("property", "home", "flat", "car", "asset", "house", "物業", "物业", "家居", "住宅", "車", "车", "資產", "资产")):
+            signals.add("asset_details")
+
+        if any(token in lowered for token in ("self-use", "own use", "rental", "rent out", "work use", "family use", "自住", "出租", "工作用途", "家庭用途")):
+            signals.add("asset_usage")
+
+        return signals
+
+    @classmethod
+    def _should_force_skill_mode(cls, msg: InboundMessage, session: Session) -> bool:
+        recent_text = cls._recent_user_text(session)
+        combined = "\n".join(part for part in (recent_text, msg.content) if part).strip()
+        if not combined:
+            return False
+
+        domain = cls._detect_insurance_domain(combined)
+        if not domain:
+            return False
+
+        available_signals = cls._extract_fact_signals(combined)
+        domain_signals = {
+            field
+            for field in cls._INSURANCE_DOMAIN_REQUIRED_FACTS.get(domain, ())
+            if field in available_signals
+        }
+
+        required_signals = cls._INSURANCE_DOMAIN_ACTIVATION_REQUIRED_FACTS.get(domain, set())
+        if required_signals and not required_signals.issubset(domain_signals):
+            return False
+
+        return len(domain_signals) >= 2
+
+    @classmethod
+    def _is_whatsapp_insurance_turn(cls, msg: InboundMessage, session: Session, state: dict[str, Any]) -> bool:
+        if msg.channel != "whatsapp":
+            return False
+        if state[cls._INSURANCE_FLOW_MODE_KEY] == "skill" and state[cls._INSURANCE_CYCLE_ACTIVE_KEY]:
+            if cls._looks_insurance_related(msg.content):
+                return True
+            if state[cls._INSURANCE_WAITING_FOR_ANSWER_KEY] and cls._looks_like_insurance_followup_answer(msg.content):
+                return True
+            return cls._recent_insurance_context(session) and cls._looks_like_insurance_followup_answer(msg.content)
+        if cls._looks_insurance_related(msg.content):
+            return True
+        if state[cls._INSURANCE_CYCLE_ACTIVE_KEY] and state[cls._INSURANCE_WAITING_FOR_ANSWER_KEY]:
+            if cls._looks_like_insurance_followup_answer(msg.content):
+                return True
+            return False
+        if cls._looks_like_insurance_followup_answer(msg.content):
+            return cls._recent_insurance_context(session)
+        if state[cls._INSURANCE_FLOW_MODE_KEY] == "skill" and state[cls._INSURANCE_CYCLE_ACTIVE_KEY]:
+            return True
+        return False
+
+    @staticmethod
+    def _extract_json_payload(text: str | None) -> Any | None:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        candidates = [raw]
+        for open_char, close_char in (("{", "}"), ("[", "]")):
+            start = raw.find(open_char)
+            end = raw.rfind(close_char)
+            if start != -1 and end != -1 and end > start:
+                candidates.append(raw[start:end + 1])
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    @classmethod
+    def _inspect_insurance_tool_activity(cls, turn_messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Inspect this turn's tool calls/results for product-flow completion."""
+        pending_exec: dict[str, str] = {}
+        find_result: dict[str, Any] | None = None
+        research_result: dict[str, Any] | None = None
+
+        for message in turn_messages:
+            if message.get("role") == "assistant":
+                for tool_call in message.get("tool_calls", []) or []:
+                    function = tool_call.get("function", {}) or {}
+                    if function.get("name") != "exec":
+                        continue
+                    try:
+                        arguments = json.loads(function.get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    command = str(arguments.get("command", ""))
+                    if "find_products.py" in command:
+                        pending_exec[tool_call.get("id", "")] = "find_products"
+                    elif "research_products.py" in command:
+                        pending_exec[tool_call.get("id", "")] = "research_products"
+            elif message.get("role") == "tool":
+                tool_id = str(message.get("tool_call_id", ""))
+                action = pending_exec.get(tool_id)
+                payload = cls._extract_json_payload(message.get("content"))
+                if action == "find_products" and isinstance(payload, dict):
+                    find_result = payload
+                elif action == "research_products" and isinstance(payload, dict):
+                    research_result = payload
+
+        missing_fields = []
+        no_fit_completed = False
+        if isinstance(find_result, dict):
+            missing_fields = find_result.get("missing_fields") or []
+            candidates = find_result.get("candidates") or []
+            no_fit_completed = not missing_fields and not candidates
+
+        research_completed = isinstance(research_result, dict) and "candidates" in research_result
+        return {
+            "find_products_used": find_result is not None,
+            "research_products_used": research_result is not None,
+            "missing_fields": missing_fields,
+            "no_fit_completed": no_fit_completed,
+            "research_completed": research_completed,
+        }
+
+    def _advance_insurance_state_after_turn(
+        self,
+        session: Session,
+        state: dict[str, Any],
+        insurance_turn: bool,
+        final_content: str | None,
+        turn_messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Update the session insurance flow state after one completed turn."""
+        next_state = dict(state)
+
+        if not insurance_turn and not next_state[self._INSURANCE_CYCLE_ACTIVE_KEY]:
+            return next_state
+
+        if next_state[self._INSURANCE_FLOW_MODE_KEY] == "generic":
+            if insurance_turn and final_content:
+                next_state[self._INSURANCE_CYCLE_ACTIVE_KEY] = True
+                next_state[self._INSURANCE_GENERIC_REPLY_COUNT_KEY] += 1
+                next_state[self._INSURANCE_WAITING_FOR_ANSWER_KEY] = True
+                if next_state[self._INSURANCE_GENERIC_REPLY_COUNT_KEY] >= self._INSURANCE_GENERIC_LIMIT:
+                    next_state[self._INSURANCE_FLOW_MODE_KEY] = "skill"
+            return next_state
+
+        activity = self._inspect_insurance_tool_activity(turn_messages)
+        if activity["research_completed"] or activity["no_fit_completed"]:
+            return self._default_insurance_state()
+
+        next_state[self._INSURANCE_FLOW_MODE_KEY] = "skill"
+        next_state[self._INSURANCE_CYCLE_ACTIVE_KEY] = True
+        next_state[self._INSURANCE_WAITING_FOR_ANSWER_KEY] = bool(
+            activity["missing_fields"] or self._looks_like_question(final_content)
+        )
+        return next_state
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -345,7 +989,7 @@ class AgentLoop:
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
                 history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_message=msg.content, channel=channel, chat_id=chat_id, metadata=msg.metadata,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -358,6 +1002,55 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+
+        if bool(msg.metadata.get("capture_only")):
+            if msg.metadata.get("event_type") == "message_deleted":
+                matched = session.mark_message_deleted(
+                    message_id=str(msg.metadata.get("deleted_message_id") or ""),
+                    deleted_by_sender=bool(msg.metadata.get("deleted_by_sender", True)),
+                    deleted_at=str(msg.metadata.get("deleted_at") or ""),
+                    deleter_id=str(msg.metadata.get("sender") or msg.sender_id or ""),
+                    chat_id=msg.chat_id,
+                )
+                self.sessions.save(session)
+                logger.info(
+                    "Recorded deleted WhatsApp message {} for {}:{} (matched={})",
+                    msg.metadata.get("deleted_message_id"),
+                    msg.channel,
+                    msg.sender_id,
+                    matched,
+                )
+                return None
+            if msg.channel == "whatsapp" and bool(msg.metadata.get("is_self_chat")):
+                self._apply_whatsapp_self_routing_from_message(msg.content)
+            session.add_message(
+                role="user",
+                content=msg.content,
+                sender_id=msg.sender_id,
+                chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
+            self.sessions.save(session)
+            logger.info("Captured message without reply for {}:{} (capture_only)", msg.channel, msg.sender_id)
+            return None
+
+        insurance_state = self._get_insurance_state(session) if msg.channel == "whatsapp" else None
+        insurance_turn = False
+        runtime_metadata = dict(msg.metadata or {})
+        skill_names: list[str] | None = None
+
+        if insurance_state is not None:
+            insurance_turn = self._is_whatsapp_insurance_turn(msg, session, insurance_state)
+            if insurance_turn:
+                insurance_state[self._INSURANCE_CYCLE_ACTIVE_KEY] = True
+                if (
+                    insurance_state[self._INSURANCE_GENERIC_REPLY_COUNT_KEY] >= self._INSURANCE_GENERIC_LIMIT
+                    or self._should_force_skill_mode(msg, session)
+                ):
+                    insurance_state[self._INSURANCE_FLOW_MODE_KEY] = "skill"
+                self._write_insurance_state(session, insurance_state)
+                runtime_metadata.update(self._insurance_runtime_metadata(insurance_state))
+                skill_names = [self._INSURANCE_SKILL_NAME]
 
         # Slash commands
         cmd = msg.content.strip().lower()
@@ -421,7 +1114,14 @@ class AgentLoop:
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+            channel=msg.channel, chat_id=msg.chat_id, metadata=runtime_metadata, skill_names=skill_names,
+        )
+        self._write_turn_snapshot(
+            session_key=session.key,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            initial_messages=initial_messages,
+            history=history,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -439,7 +1139,17 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        self._save_turn(session, all_msgs, 1 + len(history), inbound_msg=msg)
+        if insurance_state is not None:
+            turn_messages = all_msgs[1 + len(history):]
+            next_state = self._advance_insurance_state_after_turn(
+                session,
+                insurance_state,
+                insurance_turn=insurance_turn,
+                final_content=final_content,
+                turn_messages=turn_messages,
+            )
+            self._write_insurance_state(session, next_state)
         self.sessions.save(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
@@ -452,9 +1162,10 @@ class AgentLoop:
             metadata=msg.metadata or {},
         )
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+    def _save_turn(self, session: Session, messages: list[dict], skip: int, *, inbound_msg: InboundMessage | None = None) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
+        attached_inbound_user = False
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
@@ -483,6 +1194,11 @@ class AgentLoop:
                     if not filtered:
                         continue
                     entry["content"] = filtered
+                if not attached_inbound_user and inbound_msg is not None:
+                    entry.setdefault("message_id", inbound_msg.metadata.get("message_id"))
+                    entry.setdefault("sender_id", inbound_msg.sender_id)
+                    entry.setdefault("chat_id", inbound_msg.chat_id)
+                    attached_inbound_user = True
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()

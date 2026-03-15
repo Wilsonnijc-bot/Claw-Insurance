@@ -40,6 +40,7 @@ def test_whatsapp_config_accepts_draft_fields() -> None:
                     "webProfileDir": "~/custom-whatsapp-web",
                     "contactsFile": "~/contacts.json",
                     "groupMembersFile": "~/groups.csv",
+                    "replyTargetsFile": "~/data/reply_targets.json",
                     "storageDir": "~/whatsapp-storage",
                     "allowFrom": ["+1234567890"],
                 }
@@ -51,6 +52,7 @@ def test_whatsapp_config_accepts_draft_fields() -> None:
     assert config.channels.whatsapp.web_profile_dir == "~/custom-whatsapp-web"
     assert config.channels.whatsapp.contacts_file == "~/contacts.json"
     assert config.channels.whatsapp.group_members_file == "~/groups.csv"
+    assert config.channels.whatsapp.reply_targets_file == "~/data/reply_targets.json"
     assert config.channels.whatsapp.storage_dir == "~/whatsapp-storage"
 
 
@@ -67,6 +69,33 @@ async def test_whatsapp_send_mode_emits_send_command() -> None:
 
     assert [json.loads(item) for item in ws.sent] == [
         {"type": "send", "to": "123@s.whatsapp.net", "text": "hello"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_send_restores_only_sender_name_placeholder() -> None:
+    channel = _make_channel(
+        WhatsAppConfig(enabled=True, delivery_mode="send", allow_from=["+1234567890"], contacts_file="", group_members_file="")
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+    channel._connected = True
+
+    await channel.send(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id="123@s.whatsapp.net",
+            content="Hi Unknown Sender Name, call Unknown Phone Number",
+            metadata={"sender_name": "Hendrick"},
+        )
+    )
+
+    assert [json.loads(item) for item in ws.sent] == [
+        {
+            "type": "send",
+            "to": "123@s.whatsapp.net",
+            "text": "Hi Hendrick, call Unknown Phone Number",
+        }
     ]
 
 
@@ -122,6 +151,7 @@ async def test_whatsapp_allowed_direct_message_reaches_bus() -> None:
                 "id": "m1",
                 "sender": "123@s.whatsapp.net",
                 "pn": "+1234567890",
+                "pushName": "Alice Chan",
                 "content": "hello there",
                 "timestamp": 1700000000,
                 "isGroup": False,
@@ -135,7 +165,9 @@ async def test_whatsapp_allowed_direct_message_reaches_bus() -> None:
     assert msg.chat_id == "123@s.whatsapp.net"
     assert msg.content == "hello there"
     assert msg.metadata["pn"] == "+1234567890"
+    assert msg.metadata["sender_phone"] == "+1234567890"
     assert msg.metadata["sender"] == "123@s.whatsapp.net"
+    assert msg.metadata["sender_name"] == "Alice Chan"
     assert msg.session_key == "whatsapp:1234567890"
 
 
@@ -165,6 +197,67 @@ async def test_whatsapp_falls_back_to_phone_jid_when_pn_is_missing() -> None:
     assert msg.sender_id == "85212345678"
     assert msg.chat_id == "85212345678@s.whatsapp.net"
     assert msg.metadata["pn"] == "85212345678"
+    assert msg.session_key == "whatsapp:85212345678"
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_self_chat_bypasses_allowlist_and_marks_capture_only() -> None:
+    bus = MessageBus()
+    channel = WhatsAppChannel(
+        WhatsAppConfig(enabled=True, delivery_mode="send", allow_from=[], contacts_file="", group_members_file=""),
+        bus,
+    )
+
+    await channel._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "self1",
+                "sender": "85212345678@s.whatsapp.net",
+                "pn": "+85212345678",
+                "pushName": "Me",
+                "content": "note to self",
+                "timestamp": 1700000010,
+                "isGroup": False,
+                "isSelfChat": True,
+            }
+        )
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.sender_id == "+85212345678"
+    assert msg.chat_id == "85212345678@s.whatsapp.net"
+    assert msg.metadata["is_self_chat"] is True
+    assert msg.metadata["capture_only"] is True
+    assert msg.session_key == "whatsapp:85212345678"
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_deleted_direct_message_reaches_bus_as_capture_only() -> None:
+    bus = MessageBus()
+    channel = WhatsAppChannel(
+        WhatsAppConfig(enabled=True, delivery_mode="send", allow_from=["+85212345678"], contacts_file="", group_members_file=""),
+        bus,
+    )
+
+    await channel._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "deleted",
+                "deletedMessageId": "wa-msg-1",
+                "sender": "85212345678@s.whatsapp.net",
+                "pn": "+85212345678",
+                "timestamp": 1700000100,
+                "isGroup": False,
+            }
+        )
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.content == ""
+    assert msg.metadata["event_type"] == "message_deleted"
+    assert msg.metadata["deleted_message_id"] == "wa-msg-1"
+    assert msg.metadata["capture_only"] is True
     assert msg.session_key == "whatsapp:85212345678"
 
 
@@ -257,6 +350,7 @@ async def test_whatsapp_group_message_matching_csv_reaches_bus(tmp_path: Path) -
                 "participantPn": "+85212345678",
                 "groupId": "1203630group@g.us",
                 "groupName": "Family Group",
+                "pushName": "Alice",
                 "content": "hello group",
                 "timestamp": 1700000002,
                 "isGroup": True,
@@ -268,6 +362,8 @@ async def test_whatsapp_group_message_matching_csv_reaches_bus(tmp_path: Path) -
     assert msg.sender_id == "alice@lid"
     assert msg.chat_id == "1203630group@g.us"
     assert msg.metadata["pn"] == "+85212345678"
+    assert msg.metadata["sender_phone"] == "+85212345678"
+    assert msg.metadata["sender_name"] == "Alice"
     assert msg.metadata["group_id"] == "1203630group@g.us"
     assert msg.metadata["group_name"] == "Family Group"
     assert msg.session_key == "whatsapp:1203630group@g.us:85212345678"

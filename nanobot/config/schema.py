@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Base(BaseModel):
@@ -24,6 +24,7 @@ class WhatsAppConfig(Base):
     web_profile_dir: str = "~/.nanobot/whatsapp-web"
     contacts_file: str = "~/.nanobot/contacts/whatsapp.json"
     group_members_file: str = "~/.nanobot/contacts/whatsapp_groups.csv"
+    reply_targets_file: str = "data/whatsapp_reply_targets.json"
     storage_dir: str = ""
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
@@ -282,6 +283,18 @@ class HeartbeatConfig(Base):
     interval_s: int = 30 * 60  # 30 minutes
 
 
+class PrivacyGatewayConfig(Base):
+    """Local privacy gateway configuration."""
+
+    enabled: bool = True
+    listen_host: str = "127.0.0.1"
+    listen_port: int = 8787
+    fail_closed: bool = True
+    save_redacted_debug: bool = True
+    text_only_scope: bool = True
+    enable_ner_assist: bool = False
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
@@ -337,10 +350,13 @@ class ToolsConfig(Base):
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
+    model_config = SettingsConfigDict(alias_generator=to_camel, populate_by_name=True)
+
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    privacy_gateway: PrivacyGatewayConfig = Field(default_factory=PrivacyGatewayConfig, alias="privacyGateway")
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     @property
