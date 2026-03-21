@@ -25,6 +25,15 @@ class InboundMessage:
 
 
 @dataclass
+class InboundHistoryBatch:
+    """Batch of historical messages imported from a channel without reply handling."""
+
+    channel: str
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class OutboundMessage:
     """Message to send to a chat channel."""
 
@@ -34,5 +43,4 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-
 

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundHistoryBatch, InboundMessage, OutboundMessage
 
 
 class MessageBus:
@@ -15,6 +15,7 @@ class MessageBus:
 
     def __init__(self):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
+        self.history: asyncio.Queue[InboundHistoryBatch] = asyncio.Queue()
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
@@ -24,6 +25,14 @@ class MessageBus:
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""
         return await self.inbound.get()
+
+    async def publish_history(self, batch: InboundHistoryBatch) -> None:
+        """Publish a historical batch for silent import."""
+        await self.history.put(batch)
+
+    async def consume_history(self) -> InboundHistoryBatch:
+        """Consume the next historical batch (blocks until available)."""
+        return await self.history.get()
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
@@ -42,3 +51,8 @@ class MessageBus:
     def outbound_size(self) -> int:
         """Number of pending outbound messages."""
         return self.outbound.qsize()
+
+    @property
+    def history_size(self) -> int:
+        """Number of pending history batches."""
+        return self.history.qsize()

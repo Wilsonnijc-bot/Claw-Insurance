@@ -9,7 +9,67 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.channels.whatsapp_contacts import normalize_contact_id
+from nanobot.channels.whatsapp_storage import write_visible_history_jsonl
 from nanobot.utils.helpers import ensure_dir, safe_filename
+
+
+def is_whatsapp_session_key(key: str) -> bool:
+    """Return True when the session key belongs to WhatsApp."""
+    return str(key or "").startswith("whatsapp:")
+
+
+def storage_role_for_session(key: str, role: str) -> str:
+    """Map model-style roles to persisted WhatsApp roles when needed."""
+    text = str(role or "")
+    if not is_whatsapp_session_key(key):
+        return text
+    if text == "user":
+        return "client"
+    if text == "assistant":
+        return "me"
+    return text
+
+
+def model_role_for_session(key: str, role: str) -> str:
+    """Map persisted WhatsApp roles back to model/provider roles when needed."""
+    text = str(role or "")
+    if not is_whatsapp_session_key(key):
+        return text
+    if text == "client":
+        return "user"
+    if text == "me":
+        return "assistant"
+    return text
+
+
+def legacy_chat_history_bundle_name(key: str) -> str:
+    """Return the legacy chat-history bundle name derived directly from the session key."""
+    return safe_filename(str(key or "").replace(":", "__"))
+
+
+def canonical_chat_history_bundle_name(key: str) -> str:
+    """Return the human-readable chat-history bundle name for a session key."""
+    legacy_name = legacy_chat_history_bundle_name(key)
+    if not is_whatsapp_session_key(key):
+        return legacy_name
+
+    parts = str(key or "").split(":")
+    if len(parts) != 2:
+        return legacy_name
+
+    identity = str(parts[1] or "").strip()
+    if not identity:
+        return legacy_name
+
+    # Canonicalize only when the direct-session key is clearly phone-derived.
+    if "@" in identity and not (identity.endswith("@s.whatsapp.net") or identity.endswith("@c.us")):
+        return legacy_name
+
+    phone = normalize_contact_id(identity)
+    if not phone:
+        return legacy_name
+    return safe_filename(f"whatsapp__{phone}")
 
 
 @dataclass
@@ -34,7 +94,7 @@ class Session:
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
         msg = {
-            "role": role,
+            "role": storage_role_for_session(self.key, role),
             "content": content,
             "timestamp": datetime.now().isoformat(),
             **kwargs
@@ -42,20 +102,28 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
-    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Return unconsolidated messages for LLM input, aligned to a user turn."""
-        unconsolidated = self.messages[self.last_consolidated:]
-        sliced = unconsolidated[-max_messages:]
+    def get_history(
+        self,
+        max_messages: int | None = 500,
+        *,
+        include_consolidated: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return session history for LLM input, aligned to a user turn."""
+        source = self.messages if include_consolidated else self.messages[self.last_consolidated:]
+        sliced = list(source if max_messages is None else source[-max_messages:])
 
         # Drop leading non-user messages to avoid orphaned tool_result blocks
         for i, m in enumerate(sliced):
-            if m.get("role") == "user":
+            if model_role_for_session(self.key, str(m.get("role", "") or "")) == "user":
                 sliced = sliced[i:]
                 break
 
         out: list[dict[str, Any]] = []
         for m in sliced:
-            entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
+            entry: dict[str, Any] = {
+                "role": model_role_for_session(self.key, str(m.get("role", "") or "")),
+                "content": m.get("content", ""),
+            }
             for k in ("tool_calls", "tool_call_id", "name"):
                 if k in m:
                     entry[k] = m[k]
@@ -198,6 +266,8 @@ class SessionManager:
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
                     else:
+                        if "role" in data:
+                            data["role"] = storage_role_for_session(key, str(data.get("role", "") or ""))
                         messages.append(data)
 
             return Session(
@@ -233,7 +303,7 @@ class SessionManager:
 
     def _write_chat_history_bundle(self, session: Session) -> None:
         """Write a human-readable session bundle under project ./Chathistories."""
-        bundle_name = safe_filename(session.key.replace(":", "__"))
+        bundle_name = canonical_chat_history_bundle_name(session.key)
         bundle_dir = ensure_dir(self.chat_histories_dir / bundle_name)
 
         meta_payload = {
@@ -251,9 +321,18 @@ class SessionManager:
         )
 
         history_file = bundle_dir / "history.jsonl"
-        with open(history_file, "w", encoding="utf-8") as f:
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        write_visible_history_jsonl(history_file, session.key, session.messages)
+        self._remove_legacy_chat_history_bundle(session.key, canonical_dir=bundle_dir)
+
+    def _remove_legacy_chat_history_bundle(self, key: str, *, canonical_dir: Path) -> None:
+        """Drop a legacy bundle directory after the canonical export is written."""
+        legacy_dir = self.chat_histories_dir / legacy_chat_history_bundle_name(key)
+        if legacy_dir == canonical_dir or not legacy_dir.exists():
+            return
+        try:
+            shutil.rmtree(legacy_dir)
+        except Exception:
+            logger.exception("Failed to remove legacy chat history bundle for {}", key)
 
     def _backfill_chat_history_bundles(self) -> None:
         """Populate Chathistories for existing session files if missing."""
@@ -269,11 +348,12 @@ class SessionManager:
                     key = str(first_data.get("key", "")).strip()
                     if not key:
                         continue
-                    bundle_name = safe_filename(key.replace(":", "__"))
+                    bundle_name = canonical_chat_history_bundle_name(key)
                     bundle_dir = self.chat_histories_dir / bundle_name
                     meta_path = bundle_dir / "meta.json"
                     history_path = bundle_dir / "history.jsonl"
                     if meta_path.exists() and history_path.exists():
+                        self._remove_legacy_chat_history_bundle(key, canonical_dir=bundle_dir)
                         continue
 
                 session = self._load(key)

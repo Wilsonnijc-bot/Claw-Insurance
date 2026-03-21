@@ -1,10 +1,13 @@
 import os
 from pathlib import Path
 
+import nanobot.cli.commands as commands
 from nanobot.cli.commands import (
     _bridge_needs_refresh,
+    _build_whatsapp_cdp_launch_command,
     _build_privacy_gateway_env,
     _build_whatsapp_bridge_env,
+    _cdp_probe_url,
 )
 from nanobot.config.schema import Config
 
@@ -17,6 +20,9 @@ def test_build_whatsapp_bridge_env_uses_configured_values() -> None:
                     "enabled": True,
                     "bridgeUrl": "ws://127.0.0.1:3015",
                     "bridgeToken": "secret-token",
+                    "webBrowserMode": "cdp",
+                    "webCdpUrl": "http://127.0.0.1:9333",
+                    "webCdpChromePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                     "webProfileDir": "~/wa-profile",
                     "allowFrom": ["*"],
                 }
@@ -28,8 +34,56 @@ def test_build_whatsapp_bridge_env_uses_configured_values() -> None:
 
     assert env["BRIDGE_PORT"] == "3015"
     assert env["BRIDGE_TOKEN"] == "secret-token"
+    assert env["WEB_BROWSER_MODE"] == "cdp"
+    assert env["WEB_CDP_URL"] == "http://127.0.0.1:9333"
+    assert env["WEB_CDP_CHROME_PATH"] == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     assert env["WEB_PROFILE_DIR"] == "~/wa-profile"
     assert env["PATH"] == os.environ["PATH"]
+
+
+def test_whatsapp_web_gateway_entry_routes_to_gateway(monkeypatch) -> None:
+    captured = {}
+
+    def fake_app() -> None:
+        captured["argv"] = list(commands.sys.argv)
+
+    monkeypatch.setattr(commands, "app", fake_app)
+    monkeypatch.setattr(commands.sys, "argv", ["whatsapp-web-nanobot-gateway", "--verbose"])
+
+    commands.whatsapp_web_nanobot_gateway_entry()
+
+    assert captured["argv"] == [
+        "whatsapp-web-nanobot-gateway",
+        "gateway",
+        "--verbose",
+    ]
+
+
+def test_cdp_probe_url_normalizes_base_endpoint() -> None:
+    assert _cdp_probe_url("http://127.0.0.1:9333") == "http://127.0.0.1:9333/json/version"
+
+
+def test_build_whatsapp_cdp_launch_command_uses_configured_values() -> None:
+    config = Config.model_validate(
+        {
+            "channels": {
+                "whatsapp": {
+                    "webBrowserMode": "cdp",
+                    "webCdpUrl": "http://127.0.0.1:9333",
+                    "webCdpChromePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "webProfileDir": "~/wa-profile",
+                }
+            }
+        }
+    )
+
+    command = _build_whatsapp_cdp_launch_command(config)
+
+    assert command[0] == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    assert "--remote-debugging-port=9333" in command
+    assert "--remote-debugging-address=127.0.0.1" in command
+    assert f"--user-data-dir={os.path.expanduser('~/wa-profile')}" in command
+    assert command[-1] == "https://web.whatsapp.com/"
 
 
 def test_bridge_needs_refresh_when_source_is_newer(tmp_path: Path) -> None:

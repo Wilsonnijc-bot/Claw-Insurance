@@ -1,13 +1,13 @@
 [project]
 name = "nanobot-ai"
 version = "0.1.4.post3"
-description = "A lightweight personal AI assistant framework"
+description = "Claw Insurance workspace built on the nanobot assistant framework"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "nanobot contributors"}
+    {name = "Wilsonnijc-bot"}
 ]
-keywords = ["ai", "agent", "chatbot"]
+keywords = ["ai", "agent", "chatbot", "whatsapp", "insurance"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -15,6 +15,11 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Wilsonnijc-bot/Claw-Insurance"
+Repository = "https://github.com/Wilsonnijc-bot/Claw-Insurance"
+Issues = "https://github.com/Wilsonnijc-bot/Claw-Insurance/issues"
 
 dependencies = [
     "typer>=0.20.0,<1.0.0",
@@ -63,6 +68,7 @@ dev = [
 
 [project.scripts]
 nanobot = "nanobot.cli.commands:app"
+whatsapp-web-nanobot-gateway = "nanobot.cli.commands:whatsapp_web_nanobot_gateway_entry"
 
 [build-system]
 requires = ["hatchling"]

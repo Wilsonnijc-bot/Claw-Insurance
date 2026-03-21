@@ -1,5 +1,7 @@
 .worktrees/
 .assets
+.clawhub/
+.DS_Store
 .env
 *.pyc
 dist/

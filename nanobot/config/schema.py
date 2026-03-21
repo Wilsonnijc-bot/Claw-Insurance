@@ -18,9 +18,12 @@ class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
 
     enabled: bool = False
-    delivery_mode: Literal["send", "draft"] = "send"
+    delivery_mode: Literal["send", "draft"] = "draft"
     bridge_url: str = "ws://localhost:3001"
     bridge_token: str = ""  # Shared token for bridge auth (optional, recommended)
+    web_browser_mode: Literal["cdp", "launch"] = "cdp"
+    web_cdp_url: str = "http://127.0.0.1:9222"
+    web_cdp_chrome_path: str = ""
     web_profile_dir: str = "~/.nanobot/whatsapp-web"
     contacts_file: str = "~/.nanobot/contacts/whatsapp.json"
     group_members_file: str = "~/.nanobot/contacts/whatsapp_groups.csv"

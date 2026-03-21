@@ -1,0 +1,10 @@
+{"role": "user", "content": "Hi", "timestamp": "2026-03-09T10:11:37.718083"}
+{"role": "assistant", "content": "Hi Alice，有咩可以幫到你？", "timestamp": "2026-03-09T10:11:37.718099"}
+{"role": "user", "content": "How can fill the claim form ?", "timestamp": "2026-03-09T10:11:58.024329"}
+{"role": "assistant", "content": "最簡單係先搞清楚邊類型嘅 claim，因為醫療、危疾、住院現金、意外都會有唔同表格同文件。\n\n你而家係想報邊一類嘅 claim？我幫你講返需要準備啲乜，同點填會比較順。", "timestamp": "2026-03-09T10:11:58.024344"}
+{"role": "user", "content": "Hospital", "timestamp": "2026-03-09T10:12:13.844197"}
+{"role": "assistant", "content": "如果係住院嘅 claim，通常要分兩樣先：你係  \n1) 已經出院準備「事後」索償，定  \n2) 想用住院「預批／免找數」？\n\n兩邊要填嘅 form 同文件都有少少唔同。我幫你整理埋，只要你講我知係邊一種。", "timestamp": "2026-03-09T10:12:13.844235"}
+{"role": "user", "content": "Mlp", "timestamp": "2026-03-09T10:12:27.616659"}
+{"role": "assistant", "content": "Alice，我估你想講 *MLP 住院免找數*？如果係，流程其實幾簡單：\n\n先要確認三樣嘢：  \n1) 你張醫療保單有無包含 MLP／預先批核功能  \n2) 入院日期  \n3) 醫院同手術／程序名稱  \n\n你方便講返邊間醫院同預計幾時入院？我可以幫你睇下需唔需要預批，填表邊度要交。", "timestamp": "2026-03-09T10:12:27.616683"}
+{"role": "user", "content": "1", "timestamp": "2026-03-09T10:12:35.578747"}
+{"role": "assistant", "content": "明白，Alice。如果你要做 MLP（住院免找數）申請，其實唔需要填到好複雜嘅 claim form，因為流程係預先批核。\n\n通常醫院會 ask 你提供：  \n- 你嘅保單號碼  \n- 入院日期、手術名  \n- 主診醫生嘅 referral / 建議入院文件  \n\n之後我哋可以幫你向公司做預批。\n\n你而家係準備入院，定已經約好手術日期？我睇住你嗰邊點配合最快。", "timestamp": "2026-03-09T10:12:35.578766"}

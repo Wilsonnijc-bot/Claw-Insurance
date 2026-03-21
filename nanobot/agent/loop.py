@@ -23,11 +23,16 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundHistoryBatch, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.privacy.sanitizer import TextPrivacySanitizer
 from nanobot.providers.base import LLMProvider
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import (
+    Session,
+    SessionManager,
+    model_role_for_session,
+    storage_role_for_session,
+)
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, PrivacyGatewayConfig
@@ -413,7 +418,7 @@ class AgentLoop:
             return json.dumps(content, ensure_ascii=False, indent=2)
         return str(content)
 
-    def _apply_whatsapp_self_routing_from_message(self, content: str) -> None:
+    async def _apply_whatsapp_self_routing_from_message(self, content: str) -> None:
         """Apply self-chat routing commands to WhatsApp local allowlists."""
         if self.channels_config is None:
             return
@@ -429,6 +434,7 @@ class AgentLoop:
             reply_targets_path,
             rewrite_from_self_instruction,
         )
+        from nanobot.channels.whatsapp_contacts import normalize_contact_id
 
         instruction = parse_self_routing_instruction(content)
         if instruction is None:
@@ -449,12 +455,33 @@ class AgentLoop:
                 groups=instruction.groups,
             )
             logger.info(
-                "Updated WhatsApp routing from self-chat command: contacts={}, groups_csv={}, direct_json={}, group_json={}",
+                "Updated WhatsApp routing from self-chat command: contacts_cache={}, group_cache={}, direct_json={}, group_json={}",
                 stats.get("individual_count", -1),
                 stats.get("group_member_count", -1),
                 target_stats.get("direct_reply_target_count", -1),
                 target_stats.get("group_reply_target_count", -1),
             )
+            if instruction.individuals is not None:
+                target_phones: list[str] = []
+                seen_phones: set[str] = set()
+                for value in instruction.individuals:
+                    phone = normalize_contact_id(value)
+                    if not phone or phone in seen_phones:
+                        continue
+                    seen_phones.add(phone)
+                    target_phones.append(phone)
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel="whatsapp",
+                        chat_id="",
+                        content="",
+                        metadata={
+                            "_internal_command": "sync_direct_history",
+                            "_target_phones": target_phones,
+                            "_trigger": "self_chat_command",
+                        },
+                    )
+                )
         except Exception:
             logger.exception("Failed to apply WhatsApp self-chat routing command")
 
@@ -590,7 +617,7 @@ class AgentLoop:
     def _recent_user_text(cls, session: Session, max_messages: int = 6) -> str:
         parts: list[str] = []
         for message in session.messages[-max_messages:]:
-            if message.get("role") != "user":
+            if model_role_for_session(session.key, str(message.get("role", "") or "")) != "user":
                 continue
             text = cls._session_text_content(message.get("content"))
             if text.strip():
@@ -905,19 +932,37 @@ class AgentLoop:
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
+        inbound_task = asyncio.create_task(self.bus.consume_inbound())
+        history_task = asyncio.create_task(self.bus.consume_history())
 
-        while self._running:
-            try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+        try:
+            while self._running:
+                done, _pending = await asyncio.wait(
+                    {inbound_task, history_task},
+                    timeout=1.0,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
 
-            if msg.content.strip().lower() == "/stop":
-                await self._handle_stop(msg)
-            else:
-                task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                if inbound_task in done:
+                    msg = inbound_task.result()
+                    inbound_task = asyncio.create_task(self.bus.consume_inbound())
+                    if msg.content.strip().lower() == "/stop":
+                        await self._handle_stop(msg)
+                    else:
+                        task = asyncio.create_task(self._dispatch(msg))
+                        self._active_tasks.setdefault(msg.session_key, []).append(task)
+                        task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+
+                if history_task in done:
+                    batch = history_task.result()
+                    history_task = asyncio.create_task(self.bus.consume_history())
+                    asyncio.create_task(self._dispatch_history(batch))
+        finally:
+            inbound_task.cancel()
+            history_task.cancel()
+            await asyncio.gather(inbound_task, history_task, return_exceptions=True)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -957,6 +1002,14 @@ class AgentLoop:
                     content="Sorry, I encountered an error.",
                 ))
 
+    async def _dispatch_history(self, batch: InboundHistoryBatch) -> None:
+        """Process a historical import batch under the global lock."""
+        async with self._processing_lock:
+            try:
+                self._import_history_batch(batch)
+            except Exception:
+                logger.exception("Error importing historical batch for {}", batch.channel)
+
     async def close_mcp(self) -> None:
         """Close MCP connections."""
         if self._mcp_stack:
@@ -970,6 +1023,176 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    def _save_session(self, session: Session) -> None:
+        """Persist a session and refresh WhatsApp-visible history exports when relevant."""
+        self.sessions.save(session)
+        self._refresh_whatsapp_history_exports(session)
+
+    def _refresh_whatsapp_history_exports(self, session: Session) -> None:
+        """Refresh materialized WhatsApp direct-chat exports after a save."""
+        if not session.key.startswith("whatsapp:") or session.key.count(":") != 1:
+            return
+        wa_cfg = getattr(self.channels_config, "whatsapp", None) if self.channels_config else None
+        if wa_cfg is None:
+            return
+
+        from nanobot.channels.whatsapp_contacts import normalize_contact_id
+        from nanobot.channels.whatsapp_storage import refresh_direct_history_exports, storage_path
+
+        phone = normalize_contact_id(session.key.split(":", 1)[1])
+        if not phone:
+            return
+
+        try:
+            refresh_direct_history_exports(
+                storage_path(wa_cfg.storage_dir, self.workspace),
+                self.workspace,
+                phone=phone,
+            )
+        except Exception:
+            logger.exception("Failed to refresh WhatsApp direct history exports for {}", session.key)
+
+    def _import_history_batch(self, batch: InboundHistoryBatch) -> None:
+        """Silently merge a historical batch into canonical session files."""
+        if batch.channel != "whatsapp" or not batch.entries:
+            return
+
+        touched: dict[str, dict[str, Any]] = {}
+        for raw in batch.entries:
+            if not isinstance(raw, dict):
+                continue
+
+            session_key = str(raw.get("session_key", "") or "").strip()
+            message_id = str(raw.get("message_id", "") or "").strip()
+            chat_id = str(raw.get("chat_id", "") or "").strip()
+            phone = str(raw.get("phone", "") or "").strip()
+            if not session_key or not message_id:
+                continue
+
+            bucket = touched.setdefault(
+                session_key,
+                {
+                    "session": self.sessions.get_or_create(session_key),
+                    "imports": [],
+                    "existing_ids": set(),
+                    "earliest_ts": None,
+                },
+            )
+            session: Session = bucket["session"]
+            if not bucket["existing_ids"]:
+                bucket["existing_ids"] = {
+                    str(existing.get("message_id", "") or "").strip()
+                    for existing in session.messages
+                    if str(existing.get("message_id", "") or "").strip()
+                }
+            existing_ids: set[str] = bucket["existing_ids"]
+            if message_id in existing_ids:
+                continue
+
+            timestamp_iso = self._history_timestamp_iso(raw.get("timestamp"))
+            entry = {
+                "role": storage_role_for_session(
+                    session_key,
+                    "assistant" if bool(raw.get("from_me", False)) else "user",
+                ),
+                "content": str(raw.get("content", "") or ""),
+                "timestamp": timestamp_iso,
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "sender_id": phone if not bool(raw.get("from_me", False)) else "me",
+                "sender": str(raw.get("sender", "") or ""),
+                "sender_phone": phone,
+                "push_name": str(raw.get("push_name", "") or ""),
+                "historical_import": True,
+                "from_me": bool(raw.get("from_me", False)),
+            }
+            bucket["imports"].append(entry)
+            existing_ids.add(message_id)
+
+            entry_dt = self._history_sort_value(timestamp_iso)
+            earliest = bucket["earliest_ts"]
+            if earliest is None or entry_dt < earliest:
+                bucket["earliest_ts"] = entry_dt
+
+        for session_key, payload in touched.items():
+            imports = payload["imports"]
+            if not imports:
+                continue
+
+            session: Session = payload["session"]
+            if not session.messages and payload["earliest_ts"] is not None:
+                session.created_at = payload["earliest_ts"]
+            session.messages = self._merge_history_entries(session.messages, imports)
+            session.updated_at = datetime.now()
+            self._save_session(session)
+            logger.info("Imported {} WhatsApp history messages into {}", len(imports), session_key)
+
+    def _merge_history_entries(self, existing: list[dict[str, Any]], imports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Insert historical imports by timestamp without disturbing existing relative order."""
+        merged = list(existing)
+        ordered_imports = sorted(imports, key=lambda item: self._history_sort_value(item.get("timestamp")))
+        for entry in ordered_imports:
+            entry_ts = self._history_sort_value(entry.get("timestamp"))
+            insert_at = len(merged)
+            for index, current in enumerate(merged):
+                if self._history_sort_value(current.get("timestamp")) > entry_ts:
+                    insert_at = index
+                    break
+            merged.insert(insert_at, entry)
+        return merged
+
+    @staticmethod
+    def _history_timestamp_iso(value: Any) -> str:
+        """Normalize a historical timestamp into the session JSONL format."""
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                try:
+                    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.astimezone().replace(tzinfo=None)
+                    return parsed.isoformat()
+                except ValueError:
+                    try:
+                        return datetime.fromtimestamp(AgentLoop._history_epoch_seconds(float(text))).isoformat()
+                    except ValueError:
+                        return text
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return datetime.now().isoformat()
+        return datetime.fromtimestamp(AgentLoop._history_epoch_seconds(numeric)).isoformat()
+
+    @staticmethod
+    def _history_epoch_seconds(value: float) -> float:
+        """Normalize unix timestamps in seconds, milliseconds, or finer units down to seconds."""
+        numeric = float(value)
+        while abs(numeric) >= 1e11:
+            numeric /= 1000.0
+        return numeric
+
+    @staticmethod
+    def _history_sort_value(value: Any) -> datetime:
+        """Parse timestamps for stable historical insertion ordering."""
+        if isinstance(value, datetime):
+            return value.astimezone().replace(tzinfo=None) if value.tzinfo is not None else value
+        text = str(value or "").strip()
+        if text:
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+            except ValueError:
+                try:
+                    return datetime.fromtimestamp(AgentLoop._history_epoch_seconds(float(text)))
+                except ValueError:
+                    pass
+        return datetime.max
+
+    @staticmethod
+    def _use_full_whatsapp_history_for_prompt(channel: str, session_key: str) -> bool:
+        """WhatsApp prompts use the full stored session history, not just the recent window."""
+        return channel == "whatsapp" and str(session_key or "").startswith("whatsapp:")
 
     async def _process_message(
         self,
@@ -986,14 +1209,17 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=self.memory_window)
+            history = session.get_history(
+                max_messages=None if self._use_full_whatsapp_history_for_prompt(channel, key) else self.memory_window,
+                include_consolidated=self._use_full_whatsapp_history_for_prompt(channel, key),
+            )
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id, metadata=msg.metadata,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
+            self._save_session(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -1012,7 +1238,7 @@ class AgentLoop:
                     deleter_id=str(msg.metadata.get("sender") or msg.sender_id or ""),
                     chat_id=msg.chat_id,
                 )
-                self.sessions.save(session)
+                self._save_session(session)
                 logger.info(
                     "Recorded deleted WhatsApp message {} for {}:{} (matched={})",
                     msg.metadata.get("deleted_message_id"),
@@ -1022,15 +1248,16 @@ class AgentLoop:
                 )
                 return None
             if msg.channel == "whatsapp" and bool(msg.metadata.get("is_self_chat")):
-                self._apply_whatsapp_self_routing_from_message(msg.content)
+                await self._apply_whatsapp_self_routing_from_message(msg.content)
+            capture_role = "assistant" if msg.channel == "whatsapp" and bool(msg.metadata.get("is_self_chat")) else "user"
             session.add_message(
-                role="user",
+                role=capture_role,
                 content=msg.content,
                 sender_id=msg.sender_id,
                 chat_id=msg.chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
-            self.sessions.save(session)
+            self._save_session(session)
             logger.info("Captured message without reply for {}:{} (capture_only)", msg.channel, msg.sender_id)
             return None
 
@@ -1078,7 +1305,7 @@ class AgentLoop:
                 self._consolidating.discard(session.key)
 
             session.clear()
-            self.sessions.save(session)
+            self._save_session(session)
             self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
@@ -1109,7 +1336,11 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history(max_messages=self.memory_window)
+        use_full_history = self._use_full_whatsapp_history_for_prompt(msg.channel, session.key)
+        history = session.get_history(
+            max_messages=None if use_full_history else self.memory_window,
+            include_consolidated=use_full_history,
+        )
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
@@ -1150,7 +1381,7 @@ class AgentLoop:
                 turn_messages=turn_messages,
             )
             self._write_insurance_state(session, next_state)
-        self.sessions.save(session)
+        self._save_session(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -1199,6 +1430,8 @@ class AgentLoop:
                     entry.setdefault("sender_id", inbound_msg.sender_id)
                     entry.setdefault("chat_id", inbound_msg.chat_id)
                     attached_inbound_user = True
+            if role is not None:
+                entry["role"] = storage_role_for_session(session.key, str(role))
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()

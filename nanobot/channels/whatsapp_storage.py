@@ -37,7 +37,8 @@ def sync_storage_readme(storage_dir: Path) -> None:
         "- `direct/`: one folder per allowed direct-message contact\n"
         "- `groups/`: one folder per row in `whatsapp_groups.csv`\n"
         "- `meta.json`: identifiers and the linked session file\n"
-        "- `history.jsonl`: symlink to the actual Nanobot session history when available\n",
+        "- `direct/*/history.jsonl`: materialized `client` / `me` history export\n"
+        "- `groups/*/history.jsonl`: symlink to the actual Nanobot session history when available\n",
         encoding="utf-8",
     )
 
@@ -72,7 +73,7 @@ def sync_direct_contact_storage(
             "session_file": str(session_file) if session_file else "",
         },
     )
-    _link_history(folder / "history.jsonl", session_file)
+    _write_direct_history(folder / "history.jsonl", session_key or "", session_file)
     return folder
 
 
@@ -136,6 +137,39 @@ def _write_meta(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def write_visible_history_jsonl(path: Path, session_key: str, messages: list[dict]) -> None:
+    """Write a human-readable history export, remapping WhatsApp roles when needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for msg in messages:
+            payload = dict(msg)
+            if session_key.startswith("whatsapp:"):
+                role = str(payload.get("role", "") or "")
+                if role in {"user", "client"}:
+                    payload["role"] = "client"
+                    payload.setdefault("from_me", False)
+                elif role in {"assistant", "me"}:
+                    payload["role"] = "me"
+                    payload.setdefault("from_me", True)
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def refresh_direct_history_exports(storage_dir: Path, workspace: Path, *, phone: str) -> None:
+    """Refresh all materialized direct history exports for one normalized phone."""
+    normalized_phone = normalize_contact_id(phone)
+    if not normalized_phone:
+        return
+
+    direct_root = storage_dir / "direct"
+    if not direct_root.exists():
+        return
+
+    session_key = f"whatsapp:{normalized_phone}"
+    session_file = session_file_path(workspace, session_key)
+    for folder in direct_root.glob(f"*__{normalized_phone}"):
+        _write_direct_history(folder / "history.jsonl", session_key, session_file)
+
+
 def _link_history(link_path: Path, target: Path | None) -> None:
     """Point `history.jsonl` at the real session file when one is known."""
     if link_path.exists() or link_path.is_symlink():
@@ -151,3 +185,40 @@ def _link_history(link_path: Path, target: Path | None) -> None:
         os.symlink(target, link_path)
     except OSError:
         (link_path.parent / "history.path.txt").write_text(str(target) + "\n", encoding="utf-8")
+
+
+def _write_direct_history(history_path: Path, session_key: str, session_file: Path | None) -> None:
+    """Write a materialized direct-chat history export when the session exists."""
+    fallback_path = history_path.parent / "history.path.txt"
+    if fallback_path.exists():
+        try:
+            fallback_path.unlink()
+        except OSError:
+            pass
+
+    if history_path.exists() or history_path.is_symlink():
+        try:
+            history_path.unlink()
+        except OSError:
+            pass
+
+    if session_file is None or not session_key or not session_file.exists():
+        return
+
+    messages = _load_session_messages(session_file)
+    write_visible_history_jsonl(history_path, session_key, messages)
+
+
+def _load_session_messages(path: Path) -> list[dict]:
+    """Load persisted session messages without the metadata line."""
+    messages: list[dict] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            text = line.strip()
+            if not text:
+                continue
+            payload = json.loads(text)
+            if payload.get("_type") == "metadata":
+                continue
+            messages.append(payload)
+    return messages

@@ -1,5 +1,14 @@
-We provide QR codes for joining the HKUDS discussion groups on **WeChat** and **Feishu**.
+# Communication
 
-You can join by scanning the QR codes below:
+This repository is maintained as the Claw Insurance nanobot workspace.
 
-<img src="https://github.com/HKUDS/.github/blob/main/profile/QR.png" alt="WeChat QR Code" width="400"/>
+## Operational communication
+
+- Day-to-day messaging is handled through the configured workspace channels, such as WhatsApp and CLI sessions.
+- Public group QR codes are not maintained in this repository.
+
+## Repository contact
+
+- Use GitHub issues for non-sensitive project questions and maintenance requests.
+- Use GitHub Security Advisories for vulnerability reporting.
+- Coordinate operational access and private project matters directly with the current repository owner.

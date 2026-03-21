@@ -5,6 +5,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
@@ -16,12 +17,14 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
-import { writeFile, mkdir } from 'fs/promises';
+import { constants as fsConstants } from 'fs';
+import { access, writeFile, mkdir, rm } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 
 const VERSION = '0.1.0';
+const INVALID_AUTH_RECONNECT_DELAY_MS = 5000;
 
 export interface InboundMessage {
   id: string;
@@ -37,6 +40,30 @@ export interface InboundMessage {
   groupName?: string;
   pushName?: string;
   media?: string[];
+}
+
+export interface HistoricalMessage {
+  id: string;
+  sender: string;
+  pn: string;
+  content: string;
+  timestamp: number;
+  fromMe: boolean;
+  isGroup: boolean;
+  isSelfChat?: boolean;
+  participant?: string;
+  participantPn?: string;
+  groupId?: string;
+  groupName?: string;
+  pushName?: string;
+}
+
+export interface HistoryBatch {
+  messages: HistoricalMessage[];
+  source: 'history_sync' | 'upsert';
+  isLatest?: boolean;
+  progress?: number | null;
+  syncType?: string | number | null;
 }
 
 export interface DeletedMessage {
@@ -62,6 +89,7 @@ export interface ChatTarget {
 export interface WhatsAppClientOptions {
   authDir: string;
   onMessage: (msg: InboundMessage) => void;
+  onHistory: (batch: HistoryBatch) => void;
   onDelete: (msg: DeletedMessage) => void;
   onQR: (qr: string) => void;
   onStatus: (status: string) => void;
@@ -117,6 +145,7 @@ export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
   private reconnecting = false;
+  private authResetInProgress = false;
   private chatTargets: Map<string, ChatTarget> = new Map();
   private groupNames: Map<string, string> = new Map();
 
@@ -126,6 +155,18 @@ export class WhatsAppClient {
 
   async connect(): Promise<void> {
     const logger = pino({ level: 'silent' });
+    const credsFile = join(this.options.authDir, 'creds.json');
+    await this.ensureAuthDir();
+    const hasExistingAuth = await access(credsFile, fsConstants.F_OK)
+      .then(() => true)
+      .catch(() => false);
+    if (hasExistingAuth) {
+      console.log(`🔐 Reusing existing Baileys auth session from ${credsFile}`);
+      console.log('   QR appears only if that session is missing, expired, or logged out.');
+    } else {
+      console.log(`📱 No Baileys auth session found at ${credsFile}`);
+      console.log('   A QR code will appear when WhatsApp requests login.');
+    }
     const { state, saveCreds } = await useMultiFileAuthState(this.options.authDir);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -140,8 +181,8 @@ export class WhatsAppClient {
       version,
       logger,
       printQRInTerminal: false,
-      browser: ['nanobot', 'cli', VERSION],
-      syncFullHistory: false,
+      browser: Browsers.macOS('Desktop'),
+      syncFullHistory: true,
       markOnlineOnConnect: false,
     });
 
@@ -165,21 +206,20 @@ export class WhatsAppClient {
 
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const authInvalid = statusCode === DisconnectReason.loggedOut || statusCode === 401;
+        const shouldReconnect = !authInvalid;
 
         console.log(`Connection closed. Status: ${statusCode}, Will reconnect: ${shouldReconnect}`);
         this.options.onStatus('disconnected');
 
-        if (shouldReconnect && !this.reconnecting) {
-          this.reconnecting = true;
-          console.log('Reconnecting in 5 seconds...');
-          setTimeout(() => {
-            this.reconnecting = false;
-            this.connect();
-          }, 5000);
+        if (authInvalid) {
+          await this.resetAuthAndReconnect();
+        } else if (shouldReconnect) {
+          this.scheduleReconnect(5000, 'Reconnecting in 5 seconds...');
         }
       } else if (connection === 'open') {
         console.log('✅ Connected to WhatsApp');
+        this.authResetInProgress = false;
         this.options.onStatus('connected');
       }
     });
@@ -188,83 +228,17 @@ export class WhatsAppClient {
     this.sock.ev.on('creds.update', saveCreds);
 
     // Handle incoming messages
-    this.sock.ev.on('messages.upsert', async ({ messages, type }: { messages: any[]; type: string }) => {
-      console.log(`📩 messages.upsert type=${type} count=${messages.length}`);
-      if (type !== 'notify') return;
+    this.sock.ev.on('messages.upsert', async (payload: { messages: any[]; type: string }) => {
+      await this.handleMessagesUpsert(payload);
+    });
 
-      for (const msg of messages) {
-        const isSelfChat = this.isSelfChatMessage(msg);
-        if (msg.key.fromMe && !isSelfChat) {
-          console.log(`↪️ Ignoring outbound/self message ${msg.key.id || ''}`);
-          continue;
-        }
-        if (msg.key.fromMe && isSelfChat) {
-          console.log(`🗂️ Capturing self-chat message ${msg.key.id || ''}`);
-        }
-        if (msg.key.remoteJid === 'status@broadcast') {
-          console.log(`↪️ Ignoring status broadcast ${msg.key.id || ''}`);
-          continue;
-        }
-
-        const unwrapped = baileysExtractMessageContent(msg.message);
-        if (!unwrapped) {
-          console.log(`↪️ Ignoring unsupported message ${msg.key.id || ''} from ${msg.key.remoteJid || '<unknown>'}`);
-          continue;
-        }
-
-        const content = this.getTextContent(unwrapped);
-        let fallbackContent: string | null = null;
-        const mediaPaths: string[] = [];
-
-        if (unwrapped.imageMessage) {
-          fallbackContent = '[Image]';
-          const path = await this.downloadMedia(msg, unwrapped.imageMessage.mimetype ?? undefined);
-          if (path) mediaPaths.push(path);
-        } else if (unwrapped.documentMessage) {
-          fallbackContent = '[Document]';
-          const path = await this.downloadMedia(msg, unwrapped.documentMessage.mimetype ?? undefined,
-            unwrapped.documentMessage.fileName ?? undefined);
-          if (path) mediaPaths.push(path);
-        } else if (unwrapped.videoMessage) {
-          fallbackContent = '[Video]';
-          const path = await this.downloadMedia(msg, unwrapped.videoMessage.mimetype ?? undefined);
-          if (path) mediaPaths.push(path);
-        }
-
-        const finalContent = content || (mediaPaths.length === 0 ? fallbackContent : '') || '';
-        if (!finalContent && mediaPaths.length === 0) continue;
-
-        const isGroup = msg.key.remoteJid?.endsWith('@g.us') || false;
-        const sender = msg.key.remoteJid || '';
-        const pn = resolvePhoneIdentifier(msg.key.remoteJidAlt || '', sender);
-        const participant = isGroup ? (msg.key.participant || '') : '';
-        const participantPn = isGroup ? resolvePhoneIdentifier(msg.key.participantAlt || '', participant) : '';
-        const groupName = isGroup && sender ? await this.getGroupName(sender) : '';
-
-        console.log(
-          `📨 inbound ${isGroup ? 'group' : 'direct'} chat=${sender || '<unknown>'} participant=${participant || '-'} pn=${participantPn || pn || '-'} text=${(finalContent || '[media]').slice(0, 80)}`,
-        );
-
-        if (!isGroup && sender) {
-          this.rememberChatTarget(sender, pn, msg.pushName);
-        }
-
-        this.options.onMessage({
-          id: msg.key.id || '',
-          sender,
-          pn,
-          content: finalContent,
-          timestamp: msg.messageTimestamp as number,
-          isGroup,
-          ...(isSelfChat ? { isSelfChat: true } : {}),
-          ...(participant ? { participant } : {}),
-          ...(participantPn ? { participantPn } : {}),
-          ...(sender && isGroup ? { groupId: sender } : {}),
-          ...(groupName ? { groupName } : {}),
-          ...(msg.pushName ? { pushName: msg.pushName } : {}),
-          ...(mediaPaths.length > 0 ? { media: mediaPaths } : {}),
-        });
-      }
+    this.sock.ev.on('messaging-history.set', async (payload: {
+      messages: any[];
+      isLatest?: boolean;
+      progress?: number | null;
+      syncType?: string | number | null;
+    }) => {
+      await this.handleHistorySet(payload);
     });
 
     this.sock.ev.on('messages.delete', async ({ keys }: { keys: any[] }) => {
@@ -284,6 +258,191 @@ export class WhatsAppClient {
         }
       }
     });
+  }
+
+  async handleMessagesUpsert({ messages, type }: { messages: any[]; type: string }): Promise<void> {
+    console.log(`📩 messages.upsert type=${type} count=${messages.length}`);
+    if (type !== 'notify') {
+      await this.emitHistoryBatch(messages, { source: 'upsert', syncType: type });
+      return;
+    }
+
+    for (const msg of messages) {
+      const normalized = await this.normalizeMessage(msg, {
+        downloadMedia: true,
+        includeFromMe: false,
+        loadGroupName: true,
+      });
+      if (!normalized) {
+        continue;
+      }
+
+      console.log(
+        `📨 inbound ${normalized.isGroup ? 'group' : 'direct'} chat=${normalized.sender || '<unknown>'} participant=${normalized.participant || '-'} pn=${normalized.participantPn || normalized.pn || '-'} text=${(normalized.content || '[media]').slice(0, 80)}`,
+      );
+
+      if (!normalized.isGroup && normalized.sender) {
+        this.rememberChatTarget(normalized.sender, normalized.pn, normalized.pushName);
+      }
+
+      this.options.onMessage(normalized);
+    }
+  }
+
+  async handleHistorySet(payload: {
+    messages: any[];
+    isLatest?: boolean;
+    progress?: number | null;
+    syncType?: string | number | null;
+  }): Promise<void> {
+    const { messages, isLatest, progress, syncType } = payload;
+    console.log(`🕘 messaging-history.set count=${messages.length} progress=${progress ?? '-'} latest=${isLatest ?? '-'}`);
+    await this.emitHistoryBatch(messages, {
+      source: 'history_sync',
+      isLatest,
+      progress,
+      syncType,
+    });
+  }
+
+  private async emitHistoryBatch(messages: any[], meta: Omit<HistoryBatch, 'messages'>): Promise<void> {
+    const normalizedMessages: HistoricalMessage[] = [];
+
+    for (const msg of messages || []) {
+      const normalized = await this.normalizeMessage(msg, {
+        downloadMedia: false,
+        includeFromMe: true,
+        loadGroupName: false,
+      });
+      if (!normalized || normalized.isGroup) {
+        continue;
+      }
+
+      if (normalized.sender) {
+        this.rememberChatTarget(normalized.sender, normalized.pn, normalized.pushName);
+      }
+
+      normalizedMessages.push({
+        ...normalized,
+        fromMe: Boolean(normalized.fromMe),
+      });
+    }
+
+    if (normalizedMessages.length === 0) {
+      return;
+    }
+
+    this.options.onHistory({
+      ...meta,
+      messages: normalizedMessages,
+    });
+  }
+
+  private async normalizeMessage(
+    msg: any,
+    options: {
+      downloadMedia: boolean;
+      includeFromMe: boolean;
+      loadGroupName: boolean;
+    },
+  ): Promise<(InboundMessage & { fromMe?: boolean }) | null> {
+    const remoteJid = String(msg?.key?.remoteJid || '');
+    const isSelfChat = this.isSelfChatMessage(msg);
+    if (msg?.key?.fromMe && !options.includeFromMe && !isSelfChat) {
+      console.log(`↪️ Ignoring outbound/self message ${msg?.key?.id || ''}`);
+      return null;
+    }
+    if (msg?.key?.fromMe && isSelfChat && !options.includeFromMe) {
+      console.log(`🗂️ Capturing self-chat message ${msg?.key?.id || ''}`);
+    }
+    if (remoteJid === 'status@broadcast') {
+      console.log(`↪️ Ignoring status broadcast ${msg?.key?.id || ''}`);
+      return null;
+    }
+
+    const unwrapped = baileysExtractMessageContent(msg?.message);
+    if (!unwrapped) {
+      if (this.shouldLogUnsupportedMessage(remoteJid, options)) {
+        console.log(`↪️ Ignoring unsupported message ${msg?.key?.id || ''} from ${remoteJid || '<unknown>'}`);
+      }
+      return null;
+    }
+
+    const parsed = await this.extractNormalizedContent(msg, unwrapped, options.downloadMedia);
+    if (!parsed) {
+      return null;
+    }
+
+    const isGroup = remoteJid.endsWith('@g.us');
+    const sender = remoteJid;
+    const pn = resolvePhoneIdentifier(String(msg?.key?.remoteJidAlt || ''), sender);
+    const participant = isGroup ? String(msg?.key?.participant || '') : '';
+    const participantPn = isGroup ? resolvePhoneIdentifier(String(msg?.key?.participantAlt || ''), participant) : '';
+    const groupName = isGroup && sender && options.loadGroupName ? await this.getGroupName(sender) : '';
+
+    return {
+      id: String(msg?.key?.id || ''),
+      sender,
+      pn,
+      content: parsed.content,
+      timestamp: this.normalizeTimestamp(msg?.messageTimestamp),
+      isGroup,
+      ...(isSelfChat ? { isSelfChat: true } : {}),
+      ...(participant ? { participant } : {}),
+      ...(participantPn ? { participantPn } : {}),
+      ...(sender && isGroup ? { groupId: sender } : {}),
+      ...(groupName ? { groupName } : {}),
+      ...(msg?.pushName ? { pushName: String(msg.pushName) } : {}),
+      ...(parsed.mediaPaths.length > 0 ? { media: parsed.mediaPaths } : {}),
+      ...(options.includeFromMe ? { fromMe: Boolean(msg?.key?.fromMe) } : {}),
+    };
+  }
+
+  private async extractNormalizedContent(
+    msg: any,
+    message: any,
+    downloadMedia: boolean,
+  ): Promise<{ content: string; mediaPaths: string[] } | null> {
+    const content = this.getTextContent(message);
+    let fallbackContent: string | null = null;
+    const mediaPaths: string[] = [];
+
+    if (message.imageMessage) {
+      fallbackContent = '[Image]';
+      if (downloadMedia) {
+        const path = await this.downloadMedia(msg, message.imageMessage.mimetype ?? undefined);
+        if (path) {
+          mediaPaths.push(path);
+        }
+      }
+    } else if (message.documentMessage) {
+      fallbackContent = '[Document]';
+      if (downloadMedia) {
+        const path = await this.downloadMedia(
+          msg,
+          message.documentMessage.mimetype ?? undefined,
+          message.documentMessage.fileName ?? undefined,
+        );
+        if (path) {
+          mediaPaths.push(path);
+        }
+      }
+    } else if (message.videoMessage) {
+      fallbackContent = '[Video]';
+      if (downloadMedia) {
+        const path = await this.downloadMedia(msg, message.videoMessage.mimetype ?? undefined);
+        if (path) {
+          mediaPaths.push(path);
+        }
+      }
+    }
+
+    const finalContent = content || (mediaPaths.length === 0 ? fallbackContent : '') || '';
+    if (!finalContent && mediaPaths.length === 0) {
+      return null;
+    }
+
+    return { content: finalContent, mediaPaths };
   }
 
   private async downloadMedia(msg: any, mimetype?: string, fileName?: string): Promise<string | null> {
@@ -368,6 +527,52 @@ export class WhatsAppClient {
     }
   }
 
+  private scheduleReconnect(delayMs: number, message: string): void {
+    if (this.reconnecting) {
+      return;
+    }
+
+    this.reconnecting = true;
+    console.log(message);
+    setTimeout(() => {
+      this.reconnecting = false;
+      void this.connect().catch((error) => {
+        console.error('Failed to reconnect to WhatsApp:', error);
+      });
+    }, delayMs);
+  }
+
+  private async resetAuthAndReconnect(): Promise<void> {
+    if (this.authResetInProgress || this.reconnecting) {
+      return;
+    }
+
+    this.authResetInProgress = true;
+    console.log('⚠️ Existing Baileys auth session is invalid or logged out.');
+    console.log(`🧹 Clearing saved auth state at ${this.options.authDir} so WhatsApp can issue a new QR code...`);
+
+    try {
+      await this.disconnect();
+      await this.clearAuthState();
+      await this.ensureAuthDir();
+    } catch (error) {
+      console.warn('Failed to reset Baileys auth state cleanly:', error);
+    }
+
+    this.scheduleReconnect(
+      INVALID_AUTH_RECONNECT_DELAY_MS,
+      '🔄 Reconnecting in 5 seconds. A new QR code should appear shortly and may take a little longer than usual...'
+    );
+  }
+
+  private async ensureAuthDir(): Promise<void> {
+    await mkdir(this.options.authDir, { recursive: true });
+  }
+
+  private async clearAuthState(): Promise<void> {
+    await rm(this.options.authDir, { recursive: true, force: true });
+  }
+
   private rememberChatTarget(chatId: string, pn: string, pushName?: string): void {
     const existing = this.chatTargets.get(chatId);
     const searchTerms = new Set(existing?.searchTerms || []);
@@ -391,6 +596,28 @@ export class WhatsAppClient {
   private normalizePhone(value: string): string | undefined {
     const digits = value.replace(/\D/g, '');
     return digits ? digits : undefined;
+  }
+
+  private shouldLogUnsupportedMessage(
+    remoteJid: string,
+    options: {
+      downloadMedia: boolean;
+      includeFromMe: boolean;
+      loadGroupName: boolean;
+    },
+  ): boolean {
+    if (options.includeFromMe) {
+      return false;
+    }
+    if (remoteJid.endsWith('@g.us')) {
+      return false;
+    }
+    return true;
+  }
+
+  private normalizeTimestamp(value: unknown): number {
+    const numeric = Number(value || 0);
+    return Number.isFinite(numeric) ? numeric : 0;
   }
 
   private async getGroupName(groupId: string): Promise<string> {

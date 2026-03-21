@@ -60,7 +60,7 @@ def apply_self_routing_instruction(
     stats: dict[str, int] = {}
 
     if instruction.individuals is not None:
-        existing_contacts = load_contacts(contacts_file)
+        existing_contacts = load_contacts(contacts_file) if contacts_file else []
         existing_by_phone = {normalize_contact_id(c.phone): c for c in existing_contacts if normalize_contact_id(c.phone)}
         contacts: list[WhatsAppContact] = []
         seen: set[str] = set()
@@ -78,13 +78,14 @@ def apply_self_routing_instruction(
                 )
             )
 
-        save_contacts(contacts_file, contacts)
+        if contacts_file:
+            save_contacts(contacts_file, contacts)
         for contact in contacts:
             sync_direct_contact_storage(storage_dir_path, workspace, contact)
         stats["individual_count"] = len(contacts)
 
     if instruction.groups is not None:
-        existing_rows = load_group_members(group_members_file)
+        existing_rows = load_group_members(group_members_file) if group_members_file else []
         existing_by_key: dict[tuple[str, str], WhatsAppGroupMember] = {}
         for row in existing_rows:
             key = (normalize_group_name(row.group_name), normalize_contact_id(row.member_pn))
@@ -117,7 +118,8 @@ def apply_self_routing_instruction(
                 )
             )
 
-        save_group_members(group_members_file, rows)
+        if group_members_file:
+            save_group_members(group_members_file, rows)
         for index, row in enumerate(rows, start=1):
             sync_group_row_storage(storage_dir_path, workspace, index, row)
         stats["group_member_count"] = len(rows)

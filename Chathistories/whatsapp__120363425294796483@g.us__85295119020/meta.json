@@ -1,0 +1,14 @@
+{
+  "key": "whatsapp:120363425294796483@g.us:85295119020",
+  "created_at": "2026-03-09T09:29:14.645207",
+  "updated_at": "2026-03-10T22:52:27.670384",
+  "last_consolidated": 0,
+  "message_count": 22,
+  "metadata": {
+    "insurance_flow_mode": "skill",
+    "insurance_generic_reply_count": 2,
+    "insurance_cycle_active": true,
+    "insurance_waiting_for_answer": false
+  },
+  "source_session_file": "/Users/nijiachen/.nanobot/workspace/sessions/whatsapp_120363425294796483@g.us_85295119020.jsonl"
+}

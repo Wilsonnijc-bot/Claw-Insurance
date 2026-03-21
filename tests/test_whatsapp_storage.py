@@ -11,9 +11,26 @@ from nanobot.channels.whatsapp_storage import (
 )
 
 
-def test_sync_direct_contact_storage_creates_metadata_and_history_link(tmp_path: Path) -> None:
+def _write_session_file(path: Path, *, key: str, messages: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"_type": "metadata", "key": key, "metadata": {}, "last_consolidated": 0}) + "\n")
+        for msg in messages:
+            f.write(json.dumps(msg) + "\n")
+
+
+def test_sync_direct_contact_storage_creates_metadata_and_materialized_history_export(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     root = storage_path("", workspace)
+    session_path = session_file_path(workspace, "whatsapp:85212345678")
+    _write_session_file(
+        session_path,
+        key="whatsapp:85212345678",
+        messages=[
+            {"role": "user", "content": "Hi", "timestamp": "2026-03-09T10:11:37.718083", "message_id": "m1"},
+            {"role": "assistant", "content": "Hello", "timestamp": "2026-03-09T10:11:37.718099", "message_id": "m2"},
+        ],
+    )
 
     folder = sync_direct_contact_storage(
         root,
@@ -28,7 +45,14 @@ def test_sync_direct_contact_storage_creates_metadata_and_history_link(tmp_path:
     assert meta["normalized_phone"] == "85212345678"
     assert meta["session_key"] == "whatsapp:85212345678"
     assert Path(meta["session_file"]) == session_file_path(workspace, "whatsapp:85212345678")
-    assert (folder / "history.jsonl").is_symlink()
+    history_lines = [
+        json.loads(line)
+        for line in (folder / "history.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert not (folder / "history.jsonl").is_symlink()
+    assert [item["role"] for item in history_lines] == ["client", "me"]
+    assert [item["from_me"] for item in history_lines] == [False, True]
 
 
 def test_sync_group_row_storage_bootstrap_marks_pending_until_ids_are_known(tmp_path: Path) -> None:

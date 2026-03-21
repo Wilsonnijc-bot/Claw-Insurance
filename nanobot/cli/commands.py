@@ -153,6 +153,12 @@ def version_callback(value: bool):
         raise typer.Exit()
 
 
+def whatsapp_web_nanobot_gateway_entry() -> None:
+    """Console-script alias for `nanobot gateway`."""
+    sys.argv = ["whatsapp-web-nanobot-gateway", "gateway", *sys.argv[1:]]
+    app()
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(
@@ -858,6 +864,12 @@ def _build_whatsapp_bridge_env(config: Config) -> dict[str, str]:
     wa = config.channels.whatsapp
     if wa.bridge_token:
         env["BRIDGE_TOKEN"] = wa.bridge_token
+    if wa.web_browser_mode:
+        env["WEB_BROWSER_MODE"] = wa.web_browser_mode
+    if wa.web_cdp_url:
+        env["WEB_CDP_URL"] = wa.web_cdp_url
+    if wa.web_cdp_chrome_path:
+        env["WEB_CDP_CHROME_PATH"] = wa.web_cdp_chrome_path
     if wa.web_profile_dir:
         env["WEB_PROFILE_DIR"] = wa.web_profile_dir
 
@@ -894,6 +906,9 @@ def _ensure_whatsapp_bridge_browser(bridge_dir: Path, config: Config, env: dict[
 
     if config.channels.whatsapp.delivery_mode != "draft":
         return
+    if config.channels.whatsapp.web_browser_mode != "launch":
+        console.print("Using CDP browser mode for WhatsApp Web; skipping Playwright Chromium install")
+        return
 
     console.print("Ensuring Playwright Chromium is installed for WhatsApp draft mode...")
     try:
@@ -909,6 +924,132 @@ def _ensure_whatsapp_bridge_browser(bridge_dir: Path, config: Config, env: dict[
         if e.stderr:
             console.print(f"[dim]{e.stderr.decode()[:500]}[/dim]")
         raise typer.Exit(1)
+
+
+def _cdp_probe_url(endpoint: str) -> str:
+    """Return the CDP JSON/version probe URL for an endpoint."""
+    parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 9222
+    return f"{scheme}://{host}:{port}/json/version"
+
+
+def _whatsapp_cdp_running(config: Config) -> bool:
+    """Return True when the configured CDP endpoint responds like a Chrome debugger."""
+    import json
+    import urllib.request
+
+    endpoint = config.channels.whatsapp.web_cdp_url
+    try:
+        with urllib.request.urlopen(_cdp_probe_url(endpoint), timeout=0.5) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8", errors="ignore") or "{}")
+            return bool(payload.get("webSocketDebuggerUrl") or payload.get("Browser"))
+    except Exception:
+        parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 9222
+        try:
+            with socket.create_connection((host, port), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+
+def _resolve_whatsapp_cdp_chrome_command(config: Config) -> str:
+    """Resolve the Chrome/Chromium executable used for CDP launch."""
+    import shutil
+
+    path_separators = tuple(sep for sep in (os.sep, os.altsep) if sep)
+    configured = os.path.expanduser(config.channels.whatsapp.web_cdp_chrome_path.strip())
+    if configured:
+        if any(sep in configured for sep in path_separators) and not Path(configured).exists():
+            console.print(f"[red]Configured webCdpChromePath does not exist: {configured}[/red]")
+            raise typer.Exit(1)
+        return configured
+
+    candidates = [
+        os.environ.get("CHROME_PATH", ""),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        str(Path.home() / "Applications" / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"),
+        str(Path.home() / "Applications" / "Chromium.app" / "Contents" / "MacOS" / "Chromium"),
+        shutil.which("google-chrome") or "",
+        shutil.which("google-chrome-stable") or "",
+        shutil.which("chromium") or "",
+        shutil.which("chromium-browser") or "",
+        shutil.which("microsoft-edge") or "",
+        shutil.which("msedge") or "",
+    ]
+    for candidate in candidates:
+        expanded = os.path.expanduser(candidate.strip())
+        if not expanded:
+            continue
+        if Path(expanded).exists() or not any(sep in expanded for sep in path_separators):
+            return expanded
+
+    console.print(
+        "[red]No Chrome/Chromium executable was found for WhatsApp CDP launch. "
+        "Set channels.whatsapp.webCdpChromePath in config.[/red]"
+    )
+    raise typer.Exit(1)
+
+
+def _build_whatsapp_cdp_launch_command(config: Config) -> list[str]:
+    """Build the Chrome command used for WhatsApp CDP mode."""
+    parsed = urlparse(config.channels.whatsapp.web_cdp_url if "://" in config.channels.whatsapp.web_cdp_url else f"http://{config.channels.whatsapp.web_cdp_url}")
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 9222
+    profile_dir = os.path.expanduser(config.channels.whatsapp.web_profile_dir)
+    return [
+        _resolve_whatsapp_cdp_chrome_command(config),
+        f"--remote-debugging-port={port}",
+        f"--remote-debugging-address={host}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        "https://web.whatsapp.com/",
+    ]
+
+
+def _ensure_whatsapp_cdp_browser(config: Config):
+    """Launch or reuse the configured CDP browser for WhatsApp Web."""
+    import subprocess
+
+    wa = config.channels.whatsapp
+    if wa.web_browser_mode != "cdp":
+        return None
+
+    if _whatsapp_cdp_running(config):
+        console.print("[green]✓[/green] WhatsApp Web CDP browser ready")
+        return None
+
+    command = _build_whatsapp_cdp_launch_command(config)
+    console.print("WhatsApp Web CDP browser not detected, launching Chrome...")
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            console.print(f"[red]WhatsApp Web CDP browser exited early with code {proc.returncode}[/red]")
+            raise typer.Exit(1)
+        if _whatsapp_cdp_running(config):
+            console.print("[green]✓[/green] WhatsApp Web CDP browser ready")
+            return proc
+        time.sleep(0.2)
+
+    console.print("[red]WhatsApp Web CDP browser did not become ready in time[/red]")
+    raise typer.Exit(1)
 
 
 def _whatsapp_bridge_running(config: Config) -> bool:
@@ -976,6 +1117,12 @@ def _start_whatsapp_bridge(config: Config):
 
     if not config.channels.whatsapp.enabled:
         return None
+
+    if (
+        config.channels.whatsapp.delivery_mode == "draft"
+        and config.channels.whatsapp.web_browser_mode == "cdp"
+    ):
+        _ensure_whatsapp_cdp_browser(config)
 
     if _whatsapp_bridge_running(config):
         console.print("[green]✓[/green] WhatsApp bridge already running")
@@ -1105,6 +1252,19 @@ def channels_login():
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+
+
+@channels_app.command("whatsapp-web")
+def channels_whatsapp_web():
+    """Launch or reuse the WhatsApp Web CDP browser."""
+    from nanobot.config.loader import load_config
+
+    config = load_config()
+    if config.channels.whatsapp.web_browser_mode != "cdp":
+        console.print("[red]channels.whatsapp.webBrowserMode must be set to 'cdp' for this command.[/red]")
+        raise typer.Exit(1)
+
+    _ensure_whatsapp_cdp_browser(config)
 
 
 @whatsapp_contacts_app.command("init")

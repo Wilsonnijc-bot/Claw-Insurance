@@ -10,7 +10,7 @@
  *   npm run build && npm start
  *   
  * Or with custom settings:
- *   BRIDGE_PORT=3001 AUTH_DIR=~/.nanobot/whatsapp npm start
+ *   BRIDGE_PORT=3001 AUTH_DIR=~/.nanobot/whatsapp WEB_BROWSER_MODE=cdp WEB_CDP_URL=http://127.0.0.1:9222 npm start
  */
 
 // Polyfill crypto for Baileys in ESM
@@ -25,13 +25,34 @@ import { join } from 'path';
 
 const PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
 const AUTH_DIR = process.env.AUTH_DIR || join(homedir(), '.nanobot', 'whatsapp-auth');
+const WEB_BROWSER_MODE = (process.env.WEB_BROWSER_MODE || 'cdp') as 'cdp' | 'launch';
+const WEB_CDP_URL = process.env.WEB_CDP_URL || 'http://127.0.0.1:9222';
+const WEB_CDP_CHROME_PATH = process.env.WEB_CDP_CHROME_PATH || '';
 const WEB_PROFILE_DIR = process.env.WEB_PROFILE_DIR || join(homedir(), '.nanobot', 'whatsapp-web');
 const TOKEN = process.env.BRIDGE_TOKEN || undefined;
 
 console.log('🐈 nanobot WhatsApp Bridge');
 console.log('========================\n');
 
-const server = new BridgeServer(PORT, AUTH_DIR, WEB_PROFILE_DIR, TOKEN);
+console.log(`🌐 Web automation mode: ${WEB_BROWSER_MODE}`);
+if (WEB_BROWSER_MODE === 'cdp') {
+  console.log(`🔌 CDP endpoint: ${WEB_CDP_URL}`);
+  if (WEB_CDP_CHROME_PATH) {
+    console.log(`🌐 CDP Chrome path: ${WEB_CDP_CHROME_PATH}`);
+  }
+} else {
+  console.log(`🗂️ Playwright profile: ${WEB_PROFILE_DIR}`);
+}
+
+const server = new BridgeServer(
+  PORT,
+  AUTH_DIR,
+  WEB_PROFILE_DIR,
+  TOKEN,
+  WEB_BROWSER_MODE,
+  WEB_CDP_URL,
+  WEB_CDP_CHROME_PATH,
+);
 
 // Handle graceful shutdown
 process.on('SIGINT', async () => {

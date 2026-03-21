@@ -1,7 +1,17 @@
 {
   "version": 1,
-  "updated_at": "",
-  "source": "",
-  "direct_reply_targets": [],
+  "updated_at": "2026-03-21T15:08:18.846809+00:00",
+  "source": "self_chat_command",
+  "direct_reply_targets": [
+    {
+      "phone": "85268424658",
+      "enabled": true,
+      "label": "",
+      "chat_id": "85268424658@s.whatsapp.net",
+      "sender_id": "85268424658@s.whatsapp.net",
+      "push_name": "+852 6842 4658",
+      "last_seen_at": "2026-03-21T15:08:18.846796+00:00"
+    }
+  ],
   "group_reply_targets": []
 }

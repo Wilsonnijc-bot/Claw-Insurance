@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,32 @@ from nanobot.channels.whatsapp_contacts import normalize_contact_id
 from nanobot.channels.whatsapp_group_members import normalize_group_name
 
 _DEFAULT_REL_PATH = "data/whatsapp_reply_targets.json"
+
+
+@dataclass(frozen=True)
+class DirectReplyTarget:
+    """One direct auto-reply target persisted from self-chat routing."""
+
+    phone: str
+    enabled: bool = True
+    label: str = ""
+    chat_id: str = ""
+    sender_id: str = ""
+    push_name: str = ""
+    last_seen_at: str = ""
+
+
+@dataclass(frozen=True)
+class GroupReplyTarget:
+    """One group auto-reply target persisted from self-chat routing."""
+
+    group_name: str
+    member_phone: str
+    enabled: bool = True
+    group_id: str = ""
+    member_id: str = ""
+    member_label: str = ""
+    last_seen_at: str = ""
 
 
 def reply_targets_path(path_str: str, project_root: Path) -> Path:
@@ -62,6 +89,142 @@ def save_reply_targets(path: Path, payload: dict[str, Any]) -> Path:
         json.dump(payload, f, ensure_ascii=False, indent=2)
         f.write("\n")
     return path
+
+
+def load_direct_reply_targets(path: Path) -> list[DirectReplyTarget]:
+    """Load valid direct reply-target rows from the JSON store."""
+    payload = load_reply_targets(path)
+    rows: list[DirectReplyTarget] = []
+    for raw in payload.get("direct_reply_targets", []):
+        if not isinstance(raw, dict):
+            continue
+        phone = normalize_contact_id(str(raw.get("phone", "")))
+        if not phone:
+            continue
+        rows.append(
+            DirectReplyTarget(
+                phone=phone,
+                enabled=bool(raw.get("enabled", True)),
+                label=str(raw.get("label", "")).strip(),
+                chat_id=str(raw.get("chat_id", "")).strip(),
+                sender_id=str(raw.get("sender_id", "")).strip(),
+                push_name=str(raw.get("push_name", "")).strip(),
+                last_seen_at=str(raw.get("last_seen_at", "")).strip(),
+            )
+        )
+    return rows
+
+
+def load_group_reply_targets(path: Path) -> list[GroupReplyTarget]:
+    """Load valid group reply-target rows from the JSON store."""
+    payload = load_reply_targets(path)
+    rows: list[GroupReplyTarget] = []
+    for raw in payload.get("group_reply_targets", []):
+        if not isinstance(raw, dict):
+            continue
+        group_name = " ".join(str(raw.get("group_name", "")).split())
+        member_phone = normalize_contact_id(str(raw.get("member_phone", "")))
+        if not group_name or not member_phone:
+            continue
+        rows.append(
+            GroupReplyTarget(
+                group_name=group_name,
+                member_phone=member_phone,
+                enabled=bool(raw.get("enabled", True)),
+                group_id=str(raw.get("group_id", "")).strip(),
+                member_id=str(raw.get("member_id", "")).strip(),
+                member_label=str(raw.get("member_label", "")).strip(),
+                last_seen_at=str(raw.get("last_seen_at", "")).strip(),
+            )
+        )
+    return rows
+
+
+def find_direct_reply_target(
+    path: Path,
+    *,
+    phone: str = "",
+    chat_id: str = "",
+    sender_id: str = "",
+) -> DirectReplyTarget | None:
+    """Return the first direct reply target matching phone or chat identifiers."""
+    rows = load_direct_reply_targets(path)
+    return match_direct_reply_target(rows, phone=phone, chat_id=chat_id, sender_id=sender_id)
+
+
+def match_direct_reply_target(
+    rows: list[DirectReplyTarget],
+    *,
+    phone: str = "",
+    chat_id: str = "",
+    sender_id: str = "",
+) -> DirectReplyTarget | None:
+    """Return the first direct reply target matching phone or chat identifiers."""
+    phone_norm = normalize_contact_id(phone)
+    chat_id_norm = _normalize_chat_identifier(chat_id)
+    sender_id_norm = _normalize_chat_identifier(sender_id)
+
+    if phone_norm:
+        for row in rows:
+            if row.phone == phone_norm:
+                return row
+
+    if chat_id_norm:
+        for row in rows:
+            if _normalize_chat_identifier(row.chat_id) == chat_id_norm:
+                return row
+
+    if sender_id_norm:
+        for row in rows:
+            if _normalize_chat_identifier(row.sender_id) == sender_id_norm:
+                return row
+
+    return None
+
+
+def match_group_reply_target(
+    rows: list[GroupReplyTarget],
+    *,
+    group_id: str = "",
+    group_name: str = "",
+    member_id: str = "",
+    member_phone: str = "",
+) -> tuple[int, GroupReplyTarget] | None:
+    """Return the first enabled group reply target matching the incoming member."""
+    incoming_group_id = str(group_id or "").strip().lower()
+    incoming_group_name = normalize_group_name(group_name)
+    incoming_member_id = str(member_id or "").strip().lower()
+    incoming_member_id_bare = incoming_member_id.split("@", 1)[0] if "@" in incoming_member_id else incoming_member_id
+    incoming_member_phone = normalize_contact_id(member_phone)
+
+    for index, row in enumerate(rows):
+        if not row.enabled:
+            continue
+        row_group_id = str(row.group_id or "").strip().lower()
+        row_group_name = normalize_group_name(row.group_name)
+        row_member_id = str(row.member_id or "").strip().lower()
+        row_member_id_bare = row_member_id.split("@", 1)[0] if "@" in row_member_id else row_member_id
+        row_member_phone = normalize_contact_id(row.member_phone)
+
+        if row_group_id:
+            if not incoming_group_id or row_group_id != incoming_group_id:
+                continue
+        elif not incoming_group_name or row_group_name != incoming_group_name:
+            continue
+
+        member_matches = False
+        if row_member_phone and incoming_member_phone and row_member_phone == incoming_member_phone:
+            member_matches = True
+        if row_member_id and incoming_member_id and row_member_id in {incoming_member_id, incoming_member_id_bare}:
+            member_matches = True
+        if row_member_id_bare and incoming_member_id_bare and row_member_id_bare == incoming_member_id_bare:
+            member_matches = True
+        if not member_matches:
+            continue
+
+        return index, row
+
+    return None
 
 
 def rewrite_from_self_instruction(
@@ -219,3 +382,7 @@ def observe_group_identification(
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_chat_identifier(value: str) -> str:
+    return str(value or "").strip().casefold()
