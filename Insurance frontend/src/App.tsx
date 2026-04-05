@@ -1,0 +1,609 @@
+import { useState, useMemo, useCallback, useEffect } from 'react';
+import { 
+  MessageSquare, Radio, Shield, LogOut, FileText, 
+  ChevronLeft, ChevronRight, Menu, X, Wifi, WifiOff, UserPlus
+} from 'lucide-react';
+import { ClientList } from './components/ClientList/ClientList';
+import { MessageThread } from './components/MessageCenter/MessageThread';
+import { MessageInput } from './components/MessageCenter/MessageInput';
+import { BroadcastModal } from './components/MessageCenter/BroadcastModal';
+import { ClientProfile } from './components/ClientDetail/ClientProfile';
+import { LoginPage } from './components/Auth/LoginPage';
+import { LogViewer } from './components/Logs/LogViewer';
+import { AddReplyTargetModal } from './components/MessageCenter/AddReplyTargetModal';
+import { GatewayBootstrapOverlay } from './components/common/GatewayBootstrapOverlay';
+import { FloatingStatusNotice } from './components/common/FloatingStatusNotice';
+import { fetchClient } from './services/api';
+import { useRecording } from './hooks/useRecording';
+import { useAIGeneration } from './hooks/useAIGeneration';
+import { useLogger } from './hooks/useLogger';
+import { useNanobot } from './hooks/useNanobot';
+
+function App() {
+  // Auth State
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [currentUser, setCurrentUser] = useState<{ id: string; name: string } | null>(null);
+  const [loginError, setLoginError] = useState('');
+
+  // Layout State - Responsive
+  const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
+  const [rightPanelOpen, setRightPanelOpen] = useState(true);
+  const [isMobile, setIsMobile] = useState(false);
+
+  // App State
+  const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
+  const [broadcastMode, setBroadcastMode] = useState(false);
+  const [showBroadcastModal, setShowBroadcastModal] = useState(false);
+  const [showLogViewer, setShowLogViewer] = useState(false);
+  const [showAddTarget, setShowAddTarget] = useState(false);
+  const [editingDraftContent, setEditingDraftContent] = useState<string | null>(null);
+  const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
+  const [initialConversationLoading, setInitialConversationLoading] = useState(false);
+
+  // Nanobot backend hook — only activates after login
+  const nanobot = useNanobot(isAuthenticated);
+
+  const clients = nanobot.clients;
+  const messages = nanobot.messages;
+
+  // Hooks
+  const { recordingState, startRecording, stopRecording } = useRecording();
+  const { aiLoading, startGeneration, stopGeneration } = useAIGeneration();
+  const { logs, addLog, setUser, clearLogs, downloadLogs } = useLogger(isAuthenticated);
+
+  // Check responsive on mount and resize
+  useEffect(() => {
+    const checkResponsive = () => {
+      const width = window.innerWidth;
+      const mobile = width < 768;
+      const tablet = width >= 768 && width < 1280;
+
+      setIsMobile(mobile);
+      
+      if (mobile) {
+        setLeftSidebarOpen(false);
+        setRightPanelOpen(false);
+      } else if (tablet) {
+        setLeftSidebarOpen(true);
+        setRightPanelOpen(false);
+      } else {
+        setLeftSidebarOpen(true);
+        setRightPanelOpen(true);
+      }
+    };
+
+    checkResponsive();
+    window.addEventListener('resize', checkResponsive);
+    return () => window.removeEventListener('resize', checkResponsive);
+  }, []);
+
+  // Set logger user when authenticated
+  useEffect(() => {
+    if (currentUser) {
+      setUser(currentUser);
+    }
+  }, [currentUser, setUser]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !nanobot.gatewayReady) {
+      return;
+    }
+
+    if (clients.length === 0) {
+      setSelectedClientId(null);
+      setInitialConversationLoading(false);
+      return;
+    }
+
+    if (selectedClientId && clients.some((client) => client.id === selectedClientId)) {
+      return;
+    }
+
+    const firstClientId = clients[0].id;
+    setSelectedClientId(firstClientId);
+    setInitialConversationLoading(true);
+    void nanobot.loadMessages(firstClientId).finally(() => {
+      setInitialConversationLoading(false);
+    });
+  }, [isAuthenticated, nanobot, clients, selectedClientId]);
+
+  // Auto-draft → composer: when an auto-generated AI draft arrives, put it in the input
+  useEffect(() => {
+    if (nanobot.autoDraftPhone && nanobot.autoDraftContent) {
+      // Draft arrived — stop the thinking indicator
+      stopGeneration();
+      // If the user is looking at the client whose draft just arrived,
+      // immediately load it into the composer textarea.
+      if (nanobot.autoDraftPhone === selectedClientId) {
+        setEditingDraftContent(nanobot.autoDraftContent);
+        setEditingDraftId(`auto_${Date.now()}`);
+      }
+      // Even if not viewing this client, store it so it'll load when they select it
+      // (we clear after consuming)
+      nanobot.clearAutoDraft();
+    }
+  }, [nanobot.autoDraftPhone, nanobot.autoDraftContent, selectedClientId, nanobot, stopGeneration]);
+
+  // Backend-driven AI generating indicator (for both auto-draft and manual paths)
+  useEffect(() => {
+    if (
+      nanobot.aiGeneratingStatus === 'started' &&
+      nanobot.aiGeneratingPhone &&
+      nanobot.aiGeneratingPhone === selectedClientId
+    ) {
+      startGeneration();
+    } else if (nanobot.aiGeneratingStatus !== 'started' && nanobot.aiGeneratingPhone === null) {
+      // AI stopped (completed, error, etc.) — stop is also handled when draft arrives
+    }
+  }, [nanobot.aiGeneratingStatus, nanobot.aiGeneratingPhone, selectedClientId, startGeneration]);
+
+  // Derived state
+  const selectedClient = useMemo(
+    () => clients.find((c) => c.id === selectedClientId) || null,
+    [clients, selectedClientId]
+  );
+
+  const currentMessages = useMemo(
+    () => (selectedClientId ? messages[selectedClientId] || [] : []),
+    [messages, selectedClientId]
+  );
+
+  const currentVoiceMemos = useMemo(
+    () => [],
+    []
+  );
+
+  const isClientLoading = initialConversationLoading;
+  const showBootstrapOverlay = isAuthenticated && (
+    nanobot.loading ||
+    !nanobot.gatewayReady ||
+    nanobot.whatsappAuthRequired ||
+    initialConversationLoading
+  );
+
+  // Auth Handlers
+  const handleLogin = useCallback((username: string, _password: string) => {
+    const user = { id: `user_${Date.now()}`, name: username };
+    setCurrentUser(user);
+    setIsAuthenticated(true);
+    setLoginError('');
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    addLog('LOGOUT', `用户 ${currentUser?.name} 退出系统`);
+    setIsAuthenticated(false);
+    setCurrentUser(null);
+    setSelectedClientId(null);
+    setEditingDraftContent(null);
+    setEditingDraftId(null);
+    setInitialConversationLoading(false);
+  }, [addLog, currentUser]);
+
+  // Handlers
+  const handleSelectClient = useCallback((clientId: string) => {
+    setSelectedClientId(clientId);
+    // Load messages from backend if connected
+    if (nanobot.backendConnected) {
+      nanobot.loadMessages(clientId);
+    }
+    if (isMobile) {
+      setLeftSidebarOpen(false);
+    }
+  }, [isMobile, nanobot]);
+
+  const handleToggleAutoDraft = useCallback((clientId: string) => {
+    const client = clients.find(c => c.id === clientId);
+    const newState = !client?.autoDraftEnabled;
+    if (!nanobot.backendConnected) {
+      return;
+    }
+    nanobot.toggleAutoDraft(clientId, newState);
+  }, [clients, nanobot]);
+
+  const handleSyncWhatsApp = useCallback(async (clientId: string) => {
+    if (!nanobot.backendConnected) {
+      return;
+    }
+
+    const client = clients.find((c) => c.id === clientId);
+    const beforeMessageCount = client?.messageCount ?? 0;
+    const beforeUpdatedAt = client?.updatedAt ?? '';
+
+    await nanobot.syncWhatsApp(clientId);
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await nanobot.refreshClients();
+      const refreshedClient = await fetchClient(clientId).catch(() => null);
+      if (selectedClientId === clientId) {
+        await nanobot.loadMessages(clientId);
+      }
+      if (
+        refreshedClient && (
+          (typeof refreshedClient.messageCount === 'number' && refreshedClient.messageCount > beforeMessageCount)
+          || (refreshedClient.updatedAt && refreshedClient.updatedAt !== beforeUpdatedAt)
+        )
+      ) {
+        return;
+      }
+    }
+
+    throw new Error('未检测到新的聊天记录，请确认打开的是正确联系人后再试');
+  }, [clients, nanobot, selectedClientId]);
+
+  const handleSendMessage = useCallback(
+    async (content: string) => {
+      if (!selectedClientId) return;
+      const wasDraftEdit = !!editingDraftId;
+
+      // Clear editing state
+      if (editingDraftId) {
+        setEditingDraftId(null);
+      }
+
+      // If this was an edited AI draft, route through sendAIDraft (saves to JSONL + sends)
+      if (wasDraftEdit && nanobot.backendConnected) {
+        await nanobot.sendAIDraft(selectedClientId, content);
+        return;
+      }
+
+      if (!nanobot.backendConnected) {
+        return;
+      }
+      await nanobot.sendMessage(selectedClientId, content);
+    },
+    [selectedClientId, nanobot, editingDraftId]
+  );
+
+  const handleRequestAI = useCallback(() => {
+    if (!selectedClientId) return;
+    startGeneration();
+
+    if (!nanobot.backendConnected) {
+      stopGeneration();
+      return;
+    }
+    nanobot.requestAIDraft(selectedClientId).then((draft) => {
+      if (draft && selectedClientId) {
+        setEditingDraftContent(draft);
+        setEditingDraftId(`ai_${Date.now()}`);
+      }
+      stopGeneration();
+    }).catch(() => {
+      stopGeneration();
+    });
+  }, [selectedClientId, startGeneration, stopGeneration, nanobot]);
+
+  const handleToggleBroadcast = useCallback(() => {
+    if (!broadcastMode) {
+      setShowBroadcastModal(true);
+    }
+    setBroadcastMode((prev) => !prev);
+  }, [broadcastMode]);
+
+  const handleSendBroadcast = useCallback(
+    (clientIds: string[], message: string) => {
+      if (!nanobot.backendConnected) {
+        return;
+      }
+      nanobot.broadcast(clientIds, message);
+
+      setBroadcastMode(false);
+    },
+    [nanobot]
+  );
+
+  const handleStartRecording = useCallback(() => {
+    startRecording();
+  }, [startRecording]);
+
+  const handleStopRecording = useCallback(() => {
+    stopRecording();
+  }, [stopRecording]);
+
+  const handleOpenLogs = useCallback(() => {
+    setShowLogViewer(true);
+  }, []);
+
+  const handleClearLogs = useCallback(() => {
+    clearLogs();
+  }, [clearLogs]);
+
+  // Render Login Page if not authenticated
+  if (!isAuthenticated) {
+    return <LoginPage onLogin={handleLogin} error={loginError} />;
+  }
+
+  return (
+    <div className="relative h-screen w-screen flex flex-col bg-light-gray font-sans antialiased overflow-hidden">
+      {/* Top Navigation - Fixed, Desktop App Style */}
+      <header className="h-14 bg-white/95 backdrop-blur-md border-b border-border-light shadow-header flex items-center justify-between px-5 flex-shrink-0 relative z-10">
+        <div className="flex items-center gap-3">
+          {/* Mobile Menu Toggle */}
+          <button
+            onClick={() => setLeftSidebarOpen(!leftSidebarOpen)}
+            className="lg:hidden p-2 hover:bg-surface rounded-subtle transition-colors"
+          >
+            {leftSidebarOpen ? (
+              <X className="w-5 h-5 text-deep-slate" strokeWidth={1.5} />
+            ) : (
+              <Menu className="w-5 h-5 text-deep-slate" strokeWidth={1.5} />
+            )}
+          </button>
+
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-deep-trust to-warm-navy flex items-center justify-center shadow-sm">
+            <Shield className="w-[18px] h-[18px] text-white" strokeWidth={1.5} />
+          </div>
+          <h1 className="text-[15px] font-bold text-deep-slate tracking-tight hidden sm:block">
+            InsureAI <span className="text-gradient-brand">销售助手</span>
+          </h1>
+        </div>
+
+        <div className="flex items-center gap-2 md:gap-4">
+          {/* Backend Connection Status */}
+          <div className={`flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold rounded-full border transition-all ${
+            nanobot.backendConnected
+              ? 'bg-success/8 text-success border-success/20'
+              : 'bg-warning/10 text-warning border-warning/20'
+          }`}>
+            {nanobot.backendConnected ? (
+              <Wifi className="w-3 h-3" strokeWidth={2} />
+            ) : (
+              <WifiOff className="w-3 h-3" strokeWidth={2} />
+            )}
+            <span className="hidden md:inline">
+              {nanobot.backendConnected ? 'Nanobot 已连接' : '正在连接后台'}
+            </span>
+          </div>
+
+          {/* Log Viewer Button */}
+          <button
+            onClick={handleOpenLogs}
+            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-deep-trust hover:bg-deep-trust/[0.06] rounded-lg transition-all btn-press"
+          >
+            <FileText className="w-4 h-4" strokeWidth={1.5} />
+            <span className="hidden sm:inline">日志</span>
+            {logs.length > 0 && (
+              <span className="px-1.5 py-0.5 text-[10px] bg-deep-trust text-white rounded-full font-semibold min-w-[20px] text-center">
+                {logs.length > 99 ? '99+' : logs.length}
+              </span>
+            )}
+          </button>
+
+          {/* Add Reply Target Button */}
+          <button
+            onClick={() => setShowAddTarget(true)}
+            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-deep-trust hover:bg-deep-trust/[0.06] rounded-lg transition-all btn-press"
+            title="添加回复目标"
+          >
+            <UserPlus className="w-4 h-4" strokeWidth={1.5} />
+            <span className="hidden sm:inline">添加目标</span>
+          </button>
+
+          <button
+            onClick={() => setShowBroadcastModal(true)}
+            className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-deep-trust hover:bg-deep-trust/[0.06] rounded-lg transition-all btn-press"
+          >
+            <Radio className="w-4 h-4" strokeWidth={1.5} />
+            <span className="hidden sm:inline">广播</span>
+          </button>
+
+          {/* User Info */}
+          <div className="flex items-center gap-2.5 pl-3 md:pl-4 border-l border-border-light">
+            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-warm-navy to-deep-trust flex items-center justify-center text-white text-sm font-semibold ring-2 ring-deep-trust/10">
+              {currentUser?.name.charAt(0).toUpperCase()}
+            </div>
+            <span className="text-sm font-medium text-deep-slate hidden md:block max-w-[100px] truncate">
+              {currentUser?.name}
+            </span>
+            <button
+              onClick={handleLogout}
+              className="p-2 hover:bg-safety-red/[0.06] rounded-lg transition-all text-medium-gray hover:text-safety-red"
+              title="退出登录"
+            >
+              <LogOut className="w-4 h-4" strokeWidth={1.5} />
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {nanobot.whatsappBrowserMode === 'cdp'
+        && nanobot.whatsappBrowserReusable === false
+        && nanobot.whatsappBrowserSeverity === 'error'
+        && !showBootstrapOverlay && (
+        <FloatingStatusNotice
+          title="Bridge 异常"
+          message={nanobot.whatsappBrowserMessage || 'Bridge 未就绪，历史同步暂时不可用。'}
+          severity="error"
+          action={{ label: '重启 Bridge', onClick: nanobot.restartBridge }}
+        />
+      )}
+
+      {showBootstrapOverlay && (
+        <GatewayBootstrapOverlay
+          progress={nanobot.gatewayProgress}
+          title={nanobot.whatsappAuthRequired ? '等待 WhatsApp 重新认证' : '正在同步真实会话数据'}
+          description={nanobot.whatsappAuthRequired
+            ? (nanobot.whatsappAuthMessage || 'You need to login again to the whatsapp web browser')
+            : (nanobot.gatewayMessage || '正在读取客户列表与聊天内容...')}
+          authRequired={nanobot.whatsappAuthRequired}
+          qrValue={nanobot.whatsappAuthQr}
+          authMessage={nanobot.whatsappAuthMessage}
+        />
+      )}
+
+      {/* Main Content */}
+      <main className="flex-1 flex overflow-hidden relative">
+        {/* Left Sidebar - Client List */}
+        <div 
+          className={`absolute lg:relative z-20 h-full transition-all duration-300 ease-out ${
+            leftSidebarOpen 
+              ? 'translate-x-0' 
+              : '-translate-x-full lg:translate-x-0 lg:w-0 lg:opacity-0 lg:overflow-hidden'
+          }`}
+        >
+          <ClientList
+            clients={clients}
+            selectedClientId={selectedClientId}
+            onSelectClient={handleSelectClient}
+            onToggleAutoDraft={handleToggleAutoDraft}
+          />
+        </div>
+
+        {/* Left Sidebar Toggle (Desktop) */}
+        <button
+          onClick={() => setLeftSidebarOpen(!leftSidebarOpen)}
+          className="hidden lg:flex absolute left-0 top-1/2 -translate-y-1/2 z-30 w-5 h-12 bg-white border border-border-light rounded-r-lg items-center justify-center shadow-card hover:bg-surface hover:shadow-card-hover transition-all"
+          style={{ marginLeft: leftSidebarOpen ? '320px' : '0' }}
+        >
+          {leftSidebarOpen ? (
+            <ChevronLeft className="w-3 h-3 text-medium-gray" strokeWidth={2} />
+          ) : (
+            <ChevronRight className="w-3 h-3 text-medium-gray" strokeWidth={2} />
+          )}
+        </button>
+
+        {/* Overlay for mobile when sidebar is open */}
+        {leftSidebarOpen && isMobile && (
+          <div 
+            className="absolute inset-0 bg-black/20 z-10 lg:hidden"
+            onClick={() => setLeftSidebarOpen(false)}
+          />
+        )}
+
+        {/* Center - Message Center */}
+        <div className="flex-1 flex flex-col min-w-0 bg-white">
+          {/* Message Header */}
+          {selectedClient ? (
+            <div className="h-14 border-b border-border-light bg-white/80 backdrop-blur-sm flex items-center justify-between px-5 flex-shrink-0">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="relative flex-shrink-0">
+                  <div className="w-9 h-9 rounded-full bg-gradient-to-br from-deep-trust to-warm-navy flex items-center justify-center text-white text-sm font-semibold ring-2 ring-deep-trust/10">
+                    {selectedClient.name.charAt(0)}
+                  </div>
+                  <span
+                    className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-white ${
+                      selectedClient.status === 'online' ? 'bg-success' : 'bg-gray-400'
+                    }`}
+                  />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-sm font-bold text-deep-slate truncate tracking-tight">
+                    {selectedClient.name.charAt(0)}**
+                  </h2>
+                  <p className="text-[11px] text-medium-gray">
+                    {selectedClient.status === 'online' ? '在线' : '离线'}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {selectedClient.autoDraftEnabled && (
+                  <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-success/8 text-success rounded-full border border-success/15">
+                    <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse"></span>
+                    AI自动草稿
+                  </span>
+                )}
+                {/* Mobile toggle right panel */}
+                <button
+                  onClick={() => setRightPanelOpen(!rightPanelOpen)}
+                  className="xl:hidden p-2 hover:bg-surface rounded-subtle transition-colors"
+                >
+                  <Menu className="w-4 h-4 text-medium-gray" strokeWidth={1.5} />
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="h-14 border-b border-border-light flex items-center px-4">
+              <p className="text-sm text-medium-gray">选择客户开始对话</p>
+            </div>
+          )}
+
+          {/* Message Thread */}
+          {selectedClient ? (
+            <MessageThread
+              messages={currentMessages}
+              clientName={selectedClient.name}
+              isAILoading={!!aiLoading?.isGenerating || isClientLoading}
+            />
+          ) : (
+            <div className="flex-1 flex items-center justify-center">
+              <div className="text-center">
+                <MessageSquare className="w-12 h-12 text-medium-gray/30 mx-auto mb-3" strokeWidth={1.5} />
+                <p className="text-sm text-medium-gray">从左侧选择客户开始对话</p>
+              </div>
+            </div>
+          )}
+
+          {/* Message Input */}
+          {selectedClient && (
+            <MessageInput
+              onSendMessage={handleSendMessage}
+              onRequestAI={handleRequestAI}
+              aiLoading={aiLoading}
+              broadcastMode={broadcastMode}
+              onToggleBroadcast={handleToggleBroadcast}
+              draftContent={editingDraftContent}
+              onDraftConsumed={() => setEditingDraftContent(null)}
+            />
+          )}
+        </div>
+
+        {/* Right Panel - Client Profile */}
+        <div 
+          className={`absolute xl:relative right-0 z-20 h-full transition-all duration-300 ease-out ${
+            rightPanelOpen 
+              ? 'translate-x-0' 
+              : 'translate-x-full xl:translate-x-0 xl:w-0 xl:opacity-0 xl:overflow-hidden'
+          }`}
+        >
+          <ClientProfile
+            client={selectedClient}
+            voiceMemos={currentVoiceMemos}
+            recordingState={recordingState}
+            onStartRecording={handleStartRecording}
+            onStopRecording={handleStopRecording}
+            whatsappBrowserReusable={nanobot.whatsappBrowserReusable}
+            whatsappBrowserMessage={nanobot.whatsappBrowserMessage}
+            onSyncWhatsApp={handleSyncWhatsApp}
+          />
+        </div>
+
+        {/* Overlay for tablet when right panel is open */}
+        {rightPanelOpen && !isMobile && window.innerWidth < 1280 && (
+          <div 
+            className="absolute inset-0 bg-black/20 z-10 xl:hidden"
+            onClick={() => setRightPanelOpen(false)}
+          />
+        )}
+      </main>
+
+      {/* Broadcast Modal */}
+      <BroadcastModal
+        isOpen={showBroadcastModal}
+        onClose={() => setShowBroadcastModal(false)}
+        clients={clients}
+        onSendBroadcast={handleSendBroadcast}
+      />
+
+      {/* Add Reply Target Modal */}
+      <AddReplyTargetModal
+        isOpen={showAddTarget}
+        onClose={() => setShowAddTarget(false)}
+        onAdd={nanobot.addReplyTarget}
+        backendConnected={nanobot.backendConnected}
+      />
+
+      {/* Log Viewer Modal */}
+      <LogViewer
+        logs={logs}
+        isOpen={showLogViewer}
+        onClose={() => setShowLogViewer(false)}
+        onDownload={downloadLogs}
+        onClear={handleClearLogs}
+        clients={clients.map(c => ({ id: c.id, name: c.name }))}
+      />
+    </div>
+  );
+}
+
+export default App;

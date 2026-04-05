@@ -82,7 +82,7 @@ def test_build_whatsapp_cdp_launch_command_uses_configured_values() -> None:
     assert command[0] == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     assert "--remote-debugging-port=9333" in command
     assert "--remote-debugging-address=127.0.0.1" in command
-    assert f"--user-data-dir={os.path.expanduser('~/wa-profile')}" in command
+    assert "--user-data-dir=~/wa-profile" in command
     assert command[-1] == "https://web.whatsapp.com/"
 
 

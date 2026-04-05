@@ -282,3 +282,56 @@ async def test_no_fit_completion_resets_to_generic_mode(tmp_path: Path) -> None:
     assert session.metadata["insurance_flow_mode"] == "generic"
     assert session.metadata["insurance_generic_reply_count"] == 0
     assert session.metadata["insurance_cycle_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_catalog_unavailable_does_not_look_like_no_fit(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    session = loop.sessions.get_or_create("whatsapp:120363425808631928@g.us")
+    session.metadata.update(
+        {
+            "insurance_flow_mode": "skill",
+            "insurance_generic_reply_count": 2,
+            "insurance_cycle_active": True,
+            "insurance_waiting_for_answer": True,
+        }
+    )
+    loop.sessions.save(session)
+
+    calls = iter(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="find1",
+                        name="exec",
+                        arguments={
+                            "command": "python3 nanobot/skills/insurance-product-advisor/scripts/find_products.py --domain Dental --facts-file /tmp/facts.json"
+                        },
+                    )
+                ],
+            ),
+            LLMResponse(content="而家產品目錄暫時連線唔穩，我未想亂咁推薦。"),
+        ]
+    )
+    loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+
+    async def _execute(name: str, params: dict) -> str:
+        return """
+        {
+          "domain": "dental",
+          "missing_fields": [],
+          "candidates": [],
+          "catalog_unavailable": true,
+          "catalog_error": "Supabase catalog request failed"
+        }
+        """
+
+    loop.tools.execute = AsyncMock(side_effect=_execute)
+
+    await loop._process_message(_wa_message("直接推荐牙科计划"))
+
+    session = loop.sessions.get_or_create("whatsapp:120363425808631928@g.us")
+    assert session.metadata["insurance_flow_mode"] == "skill"
+    assert session.metadata["insurance_cycle_active"] is True

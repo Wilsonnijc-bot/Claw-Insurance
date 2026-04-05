@@ -7,6 +7,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from nanobot.utils.paths import project_path_str, project_root
+
+
+def _project_path_str(*parts: str) -> str:
+    """Return an absolute project-root path as a string."""
+    return project_path_str(*parts)
+
 
 class Base(BaseModel):
     """Base model that accepts both camelCase and snake_case keys."""
@@ -24,11 +31,10 @@ class WhatsAppConfig(Base):
     web_browser_mode: Literal["cdp", "launch"] = "cdp"
     web_cdp_url: str = "http://127.0.0.1:9222"
     web_cdp_chrome_path: str = ""
-    web_profile_dir: str = "~/.nanobot/whatsapp-web"
-    contacts_file: str = "~/.nanobot/contacts/whatsapp.json"
-    group_members_file: str = "~/.nanobot/contacts/whatsapp_groups.csv"
-    reply_targets_file: str = "data/whatsapp_reply_targets.json"
-    storage_dir: str = ""
+    web_profile_dir: str = Field(default_factory=lambda: _project_path_str("whatsapp-web"))
+    contacts_file: str = Field(default_factory=lambda: _project_path_str("data", "contacts", "whatsapp.json"))
+    group_members_file: str = Field(default_factory=lambda: _project_path_str("data", "whatsapp_groups.csv"))
+    reply_targets_file: str = Field(default_factory=lambda: _project_path_str("data", "whatsapp_reply_targets.json"))
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 
@@ -230,7 +236,7 @@ class ChannelsConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
-    workspace: str = "~/.nanobot/workspace"
+    workspace: str = Field(default_factory=lambda: _project_path_str())
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
@@ -287,7 +293,12 @@ class HeartbeatConfig(Base):
 
 
 class PrivacyGatewayConfig(Base):
-    """Local privacy gateway configuration."""
+    """Local privacy gateway configuration.
+
+    Privacy pipeline step 1 in ``PRIVACY_PIPELINE.md``.
+    These fields control whether custom-provider traffic is rerouted through
+    the local privacy gateway before leaving the machine.
+    """
 
     enabled: bool = True
     listen_host: str = "127.0.0.1"
@@ -350,10 +361,24 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class CatalogConfig(Base):
+    """Insurance catalog backend configuration."""
+
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_catalog_table: str = ""
+    supabase_catalog_tables: list[str] = Field(default_factory=list)
+    cache_ttl_seconds: int = 300
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
-    model_config = SettingsConfigDict(alias_generator=to_camel, populate_by_name=True)
+    model_config = SettingsConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        env_nested_delimiter="__",
+    )
 
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
@@ -361,11 +386,21 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     privacy_gateway: PrivacyGatewayConfig = Field(default_factory=PrivacyGatewayConfig, alias="privacyGateway")
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    catalog: CatalogConfig = Field(default_factory=CatalogConfig)
 
     @property
     def workspace_path(self) -> Path:
-        """Get expanded workspace path."""
-        return Path(self.agents.defaults.workspace).expanduser()
+        """Get workspace path (project-local, no expanduser).
+
+        Relative values are resolved against the project root.
+        The workspace must stay inside the project tree.
+        """
+        from nanobot.utils.paths import confine_path
+
+        workspace = Path(self.agents.defaults.workspace)
+        if not workspace.is_absolute():
+            workspace = project_root() / workspace
+        return confine_path(workspace)
 
     def _match_provider(
         self, model: str | None = None

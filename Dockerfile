@@ -30,8 +30,10 @@ WORKDIR /app/bridge
 RUN npm install && npm run build
 WORKDIR /app
 
-# Create config directory
-RUN mkdir -p /root/.nanobot
+# Create project-local runtime directories
+RUN mkdir -p /app/data /app/sessions /app/state /app/memory \
+    /app/whatsapp-auth /app/whatsapp-web /app/whatsapp-web-debug \
+    /app/skills /app/media /app/cron
 
 # Gateway default port
 EXPOSE 18790

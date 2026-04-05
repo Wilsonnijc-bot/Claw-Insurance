@@ -1,4 +1,10 @@
-"""Context builder for assembling agent prompts."""
+"""Context builder for assembling agent prompts.
+
+Per-client isolation invariant:
+    Each ``ContextBuilder`` is scoped (via its ``MemoryStore``) to
+    exactly one client.  Only that client's memory and the optional
+    global knowledge file are injected into the LLM prompt.
+"""
 
 import base64
 import mimetypes
@@ -10,6 +16,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.session.client_key import ClientKey
 from nanobot.utils.helpers import detect_image_mime
 
 
@@ -26,10 +33,23 @@ class ContextBuilder:
     }
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        client_key: ClientKey | None = None,
+        known_names: set[str] | None = None,
+    ):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.client_key = client_key
+        # Per-client memory when a ClientKey is provided; legacy global fallback otherwise.
+        if client_key is not None:
+            self.memory = MemoryStore(workspace, client_key)
+        else:
+            self.memory: MemoryStore | None = None  # type: ignore[assignment]
         self.skills = SkillsLoader(workspace)
+        # Names to redact from memory content before injection into the prompt.
+        self._known_names: set[str] = {n for n in (known_names or set()) if n and len(n) >= 2}
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
@@ -39,8 +59,13 @@ class ContextBuilder:
         if bootstrap_sections:
             parts.extend(bootstrap_sections)
 
-        memory = self.memory.get_memory_context()
+        memory = self.memory.get_memory_context() if self.memory else ""
         if memory:
+            # Per-client memory is already scoped — redaction of known names
+            # is kept as defence-in-depth for the global knowledge block.
+            for name in sorted(self._known_names, key=len, reverse=True):
+                if name in memory:
+                    memory = memory.replace(name, "[REDACTED_NAME]")
             parts.append(f"# Memory\n\n{memory}")
 
         requested_skills = [name for name in dict.fromkeys(skill_names or []) if name]
@@ -68,7 +93,6 @@ Skills with available="false" need dependencies installed first - you can try in
 
     def _get_identity(self) -> str:
         """Get the core identity section."""
-        workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
@@ -80,10 +104,10 @@ You are nanobot, the workspace's messaging assistant.
 {runtime}
 
 ## Workspace
-Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+Your workspace is "." (current directory). All tool paths are relative to it.
+- Long-term memory: memory/MEMORY.md (write important facts here)
+- History log: memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Custom skills: skills/{{skill-name}}/SKILL.md
 
 ## Hard Rules
 - State intent before tool calls, but NEVER predict or claim results before receiving them.
@@ -112,8 +136,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         tz = time.strftime("%Z") or "UTC"
         lines = [f"Current Time: {now} ({tz})"]
         meta = metadata or {}
-        if channel and chat_id:
-            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        if channel:
+            lines.append(f"Channel: {channel}")
+            # Omit raw Chat ID from the prompt — the message tool receives it
+            # programmatically via set_context(), so the LLM never needs it.
 
         is_group = bool(meta.get("is_group"))
         conversation_mode = ""
@@ -131,8 +157,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             lines.append(f"Group Name: {group_name}")
         if sender_name := cls._sanitize_runtime_value(meta.get("sender_name") or meta.get("push_name")):
             lines.append(f"Sender Name: {sender_name}")
-        if sender_phone := cls._sanitize_runtime_value(meta.get("sender_phone") or meta.get("pn")):
-            lines.append(f"Sender Phone: {sender_phone}")
+        # Only include Sender Phone in group chats where it disambiguates participants.
+        # In DM contexts it duplicates the chat identity and leaks the number gratuitously.
+        if is_group:
+            if sender_phone := cls._sanitize_runtime_value(meta.get("sender_phone") or meta.get("pn")):
+                lines.append(f"Sender Phone: {sender_phone}")
         if flow_mode := cls._sanitize_runtime_value(meta.get("insurance_flow_mode")):
             lines.append(f"Insurance Flow Mode: {flow_mode}")
         if "insurance_generic_reply_count" in meta:

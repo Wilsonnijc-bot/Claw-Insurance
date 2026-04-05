@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import HistoryImportResult, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.whatsapp import WhatsAppChannel
 from nanobot.channels.whatsapp_contacts import WhatsAppContact, save_contacts
@@ -14,6 +14,7 @@ from nanobot.channels.whatsapp_reply_targets import (
     observe_direct_identification,
     observe_group_identification,
     rewrite_from_self_instruction,
+    save_reply_targets,
 )
 from nanobot.config.schema import Config, WhatsAppConfig
 
@@ -51,7 +52,6 @@ def test_whatsapp_config_accepts_draft_fields() -> None:
                     "contactsFile": "~/contacts.json",
                     "groupMembersFile": "~/groups.csv",
                     "replyTargetsFile": "~/data/reply_targets.json",
-                    "storageDir": "~/whatsapp-storage",
                     "allowFrom": ["+1234567890"],
                 }
             }
@@ -65,7 +65,6 @@ def test_whatsapp_config_accepts_draft_fields() -> None:
     assert config.channels.whatsapp.contacts_file == "~/contacts.json"
     assert config.channels.whatsapp.group_members_file == "~/groups.csv"
     assert config.channels.whatsapp.reply_targets_file == "~/data/reply_targets.json"
-    assert config.channels.whatsapp.storage_dir == "~/whatsapp-storage"
 
 
 def test_whatsapp_config_defaults_to_draft() -> None:
@@ -259,6 +258,46 @@ async def test_whatsapp_draft_mode_uses_contact_label_as_search_fallback(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_whatsapp_draft_mode_ignores_reply_target_label_in_cdp_search_terms(tmp_path: Path) -> None:
+    targets_file = tmp_path / "reply_targets.json"
+    rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
+    observe_direct_identification(
+        targets_file,
+        phone="+1234567890",
+        chat_id="123@s.whatsapp.net",
+        sender_id="123@s.whatsapp.net",
+        push_name="Alice Chan",
+    )
+    payload = load_reply_targets(targets_file)
+    payload["direct_reply_targets"][0]["label"] = "Billy"
+    save_reply_targets(targets_file, payload)
+    channel = _make_channel(
+        WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            allow_from=["+1234567890"],
+            contacts_file="",
+            group_members_file="",
+            reply_targets_file=str(targets_file),
+        )
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+    channel._connected = True
+
+    await channel.send(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id="123@s.whatsapp.net",
+            content="draft me",
+            metadata={"sender": "123@s.whatsapp.net", "sender_phone": "+1234567890"},
+        )
+    )
+
+    assert json.loads(ws.sent[0])["target"]["searchTerms"] == ["1234567890", "123", "Alice Chan"]
+
+
+@pytest.mark.asyncio
 async def test_whatsapp_sync_direct_history_requests_web_scrape_for_all_enabled_targets(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     contacts_file = tmp_path / "contacts.json"
@@ -303,11 +342,123 @@ async def test_whatsapp_sync_direct_history_requests_web_scrape_for_all_enabled_
                 {
                     "chatId": "123@s.whatsapp.net",
                     "phone": "1234567890",
-                    "searchTerms": ["Alice Chan", "1234567890", "123", "Alice Wong"],
+                    "searchTerms": ["1234567890", "123", "Alice Chan", "Alice Wong"],
                 },
             ],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_sync_direct_history_ignores_reply_target_label_in_search_terms(tmp_path: Path) -> None:
+    targets_file = tmp_path / "reply_targets.json"
+    rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
+    observe_direct_identification(
+        targets_file,
+        phone="+1234567890",
+        chat_id="123@s.whatsapp.net",
+        sender_id="123@s.whatsapp.net",
+        push_name="Alice Chan",
+    )
+    payload = load_reply_targets(targets_file)
+    payload["direct_reply_targets"][0]["label"] = "Billy"
+    save_reply_targets(targets_file, payload)
+    channel = _make_channel(
+        WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            allow_from=["+1234567890"],
+            contacts_file="",
+            group_members_file="",
+            reply_targets_file=str(targets_file),
+        )
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+    channel._connected = True
+    channel._replay_cached_history = AsyncMock()
+
+    await channel.send(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id="",
+            content="",
+            metadata={"_internal_command": "sync_direct_history"},
+        )
+    )
+
+    assert [json.loads(item) for item in ws.sent] == [
+        {
+            "type": "scrape_direct_history",
+            "targets": [
+                {
+                    "chatId": "123@s.whatsapp.net",
+                    "phone": "1234567890",
+                    "searchTerms": ["1234567890", "123", "Alice Chan"],
+                },
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_sync_direct_history_waits_for_import_confirmation(tmp_path: Path) -> None:
+    targets_file = tmp_path / "reply_targets.json"
+    rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
+    observe_direct_identification(
+        targets_file,
+        phone="+1234567890",
+        chat_id="123@s.whatsapp.net",
+        sender_id="123@s.whatsapp.net",
+        push_name="Alice Chan",
+    )
+    channel = _make_channel(
+        WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            allow_from=["+1234567890"],
+            contacts_file="",
+            group_members_file="",
+            reply_targets_file=str(targets_file),
+        )
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+    channel._connected = True
+    channel._replay_cached_history = AsyncMock()
+
+    task = asyncio.create_task(channel.sync_direct_history(["1234567890"], timeout_s=1.0))
+    await asyncio.sleep(0)
+
+    sent = json.loads(ws.sent[0])
+    request_id = sent["requestId"]
+    await channel._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "ack",
+                "action": "scrape_direct_history",
+                "requestId": request_id,
+                "status": "history_scraped",
+                "scrapedTargets": 1,
+                "scrapedMessages": 2,
+                "missedTargets": 0,
+            }
+        )
+    )
+    await channel.bus.publish_history_result(
+        HistoryImportResult(
+            channel="whatsapp",
+            matched_entries=2,
+            imported_entries=1,
+            phones=["1234567890"],
+            metadata={"request_id": request_id},
+        )
+    )
+
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result["status"] == "history_scraped"
+    assert result["matched_entries"] == 2
+    assert result["imported_entries"] == 1
 
 
 @pytest.mark.asyncio
@@ -363,7 +514,7 @@ async def test_whatsapp_sync_direct_history_scopes_web_scrape_to_requested_phone
                 {
                     "chatId": "123@s.whatsapp.net",
                     "phone": "1234567890",
-                    "searchTerms": ["Alice Chan", "1234567890", "123"],
+                    "searchTerms": ["1234567890", "123", "Alice Chan"],
                 },
             ],
         }

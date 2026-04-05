@@ -1,4 +1,10 @@
-"""Session management for conversation history."""
+"""Session management for conversation history.
+
+Per-client isolation invariant:
+    client-scoped operations must never access another client's
+    conversation data.  Use ``get_for_client(ClientKey)`` for
+    WhatsApp sessions.
+"""
 
 import json
 import shutil
@@ -10,8 +16,8 @@ from typing import Any
 from loguru import logger
 
 from nanobot.channels.whatsapp_contacts import normalize_contact_id
-from nanobot.channels.whatsapp_storage import write_visible_history_jsonl
-from nanobot.utils.helpers import ensure_dir, safe_filename
+from nanobot.session.client_key import ClientKey
+from nanobot.utils.helpers import ensure_dir, readable_session_bundle_name, safe_filename
 
 
 def is_whatsapp_session_key(key: str) -> bool:
@@ -41,35 +47,6 @@ def model_role_for_session(key: str, role: str) -> str:
     if text == "me":
         return "assistant"
     return text
-
-
-def legacy_chat_history_bundle_name(key: str) -> str:
-    """Return the legacy chat-history bundle name derived directly from the session key."""
-    return safe_filename(str(key or "").replace(":", "__"))
-
-
-def canonical_chat_history_bundle_name(key: str) -> str:
-    """Return the human-readable chat-history bundle name for a session key."""
-    legacy_name = legacy_chat_history_bundle_name(key)
-    if not is_whatsapp_session_key(key):
-        return legacy_name
-
-    parts = str(key or "").split(":")
-    if len(parts) != 2:
-        return legacy_name
-
-    identity = str(parts[1] or "").strip()
-    if not identity:
-        return legacy_name
-
-    # Canonicalize only when the direct-session key is clearly phone-derived.
-    if "@" in identity and not (identity.endswith("@s.whatsapp.net") or identity.endswith("@c.us")):
-        return legacy_name
-
-    phone = normalize_contact_id(identity)
-    if not phone:
-        return legacy_name
-    return safe_filename(f"whatsapp__{phone}")
 
 
 @dataclass
@@ -196,21 +173,287 @@ class SessionManager:
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
-        self.legacy_sessions_dir = Path.home() / ".nanobot" / "sessions"
-        self.project_root = Path(__file__).resolve().parents[2]
-        self.chat_histories_dir = ensure_dir(self.project_root / "Chathistories")
+        self.legacy_readable_sessions_root = self.sessions_dir / "readable"
+        self.legacy_sessions_dir = self.workspace / ".nanobot-legacy" / "sessions"
+        from nanobot.utils.paths import project_root
+        self.project_root = project_root()
+        self.reply_targets_file = self.project_root / "data" / "whatsapp_reply_targets.json"
         self._cache: dict[str, Session] = {}
-        self._backfill_chat_history_bundles()
+        self._migrate_existing_session_layout()
+        self._backfill_session_metadata_hints()
 
-    def _get_session_path(self, key: str) -> Path:
-        """Get the file path for a session."""
+    def _legacy_flat_session_path(self, key: str) -> Path:
+        """Return the pre-bundle flat JSONL path for a session."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.jsonl"
 
+    def _get_session_bundle_dir(self, key: str) -> Path:
+        """Return the canonical per-chat bundle directory."""
+        return ensure_dir(self.sessions_dir / readable_session_bundle_name(key))
+
+    def _get_session_path(self, key: str) -> Path:
+        """Get the canonical JSONL file path for a session."""
+        return self._get_session_bundle_dir(key) / "session.jsonl"
+
+    def _get_session_meta_path(self, key: str) -> Path:
+        """Get the metadata JSON path for a session bundle."""
+        return self._get_session_bundle_dir(key) / "meta.json"
+
     def _get_legacy_session_path(self, key: str) -> Path:
-        """Legacy global session path (~/.nanobot/sessions/)."""
+        """Legacy migrated session path inside the project."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.legacy_sessions_dir / f"{safe_key}.jsonl"
+
+    def get_session_path(self, key: str) -> Path:
+        """Public accessor for the canonical append-only session JSONL file."""
+        return self._get_session_path(key)
+
+    def get_session_meta_path(self, key: str) -> Path:
+        """Public accessor for the canonical bundle metadata JSON file."""
+        return self._get_session_meta_path(key)
+
+    def get_readable_session_dir(self, key: str) -> Path:
+        """Readable session bundle directory under workspace/sessions/."""
+        return self._get_session_bundle_dir(key)
+
+    def _iter_bundle_dirs(self) -> list[Path]:
+        """Return all canonical bundle directories under sessions/."""
+        bundles: list[Path] = []
+        for path in self.sessions_dir.iterdir():
+            if not path.is_dir():
+                continue
+            if path.name == "readable":
+                continue
+            bundles.append(path)
+        return bundles
+
+    @staticmethod
+    def _read_session_key_from_jsonl(path: Path) -> str:
+        """Read the session key from a JSONL file's metadata line when present."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                first_line = f.readline().strip()
+            if first_line:
+                data = json.loads(first_line)
+                key = str(data.get("key") or "").strip()
+                if key:
+                    return key
+        except Exception:
+            logger.exception("Failed to inspect session metadata from {}", path)
+        return path.stem.replace("_", ":", 1)
+
+    def _move_flat_session_file_into_bundle(self, source_path: Path) -> None:
+        """Move an old flat session JSONL into the canonical bundle layout."""
+        if not source_path.exists() or not source_path.is_file():
+            return
+
+        key = self._read_session_key_from_jsonl(source_path)
+        if not key:
+            return
+
+        target_path = self._get_session_path(key)
+        if source_path == target_path:
+            return
+
+        ensure_dir(target_path.parent)
+        if target_path.exists():
+            try:
+                source_path.unlink()
+            except OSError:
+                pass
+            return
+
+        shutil.move(str(source_path), str(target_path))
+
+    def _cleanup_legacy_readable_bundle(self, key: str) -> None:
+        """Remove deprecated sessions/readable artifacts for one session."""
+        legacy_dir = self.legacy_readable_sessions_root / readable_session_bundle_name(key)
+        if not legacy_dir.exists():
+            return
+
+        for child in list(legacy_dir.iterdir()):
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+                continue
+            try:
+                child.unlink()
+            except OSError:
+                pass
+
+        try:
+            legacy_dir.rmdir()
+        except OSError:
+            pass
+
+    def _remove_legacy_readable_root_if_empty(self) -> None:
+        """Delete sessions/readable once all legacy bundles are gone."""
+        if not self.legacy_readable_sessions_root.exists():
+            return
+        try:
+            next(self.legacy_readable_sessions_root.iterdir())
+        except StopIteration:
+            try:
+                self.legacy_readable_sessions_root.rmdir()
+            except OSError:
+                pass
+
+    def _prune_noncanonical_bundle_dirs(self) -> None:
+        """Delete stale bundle directories that have no canonical session.jsonl."""
+        for bundle_dir in self._iter_bundle_dirs():
+            if (bundle_dir / "session.jsonl").exists():
+                continue
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+
+    def _migrate_existing_session_layout(self) -> None:
+        """Upgrade old flat/readable session layouts into per-chat bundles."""
+        for legacy_file in list(self.sessions_dir.glob("*.jsonl")):
+            self._move_flat_session_file_into_bundle(legacy_file)
+
+        if self.legacy_sessions_dir.exists():
+            for legacy_file in list(self.legacy_sessions_dir.glob("*.jsonl")):
+                self._move_flat_session_file_into_bundle(legacy_file)
+
+        if self.legacy_readable_sessions_root.exists():
+            for legacy_dir in list(self.legacy_readable_sessions_root.iterdir()):
+                if not legacy_dir.is_dir():
+                    continue
+                target_dir = ensure_dir(self.sessions_dir / legacy_dir.name)
+                legacy_meta = legacy_dir / "meta.json"
+                target_meta = target_dir / "meta.json"
+                if legacy_meta.exists() and not target_meta.exists():
+                    try:
+                        shutil.move(str(legacy_meta), str(target_meta))
+                    except Exception:
+                        logger.exception("Failed to migrate legacy bundle metadata from {}", legacy_meta)
+                for child in list(legacy_dir.iterdir()):
+                    if child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                        continue
+                    try:
+                        child.unlink()
+                    except OSError:
+                        pass
+                try:
+                    legacy_dir.rmdir()
+                except OSError:
+                    pass
+
+        self._remove_legacy_readable_root_if_empty()
+        self._prune_noncanonical_bundle_dirs()
+
+    def _migrate_legacy_session_for_key(self, key: str) -> None:
+        """Migrate any leftover legacy artifacts for a specific session key."""
+        self._move_flat_session_file_into_bundle(self._legacy_flat_session_path(key))
+        self._move_flat_session_file_into_bundle(self._get_legacy_session_path(key))
+        self._cleanup_legacy_readable_bundle(key)
+        self._remove_legacy_readable_root_if_empty()
+        self._prune_noncanonical_bundle_dirs()
+
+    @staticmethod
+    def _first_nonempty(*values: Any) -> str:
+        """Return the first non-empty string value."""
+        for value in values:
+            text = " ".join(str(value or "").split()).strip()
+            if text:
+                return text
+        return ""
+
+    def _reply_target_name_hints(self, normalized_phone: str) -> dict[str, str]:
+        """Look up label/push_name hints from the reply-target registry."""
+        if not normalized_phone or not self.reply_targets_file.exists():
+            return {}
+        try:
+            payload = json.loads(self.reply_targets_file.read_text(encoding="utf-8"))
+            for row in payload.get("direct_reply_targets", []) or []:
+                if normalize_contact_id(str(row.get("phone") or "")) != normalized_phone:
+                    continue
+                return {
+                    "client_label": str(row.get("label") or "").strip(),
+                    "client_push_name": str(row.get("push_name") or "").strip(),
+                    "client_chat_id": str(row.get("chat_id") or "").strip(),
+                    "client_sender_id": str(row.get("sender_id") or "").strip(),
+                }
+        except Exception:
+            logger.exception("Failed to read reply target hints from {}", self.reply_targets_file)
+        return {}
+
+    def _refresh_session_metadata_hints(self, session: Session) -> None:
+        """Store directly useful client identity hints inside the session metadata."""
+        if not isinstance(session.metadata, dict):
+            session.metadata = {}
+        meta = session.metadata
+
+        if not is_whatsapp_session_key(session.key):
+            return
+
+        identity = str(session.key.split(":", 1)[1] if ":" in session.key else "").strip()
+        normalized_phone = normalize_contact_id(identity)
+        target_hints = self._reply_target_name_hints(normalized_phone)
+        if identity:
+            meta["client_identity"] = identity
+        if normalized_phone:
+            meta["client_phone"] = normalized_phone
+
+        latest_client = next(
+            (msg for msg in reversed(session.messages) if str(msg.get("role") or "") == "client"),
+            None,
+        )
+        latest_any = next((msg for msg in reversed(session.messages) if isinstance(msg, dict)), None)
+
+        client_label = self._first_nonempty(
+            meta.get("client_label"),
+            target_hints.get("client_label"),
+            latest_client.get("reply_target_label") if latest_client else "",
+            latest_any.get("reply_target_label") if latest_any else "",
+        )
+        client_push_name = self._first_nonempty(
+            meta.get("client_push_name"),
+            target_hints.get("client_push_name"),
+            latest_client.get("push_name") if latest_client else "",
+            latest_client.get("sender_name") if latest_client else "",
+            latest_client.get("reply_target_push_name") if latest_client else "",
+            # Do NOT fall back to latest_any push_name / sender_name here.
+            # latest_any may be a fromMe message whose push_name is the
+            # *operator's* WhatsApp display name, not the client's.
+            latest_any.get("reply_target_push_name") if latest_any else "",
+        )
+        client_chat_id = self._first_nonempty(
+            meta.get("client_chat_id"),
+            target_hints.get("client_chat_id"),
+            latest_client.get("chat_id") if latest_client else "",
+            latest_any.get("chat_id") if latest_any else "",
+        )
+        client_sender_id = self._first_nonempty(
+            meta.get("client_sender_id"),
+            target_hints.get("client_sender_id"),
+            latest_client.get("sender_id") if latest_client else "",
+            latest_any.get("sender_id") if latest_any else "",
+        )
+        client_display_name = self._first_nonempty(
+            meta.get("client_display_name"),
+            client_label,
+            client_push_name,
+            normalized_phone,
+            identity,
+        )
+        client_name = self._first_nonempty(
+            meta.get("client_name"),
+            client_label,
+            client_push_name,
+        )
+
+        if client_label:
+            meta["client_label"] = client_label
+        if client_push_name:
+            meta["client_push_name"] = client_push_name
+        if client_name:
+            meta["client_name"] = client_name
+        if client_chat_id:
+            meta["client_chat_id"] = client_chat_id
+        if client_sender_id:
+            meta["client_sender_id"] = client_sender_id
+        if client_display_name:
+            meta["client_display_name"] = client_display_name
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -232,17 +475,19 @@ class SessionManager:
         self._cache[key] = session
         return session
 
+    def get_for_client(self, client_key: ClientKey) -> Session:
+        """Return the session for a specific WhatsApp client.
+
+        Derives the session key from the :class:`ClientKey` so that
+        callers never need to construct raw session key strings themselves.
+        """
+        return self.get_or_create(client_key.session_key)
+
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
         if not path.exists():
-            legacy_path = self._get_legacy_session_path(key)
-            if legacy_path.exists():
-                try:
-                    shutil.move(str(legacy_path), str(path))
-                    logger.info("Migrated session {} from legacy path", key)
-                except Exception:
-                    logger.exception("Failed to migrate session {}", key)
+            self._migrate_legacy_session_for_key(key)
 
         if not path.exists():
             return None
@@ -284,6 +529,7 @@ class SessionManager:
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
+        self._refresh_session_metadata_hints(session)
 
         with open(path, "w", encoding="utf-8") as f:
             metadata_line = {
@@ -298,13 +544,24 @@ class SessionManager:
             for msg in session.messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
-        self._write_chat_history_bundle(session)
+        self._write_readable_session_bundle(session)
         self._cache[session.key] = session
 
-    def _write_chat_history_bundle(self, session: Session) -> None:
-        """Write a human-readable session bundle under project ./Chathistories."""
-        bundle_name = canonical_chat_history_bundle_name(session.key)
-        bundle_dir = ensure_dir(self.chat_histories_dir / bundle_name)
+    def _write_readable_session_bundle(self, session: Session) -> None:
+        """Write the canonical session bundle metadata without duplicating history."""
+        bundle_dir = ensure_dir(self.get_readable_session_dir(session.key))
+        session_file = self._get_session_path(session.key)
+        meta_file = self._get_session_meta_path(session.key)
+
+        for duplicate_name in ("history.jsonl", "session.jsonl", "history.path.txt"):
+            duplicate_path = bundle_dir / duplicate_name
+            if duplicate_name == "session.jsonl":
+                continue
+            if duplicate_path.exists() or duplicate_path.is_symlink():
+                try:
+                    duplicate_path.unlink()
+                except OSError:
+                    pass
 
         meta_payload = {
             "key": session.key,
@@ -313,30 +570,36 @@ class SessionManager:
             "last_consolidated": session.last_consolidated,
             "message_count": len(session.messages),
             "metadata": session.metadata,
-            "source_session_file": str(self._get_session_path(session.key)),
+            "client_name": str(session.metadata.get("client_name") or ""),
+            "display_name": str(session.metadata.get("client_display_name") or ""),
+            "client_label": str(session.metadata.get("client_label") or ""),
+            "client_push_name": str(session.metadata.get("client_push_name") or ""),
+            "client_phone": str(session.metadata.get("client_phone") or ""),
+            "client_chat_id": str(session.metadata.get("client_chat_id") or ""),
+            "client_sender_id": str(session.metadata.get("client_sender_id") or ""),
+            "client": {
+                "name": str(session.metadata.get("client_name") or ""),
+                "display_name": str(session.metadata.get("client_display_name") or ""),
+                "label": str(session.metadata.get("client_label") or ""),
+                "push_name": str(session.metadata.get("client_push_name") or ""),
+                "phone": str(session.metadata.get("client_phone") or ""),
+                "chat_id": str(session.metadata.get("client_chat_id") or ""),
+                "sender_id": str(session.metadata.get("client_sender_id") or ""),
+            },
+            "canonical_session_file": str(session_file),
+            "history_file": str(session_file),
+            "session_file": str(session_file),
         }
-        (bundle_dir / "meta.json").write_text(
-            json.dumps(meta_payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        meta_file.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._cleanup_legacy_readable_bundle(session.key)
+        self._remove_legacy_readable_root_if_empty()
 
-        history_file = bundle_dir / "history.jsonl"
-        write_visible_history_jsonl(history_file, session.key, session.messages)
-        self._remove_legacy_chat_history_bundle(session.key, canonical_dir=bundle_dir)
-
-    def _remove_legacy_chat_history_bundle(self, key: str, *, canonical_dir: Path) -> None:
-        """Drop a legacy bundle directory after the canonical export is written."""
-        legacy_dir = self.chat_histories_dir / legacy_chat_history_bundle_name(key)
-        if legacy_dir == canonical_dir or not legacy_dir.exists():
-            return
-        try:
-            shutil.rmtree(legacy_dir)
-        except Exception:
-            logger.exception("Failed to remove legacy chat history bundle for {}", key)
-
-    def _backfill_chat_history_bundles(self) -> None:
-        """Populate Chathistories for existing session files if missing."""
-        for session_file in self.sessions_dir.glob("*.jsonl"):
+    def _backfill_session_metadata_hints(self) -> None:
+        """Upgrade existing session metadata with readable client identity hints."""
+        for bundle_dir in self._iter_bundle_dirs():
+            session_file = bundle_dir / "session.jsonl"
+            if not session_file.exists():
+                continue
             try:
                 with open(session_file, encoding="utf-8") as f:
                     first = f.readline().strip()
@@ -348,19 +611,19 @@ class SessionManager:
                     key = str(first_data.get("key", "")).strip()
                     if not key:
                         continue
-                    bundle_name = canonical_chat_history_bundle_name(key)
-                    bundle_dir = self.chat_histories_dir / bundle_name
-                    meta_path = bundle_dir / "meta.json"
-                    history_path = bundle_dir / "history.jsonl"
-                    if meta_path.exists() and history_path.exists():
-                        self._remove_legacy_chat_history_bundle(key, canonical_dir=bundle_dir)
-                        continue
 
                 session = self._load(key)
-                if session is not None:
-                    self._write_chat_history_bundle(session)
+                if session is None:
+                    continue
+                before = json.dumps(session.metadata, ensure_ascii=False, sort_keys=True)
+                self._refresh_session_metadata_hints(session)
+                after = json.dumps(session.metadata, ensure_ascii=False, sort_keys=True)
+                if before != after:
+                    self.save(session)
+                else:
+                    self._write_readable_session_bundle(session)
             except Exception:
-                logger.exception("Failed to backfill chat history bundle from {}", session_file)
+                logger.exception("Failed to backfill session metadata hints from {}", session_file)
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
@@ -375,7 +638,10 @@ class SessionManager:
         """
         sessions = []
 
-        for path in self.sessions_dir.glob("*.jsonl"):
+        for bundle_dir in self._iter_bundle_dirs():
+            path = bundle_dir / "session.jsonl"
+            if not path.exists():
+                continue
             try:
                 # Read just the metadata line
                 with open(path, encoding="utf-8") as f:

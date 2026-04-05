@@ -34,6 +34,17 @@ class InboundHistoryBatch:
 
 
 @dataclass
+class HistoryImportResult:
+    """Result emitted after a history batch has been processed and merged."""
+
+    channel: str
+    matched_entries: int = 0
+    imported_entries: int = 0
+    phones: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class OutboundMessage:
     """Message to send to a chat channel."""
 
@@ -43,4 +54,3 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-

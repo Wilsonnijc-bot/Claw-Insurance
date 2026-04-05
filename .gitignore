@@ -23,3 +23,24 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 botpy.log
+
+# Runtime/project-local generated data
+sessions/
+memory/
+whatsapp-storage/
+whatsapp-auth/
+whatsapp-web/
+whatsapp-web-debug/
+media/
+state/
+cron/
+config.json
+.cli-history
+.bridge-build/
+.nanobot-bin/
+.nanobot-legacy/
+AGENTS.md
+HEARTBEAT.md
+SOUL.md
+TOOLS.md
+USER.md

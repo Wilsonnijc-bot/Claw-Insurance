@@ -3,6 +3,7 @@
 import asyncio
 import os
 import select
+import shlex
 import signal
 import socket
 import sys
@@ -102,7 +103,7 @@ def _init_prompt_session() -> None:
     except Exception:
         pass
 
-    history_file = Path.home() / ".nanobot" / "history" / "cli_history"
+    history_file = Path(__file__).resolve().parents[2] / ".cli-history"
     history_file.parent.mkdir(parents=True, exist_ok=True)
 
     _PROMPT_SESSION = PromptSession(
@@ -159,6 +160,12 @@ def whatsapp_web_nanobot_gateway_entry() -> None:
     app()
 
 
+def whatsapp_web_nanobot_ui_entry() -> None:
+    """Console-script alias for `nanobot ui`."""
+    sys.argv = ["whatsapp-web-nanobot-ui", "ui", *sys.argv[1:]]
+    app()
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(
@@ -167,6 +174,272 @@ def main(
 ):
     """nanobot - Personal AI Assistant."""
     pass
+
+
+def _frontend_path_candidates() -> list[Path]:
+    """Return project-local locations of the React frontend."""
+    project_root = Path(__file__).resolve().parents[2]
+    candidates: list[Path] = []
+
+    for env_name in ("NANOBOT_UI_PATH", "NANOBOT_FRONTEND_PATH"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            candidates.append(Path(value).expanduser())
+
+    candidates.extend([
+        project_root / "Insurance frontend",
+    ])
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(resolved)
+    return deduped
+
+
+def _looks_like_frontend_dir(path: Path) -> bool:
+    """Return True when the path looks like the Vite frontend project."""
+    return (
+        path.exists()
+        and path.is_dir()
+        and (path / "package.json").exists()
+        and (path / "vite.config.ts").exists()
+        and (path / "src").exists()
+    )
+
+
+def _resolve_frontend_dir(frontend_path: str = "") -> Path:
+    """Resolve the React frontend directory for `nanobot ui`."""
+    if frontend_path.strip():
+        candidate = Path(frontend_path).expanduser()
+        if _looks_like_frontend_dir(candidate):
+            return candidate
+        console.print(f"[red]Frontend path is not a valid Vite app: {candidate}[/red]")
+        raise typer.Exit(1)
+
+    for candidate in _frontend_path_candidates():
+        if _looks_like_frontend_dir(candidate):
+            return candidate
+
+    console.print(
+        "[red]Could not find the frontend project. Set NANOBOT_UI_PATH or pass --path to `nanobot ui`.[/red]"
+    )
+    raise typer.Exit(1)
+
+
+def _preferred_global_bin_dir() -> Path:
+    """Choose a stable bin dir for wrapper commands on the current machine."""
+    override = os.environ.get("NANOBOT_BIN_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+
+    home = Path.home()
+    candidates = [
+        home / ".local" / "bin",
+        home / "bin",
+        Path("/usr/local/bin"),
+        Path("/opt/homebrew/bin"),
+    ]
+    for candidate in candidates:
+        parent = candidate if candidate.exists() else candidate.parent
+        try:
+            if parent.exists() and os.access(parent, os.W_OK):
+                return candidate
+        except Exception:
+            continue
+    return home / ".local" / "bin"
+
+
+def _shell_rc_candidates() -> list[Path]:
+    home = Path.home()
+    shell = Path(os.environ.get("SHELL", "")).name
+    if shell == "bash":
+        return [home / ".bashrc", home / ".bash_profile"]
+    if shell == "zsh":
+        return [home / ".zshrc"]
+    return [home / ".zshrc", home / ".bashrc", home / ".profile"]
+
+
+def _ensure_dir_in_shell_path(bin_dir: Path) -> Path | None:
+    """Add the install dir to the user's shell startup file when needed."""
+    resolved = bin_dir.expanduser().resolve()
+    path_entries = [Path(p).expanduser().resolve() for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if resolved in path_entries:
+        return None
+
+    export_line = f'export PATH="{resolved}:$PATH"'
+    for rc_path in _shell_rc_candidates():
+        try:
+            existing = rc_path.read_text(encoding="utf-8") if rc_path.exists() else ""
+            if export_line in existing:
+                return rc_path
+            rc_path.parent.mkdir(parents=True, exist_ok=True)
+            prefix = "\n" if existing and not existing.endswith("\n") else ""
+            rc_path.write_text(existing + prefix + export_line + "\n", encoding="utf-8")
+            return rc_path
+        except Exception:
+            continue
+    return None
+
+
+def _write_wrapper_script(target: Path, *, command_name: str, subcommand: str) -> None:
+    """Write a stable wrapper command bound to this project checkout."""
+    project_root = Path(__file__).resolve().parents[2]
+    venv_python = project_root / ".venv" / "bin" / "python"
+    config_path = project_root / "config.json"
+    script = f"""#!/bin/sh
+set -eu
+PROJECT_ROOT={shlex.quote(str(project_root))}
+CONFIG_PATH={shlex.quote(str(config_path))}
+VENV_PYTHON={shlex.quote(str(venv_python))}
+if [ -x \"$VENV_PYTHON\" ]; then
+  PYTHON_BIN=\"$VENV_PYTHON\"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN=\"$(command -v python3)\"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN=\"$(command -v python)\"
+else
+  echo \"Python is required for {command_name}\" >&2
+  exit 1
+fi
+export NANOBOT_CONFIG_PATH=\"$CONFIG_PATH\"
+if [ -n \"${{PYTHONPATH:-}}\" ]; then
+  export PYTHONPATH=\"$PROJECT_ROOT:$PYTHONPATH\"
+else
+  export PYTHONPATH=\"$PROJECT_ROOT\"
+fi
+cd \"$PROJECT_ROOT\"
+exec \"$PYTHON_BIN\" -m nanobot {subcommand} \"$@\"
+"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(script, encoding="utf-8")
+    target.chmod(0o755)
+
+
+def _api_launcher_running(api_port: int) -> bool:
+    """Return True when a Nanobot API/launcher server is reachable on the port."""
+    import json
+    import urllib.request
+
+    url = f"http://127.0.0.1:{api_port}/api/status"
+    try:
+        with urllib.request.urlopen(url, timeout=0.6) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8", errors="ignore") or "{}")
+            return isinstance(payload, dict) and (
+                "status" in payload or "gateway_ready" in payload or "gateway_starting" in payload
+            )
+    except Exception:
+        return False
+
+
+def _ensure_api_launcher_running(api_port: int, config_path: str | None = None) -> None:
+    """Start the lightweight launcher when the frontend API endpoint is not up yet."""
+    import subprocess
+
+    if _api_launcher_running(api_port):
+        return
+
+    project_root = Path(__file__).resolve().parents[2]
+    command = [sys.executable, "-m", "nanobot", "launcher", "--api-port", str(api_port)]
+    if config_path:
+        command.extend(["--config", config_path])
+
+    subprocess.Popen(
+        command,
+        cwd=project_root,
+        env={**os.environ},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if _api_launcher_running(api_port):
+            return
+        time.sleep(0.2)
+
+    console.print(
+        f"[red]Could not reach the Nanobot launcher on port {api_port}. "
+        "Start `nanobot launcher` or `nanobot gateway` manually.[/red]"
+    )
+    raise typer.Exit(1)
+
+
+@app.command()
+def ui(
+    path: str = typer.Option(
+        "",
+        "--path",
+        help="Path to the React/Vite frontend project. Defaults to NANOBOT_UI_PATH or nearby 'Insurance frontend'.",
+    ),
+    api_port: int = typer.Option(3456, "--api-port", help="Launcher/API port used by the frontend proxy."),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path for the launcher."),
+):
+    """Start the React UI and ensure the lightweight API launcher is available first."""
+    import subprocess
+
+    frontend_dir = _resolve_frontend_dir(path)
+    _ensure_api_launcher_running(api_port, config)
+    console.print(f"{__logo__} Starting UI from [cyan]{frontend_dir}[/cyan]")
+    console.print(
+        "UI is using the launcher on "
+        f"[cyan]localhost:{api_port}[/cyan]. Login in the frontend will call /api/login "
+        "and boot the global gateway on demand.\n"
+    )
+
+    try:
+        subprocess.run(["npm", "run", "dev"], cwd=frontend_dir, check=True, env={**os.environ})
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Frontend failed: {e}[/red]")
+        raise typer.Exit(e.returncode or 1)
+    except FileNotFoundError:
+        console.print("[red]npm not found. Please install Node.js.[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("install-ui-command")
+def install_ui_command(
+    bin_dir: str = typer.Option(
+        "",
+        "--bin-dir",
+        help="Install directory for the global wrapper commands. Defaults to ~/.local/bin, ~/bin, or a writable system bin.",
+    ),
+    update_shell: bool = typer.Option(
+        True,
+        "--update-shell/--no-update-shell",
+        help="Add the install directory to your shell PATH when needed.",
+    ),
+):
+    """Install stable global wrapper commands for this project checkout."""
+    install_dir = Path(bin_dir).expanduser() if bin_dir.strip() else _preferred_global_bin_dir()
+    install_dir.mkdir(parents=True, exist_ok=True)
+
+    ui_path = install_dir / "whatsapp-web-nanobot-ui"
+    gateway_path = install_dir / "whatsapp-web-nanobot-gateway"
+    _write_wrapper_script(ui_path, command_name="whatsapp-web-nanobot-ui", subcommand="ui")
+    _write_wrapper_script(gateway_path, command_name="whatsapp-web-nanobot-gateway", subcommand="gateway")
+
+    rc_path = _ensure_dir_in_shell_path(install_dir) if update_shell else None
+
+    console.print(f"[green]✓[/green] Installed [cyan]{ui_path}[/cyan]")
+    console.print(f"[green]✓[/green] Installed [cyan]{gateway_path}[/cyan]")
+    if rc_path is not None:
+        console.print(f"[green]✓[/green] Added [cyan]{install_dir}[/cyan] to PATH in [cyan]{rc_path}[/cyan]")
+        console.print("[yellow]Open a new terminal window or run `source` on that shell file before using the commands.[/yellow]")
+    elif update_shell:
+        console.print(f"[green]✓[/green] PATH already includes [cyan]{install_dir}[/cyan] or no update was needed")
+
+    console.print("\nGlobal commands for this project checkout:")
+    console.print("  [cyan]whatsapp-web-nanobot-ui[/cyan]")
+    console.print("  [cyan]whatsapp-web-nanobot-gateway[/cyan]")
 
 
 # ============================================================================
@@ -210,7 +483,7 @@ def onboard():
 
     console.print(f"\n{__logo__} nanobot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
+    console.print("  1. Add your API key to [cyan]config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
@@ -245,7 +518,7 @@ def _make_provider(config: Config):
     if provider_name == "azure_openai":
         if not p or not p.api_key or not p.api_base:
             console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
+            console.print("Set them in config.json under providers.azure_openai section")
             console.print("Use the model field to specify the deployment name.")
             raise typer.Exit(1)
         
@@ -260,7 +533,7 @@ def _make_provider(config: Config):
     spec = find_by_name(provider_name)
     if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers section")
+        console.print("Set one in config.json under providers section")
         raise typer.Exit(1)
 
     return LiteLLMProvider(
@@ -274,6 +547,10 @@ def _make_provider(config: Config):
 
 def _maybe_enable_privacy_gateway(config: Config):
     """Route custom-provider traffic through the local privacy gateway when enabled."""
+    # Privacy pipeline step 2:
+    # - decide whether the privacy gateway should sit in front of the real cloud endpoint
+    # - keep the real upstream URL for the child gateway process
+    # - rewrite the active custom provider to point at the local gateway instead
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     if provider_name != "custom" or not config.privacy_gateway.enabled:
@@ -293,12 +570,14 @@ def _maybe_enable_privacy_gateway(config: Config):
 @app.command()
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    api_port: int = typer.Option(3456, "--api-port", help="API server port for the frontend UI"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
     from nanobot.agent.loop import AgentLoop
+    from nanobot.api.server import ApiServer
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.config.loader import load_config
@@ -457,10 +736,21 @@ def gateway(
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
+    # Create API server for frontend UI
+    api_server = ApiServer(
+        config=config,
+        bus=bus,
+        session_manager=session_manager,
+        agent=agent,
+        channel_manager=channels,
+    )
+    console.print(f"[green]✓[/green] API server will start on port {api_port}")
+
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
+            await api_server.start(port=api_port)
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -468,6 +758,7 @@ def gateway(
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
+            await api_server.stop()
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
@@ -479,6 +770,35 @@ def gateway(
     asyncio.run(run())
 
 
+@app.command()
+def launcher(
+    api_port: int = typer.Option(3456, "--api-port", help="API server port for the frontend UI"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+):
+    """Start the lightweight launcher so the UI can load before the full gateway starts."""
+    from nanobot.api.launcher import LauncherServer
+    from nanobot.config.loader import load_config
+
+    if verbose:
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
+
+    config_path = Path(config) if config else None
+    loaded_config = load_config(config_path)
+
+    async def run() -> None:
+        server = LauncherServer(config=loaded_config, api_port=api_port)
+        try:
+            await server.start()
+            await asyncio.Event().wait()
+        finally:
+            await server.stop()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\nShutting down launcher...")
 
 
 # ============================================================================
@@ -784,7 +1104,8 @@ def _get_bridge_dir() -> Path:
     import subprocess
 
     # User's bridge location
-    user_bridge = Path.home() / ".nanobot" / "bridge"
+    from nanobot.utils.paths import project_root
+    user_bridge = project_root() / ".bridge-build"
 
     # Check for npm
     if not shutil.which("npm"):
@@ -862,6 +1183,8 @@ def _build_whatsapp_bridge_env(config: Config) -> dict[str, str]:
     """Build environment variables for the local WhatsApp bridge."""
     env = {**os.environ}
     wa = config.channels.whatsapp
+    from nanobot.utils.paths import project_root
+    _project_root = project_root()
     if wa.bridge_token:
         env["BRIDGE_TOKEN"] = wa.bridge_token
     if wa.web_browser_mode:
@@ -872,6 +1195,7 @@ def _build_whatsapp_bridge_env(config: Config) -> dict[str, str]:
         env["WEB_CDP_CHROME_PATH"] = wa.web_cdp_chrome_path
     if wa.web_profile_dir:
         env["WEB_PROFILE_DIR"] = wa.web_profile_dir
+    env["AUTH_DIR"] = str(_project_root / "whatsapp-auth")
 
     parsed = urlparse(wa.bridge_url)
     if parsed.port:
@@ -887,6 +1211,8 @@ def _privacy_gateway_url(config: Config) -> str:
 
 def _build_privacy_gateway_env(config: Config, upstream_base: str) -> dict[str, str]:
     """Build environment variables for the local privacy gateway."""
+    # Privacy pipeline step 2a: serialize the privacy config so the child
+    # gateway process can reconstruct the same runtime behavior.
     env = {**os.environ}
     privacy = config.privacy_gateway
     env["NANOBOT_PRIVACY_UPSTREAM_BASE"] = upstream_base
@@ -1004,7 +1330,7 @@ def _build_whatsapp_cdp_launch_command(config: Config) -> list[str]:
     parsed = urlparse(config.channels.whatsapp.web_cdp_url if "://" in config.channels.whatsapp.web_cdp_url else f"http://{config.channels.whatsapp.web_cdp_url}")
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 9222
-    profile_dir = os.path.expanduser(config.channels.whatsapp.web_profile_dir)
+    profile_dir = config.channels.whatsapp.web_profile_dir
     return [
         _resolve_whatsapp_cdp_chrome_command(config),
         f"--remote-debugging-port={port}",
@@ -1072,8 +1398,10 @@ def _whatsapp_bridge_running(config: Config) -> bool:
             return False
 
     try:
-        return asyncio.run(_probe())
+        asyncio.get_running_loop()
     except RuntimeError:
+        return asyncio.run(_probe())
+    else:
         parsed = urlparse(bridge_url)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or 3001
@@ -1099,8 +1427,10 @@ def _privacy_gateway_running(config: Config) -> bool:
             return False
 
     try:
-        return asyncio.run(_probe())
+        asyncio.get_running_loop()
     except RuntimeError:
+        return asyncio.run(_probe())
+    else:
         parsed = urlparse(gateway_url)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or 8787
@@ -1118,10 +1448,7 @@ def _start_whatsapp_bridge(config: Config):
     if not config.channels.whatsapp.enabled:
         return None
 
-    if (
-        config.channels.whatsapp.delivery_mode == "draft"
-        and config.channels.whatsapp.web_browser_mode == "cdp"
-    ):
+    if config.channels.whatsapp.web_browser_mode == "cdp":
         _ensure_whatsapp_cdp_browser(config)
 
     if _whatsapp_bridge_running(config):
@@ -1157,6 +1484,8 @@ def _start_whatsapp_bridge(config: Config):
 
 def _start_privacy_gateway(config: Config, upstream_base: str):
     """Start the local privacy gateway when custom cloud provider routing needs privacy filtering."""
+    # Privacy pipeline step 2b: boot the local HTTP gateway as a sibling
+    # process and wait until /healthz confirms it is ready to proxy traffic.
     import subprocess
 
     if not config.privacy_gateway.enabled:
@@ -1510,15 +1839,32 @@ def whatsapp_groups_remove(
 def status():
     """Show nanobot status."""
     from nanobot.config.loader import get_config_path, load_config
+    from nanobot.utils.paths import is_inside_project, project_root
 
     config_path = get_config_path()
     config = load_config()
     workspace = config.workspace_path
+    root = project_root()
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    # --- Path confinement summary ---
+    def _path_tag(p: Path) -> str:
+        if is_inside_project(p):
+            return "[green]✓ (project-local)[/green]"
+        return "[yellow]⚠ (external)[/yellow]"
+
+    console.print(f"[bold]Project root:[/bold]  {root}")
+    console.print(f"Config:         {config_path} {_path_tag(config_path)}")
+    console.print(f"Workspace:      {workspace} {_path_tag(workspace)}")
+    console.print(f"Sessions:       {workspace / 'sessions'} {_path_tag(workspace / 'sessions')}")
+    console.print(f"State/journal:  {workspace / 'state'} {_path_tag(workspace / 'state')}")
+    console.print(f"Memory:         {workspace / 'memory'} {_path_tag(workspace / 'memory')}")
+    console.print(f"Data:           {root / 'data'} {_path_tag(root / 'data')}")
+    console.print(f"Auth:           {root / 'whatsapp-auth'} {_path_tag(root / 'whatsapp-auth')}")
+    wa_profile = Path(config.channels.whatsapp.web_profile_dir)
+    console.print(f"Browser:        {wa_profile} {_path_tag(wa_profile)}")
+    console.print()
 
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS

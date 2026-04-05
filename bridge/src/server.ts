@@ -23,6 +23,11 @@ interface PrepareDraftCommand {
 interface ScrapeDirectHistoryCommand {
   type: 'scrape_direct_history';
   targets: ChatTarget[];
+  requestId?: string;
+}
+
+interface CdpStatusCommand {
+  type: 'cdp_status';
 }
 
 interface BridgeMessage {
@@ -30,7 +35,7 @@ interface BridgeMessage {
   [key: string]: unknown;
 }
 
-type BridgeCommand = SendCommand | PrepareDraftCommand | ScrapeDirectHistoryCommand;
+type BridgeCommand = SendCommand | PrepareDraftCommand | ScrapeDirectHistoryCommand | CdpStatusCommand;
 
 export class BridgeServer {
   private wss: WebSocketServer | null = null;
@@ -203,6 +208,7 @@ export class BridgeServer {
               type: 'ack',
               action: cmd.type,
               to: target.chatId,
+              ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
               status: result.status,
               detail: result.detail,
             };
@@ -219,6 +225,7 @@ export class BridgeServer {
             this.broadcast({
               type: 'history',
               source: 'web_scrape',
+              ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
               messages,
               target: target.chatId,
             });
@@ -228,6 +235,7 @@ export class BridgeServer {
             type: 'ack',
             action: cmd.type,
             to: target.chatId,
+            ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
             status: 'not_ready',
             detail: String(error),
           };
@@ -238,10 +246,34 @@ export class BridgeServer {
         type: 'ack',
         action: cmd.type,
         to: '',
+        ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
         status: 'history_scraped',
         scrapedTargets,
         scrapedMessages,
         missedTargets,
+      };
+    }
+
+    if (cmd.type === 'cdp_status') {
+      if (!this.composer) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          status: 'bridge_unreachable',
+          reusable: false,
+          detail: 'WhatsApp bridge composer is not ready yet.',
+        };
+      }
+
+      const result = await this.composer.getBrowserStatus();
+      return {
+        type: 'ack',
+        action: cmd.type,
+        to: '',
+        status: result.status,
+        reusable: result.reusable,
+        detail: result.detail,
       };
     }
 

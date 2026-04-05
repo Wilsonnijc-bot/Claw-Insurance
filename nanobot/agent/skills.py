@@ -6,8 +6,8 @@ import re
 import shutil
 from pathlib import Path
 
-# Default builtin skills directory (relative to this file)
-BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+# Default builtin skills directory (relative to the nanobot package)
+BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
 
 class SkillsLoader:
@@ -118,7 +118,12 @@ class SkillsLoader:
         lines = ["<skills>"]
         for s in all_skills:
             name = escape_xml(s["name"])
-            path = s["path"]
+            # Use workspace-relative path to avoid leaking the absolute filesystem path.
+            try:
+                rel_path = str(Path(s["path"]).relative_to(self.workspace))
+            except ValueError:
+                rel_path = s["path"]
+            path = escape_xml(rel_path)
             desc = escape_xml(self._get_skill_description(s["name"]))
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)

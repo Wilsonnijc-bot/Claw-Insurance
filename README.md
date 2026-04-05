@@ -1,268 +1,979 @@
 # Nanobot WhatsApp Gateway
 
-This repository is a WhatsApp-focused Nanobot workspace.
+An AI-powered WhatsApp sales assistant for insurance workflows, with a Python gateway backend and a React operator UI.
 
-Its primary job is:
+This project now uses a **project-local runtime model**:
 
-1. receive WhatsApp messages through Baileys,
-2. keep local chat history and routing state on disk,
-3. decide which direct chats are allowed to auto-reply,
-4. generate a reply with Nanobot,
-5. paste the final reply into the WhatsApp Web message box without sending it.
+- config is read from this repo's [config.json](config.json) unless you explicitly override it
+- sessions are stored in [sessions](sessions)
+- reply-target and contact data are stored in [data](data)
+- per-client memory is stored under [memory](memory) as `memory/{phone}/MEMORY.md` and `memory/{phone}/HISTORY.md`
+- shared operator knowledge is stored in [memory/GLOBAL.md](memory/GLOBAL.md)
+- auth/browser state are stored in [whatsapp-auth](whatsapp-auth) and [whatsapp-web](whatsapp-web)
+- backend activity journal is stored in [state/activity_journal.jsonl](state/activity_journal.jsonl)
 
-The default outbound mode is `draft`, not `send`.
+It does **not** intentionally route runtime state to legacy home-folder paths such as `~/.nanobot/workspace` during normal project usage.
 
-That means the system prepares the reply in WhatsApp Web for manual review. It does not press Enter.
+## Workspace Confinement Update
 
-## What The System Is Made Of
+Based on the current `git diff`, the container/runtime path model was changed to keep state inside this project checkout instead of falling back to home-directory storage.
 
-There are two separate WhatsApp-facing layers:
+### What changed in [Dockerfile](Dockerfile)
 
-- `Baileys bridge`
-  - Receives inbound WhatsApp events.
-  - Uses the linked-device auth stored in `~/.nanobot/whatsapp-auth` by default.
-  - If the auth session is missing or expired, WhatsApp asks for a QR scan in the bridge terminal.
+Before:
 
-- `CDP WhatsApp Web browser`
-  - Used for two browser tasks:
-    - scraping direct-chat history from WhatsApp Web,
-    - putting the final reply into the WhatsApp Web compose box.
-  - Uses a Chrome remote-debugging endpoint such as `http://127.0.0.1:9222`.
-  - Uses a persistent Chrome user-data directory, `~/.nanobot/whatsapp-web` by default.
+- the image created `/root/.nanobot`
 
-These two layers are independent.
+Now:
 
-Baileys being connected does not automatically mean WhatsApp Web is logged in.
+- the image creates explicit project-local runtime directories under `/app`
+- these include `/app/data`, `/app/sessions`, `/app/state`, `/app/memory`, `/app/whatsapp-auth`, `/app/whatsapp-web`, `/app/whatsapp-web-debug`, `/app/skills`, `/app/media`, and `/app/cron`
 
-## Current Default Behavior
+Why this changed:
 
-- WhatsApp delivery mode defaults to `draft`.
-- Web browser mode defaults to `cdp`.
-- Direct auto-reply targets are stored in `data/whatsapp_reply_targets.json`.
-- Startup history sync runs for all enabled `direct_reply_targets`, even if you have not sent a new self control message in this session.
-- A new self control message rewrites the reply-target JSON and immediately re-syncs history for the direct targets listed in that message.
-- In `draft` mode:
-  - direct chats can generate draft replies,
-  - group chats are ignored,
-  - the final reply is inserted into the WhatsApp Web message box and left unsent.
+- `/root/.nanobot` encouraged a hidden container-global storage pattern
+- `/app/...` matches the repo layout and makes container behavior consistent with local development
+- runtime state is easier to inspect, back up, mount, and verify from the project folder
 
-## Installation
+### What changed in [docker-compose.yml](docker-compose.yml)
 
-### Prerequisites
+Before:
 
-- Python 3.11 or newer
-- Node.js and `npm`
-- Google Chrome or another Chromium-family browser
+- one broad home-directory mount: `~/.nanobot:/root/.nanobot`
 
-### Install from this repository
+Now:
+
+- explicit bind mounts for [config.json](config.json), [data](data), [sessions](sessions), [state](state), [memory](memory), [whatsapp-auth](whatsapp-auth), [whatsapp-web](whatsapp-web), [whatsapp-web-debug](whatsapp-web-debug), and [skills](skills)
+
+Why this changed:
+
+- it removes silent dependence on `~/.nanobot`
+- it makes the active runtime files obvious
+- it keeps Docker, the host checkout, and the path confinement rules aligned
+- it reduces the chance of old laptop state leaking into a fresh project run
+
+### Practical result
+
+If you clone this repo onto a laptop and run it normally, the intended storage model is:
+
+- config in [config.json](config.json)
+- sessions in [sessions](sessions)
+- contacts and reply targets in [data](data)
+- memory in [memory](memory)
+- auth/browser state in [whatsapp-auth](whatsapp-auth) and [whatsapp-web](whatsapp-web)
+
+That same model now applies to Docker and Compose.
+
+## How to keep everything inside one workspace
+
+Use this checklist if you want the whole system restrained to this single repo directory.
+
+1. Keep `agents.defaults.workspace` project-local.
+  - recommended: `"."`
+  - also fine: `"sessions"`, `"data"`, or another subdirectory inside this repo
+  - do **not** use `~`, `/tmp/...`, or another folder outside the repo
+
+2. Turn on tool restraint.
+  - set `tools.restrictToWorkspace` to `true`
+  - this keeps agent tool access scoped to the configured workspace directory
+
+3. Keep path-like channel settings repo-relative.
+  - use values like `whatsapp-web`, `data/whatsapp_reply_targets.json`, and `data/contacts/whatsapp.json`
+  - do **not** use `~/.nanobot/...`
+
+4. Prefer the installed wrapper commands.
+  - `whatsapp-web-nanobot-ui`
+  - `whatsapp-web-nanobot-gateway`
+  - these point back to this checkout's [config.json](config.json)
+
+5. In Docker, mount this repo's folders into `/app/...`.
+  - do not reintroduce `~/.nanobot:/root/.nanobot`
+
+6. Use `python3 -m nanobot status` after setup.
+  - confirm the reported config path, workspace path, sessions path, memory path, data path, auth path, and browser path are all project-local
+
+It also now enforces a **per-client data isolation model**:
+
+- WhatsApp client identity is normalized through `ClientKey` before session or API lookup
+- client memory is no longer shared across all chats
+- history import and reply-target matching reject cross-client mismatches instead of trying to guess
+
+---
+
+## Recent Data-Flow Changes
+
+This README has been updated to reflect the current code paths without rewriting the rest of the document.
+
+### Added
+
+- `ClientKey` as the canonical WhatsApp client identity model for phone normalization and session derivation
+- per-client memory directories under `memory/{phone}/`
+- shared read-only operator knowledge in [memory/GLOBAL.md](memory/GLOBAL.md)
+- `SessionManager.get_for_client(...)` and API lookup paths that resolve sessions from normalized client identity
+- stricter history-import guards: empty-phone rejection, normalized phone matching, and explicit cross-client assertion
+- stricter reply-target matching rules for direct chats and group-name collisions
+- regression coverage in `tests/test_client_isolation.py`
+- dedicated isolation documentation in [ISOLATION.md](ISOLATION.md)
+
+### Removed or retired
+
+- shared client memory in legacy `memory/MEMORY.md` and `memory/HISTORY.md` as the active per-client store
+- implicit raw-string session lookup for WhatsApp clients
+- direct-chat routing that could rely on stale display names
+- history import behavior that could accept entries without a validated client phone
+- the old assumption that one visible WhatsApp name safely identifies one client
+
+---
+
+## Quick Start
+
+### Recommended flow for every laptop
+
+Run this once after cloning the repo:
 
 ```bash
-git clone https://github.com/HKUDS/nanobot.git
-cd nanobot
-python3 -m pip install -e .
+cd /path/to/Nanobot-Whatsapp
+python3 -m nanobot install-ui-command
 ```
 
-The editable install is important because it gives you global launcher commands that work from any directory.
+That installs two stable wrapper commands for **this project checkout**:
 
-## Main Commands
+- `whatsapp-web-nanobot-ui`
+- `whatsapp-web-nanobot-gateway`
 
-There are two operational commands, plus one simple alias:
+After that, the normal daily command is:
 
-### 1. Gateway
+```bash
+whatsapp-web-nanobot-ui
+```
 
-Recommended launcher:
+What it does:
+
+1. uses this repo's [config.json](config.json)
+2. uses this repo as the working directory
+3. starts the lightweight launcher/API on port `3456` if needed
+4. starts the React frontend from [Insurance frontend](Insurance%20frontend)
+5. waits for you to log in from the UI
+6. after UI login, `/api/login` boots the full gateway in-process
+
+So the **correct normal operator flow** is:
+
+1. run `whatsapp-web-nanobot-ui`
+2. open the frontend URL shown by Vite
+3. log in in the UI
+4. if WhatsApp auth is needed, complete it in the UI / linked browser
+5. work from the UI
+
+If you only want the backend without the React UI, run:
 
 ```bash
 whatsapp-web-nanobot-gateway
 ```
 
-Canonical equivalent:
+---
+
+## What the wrapper commands really are
+
+The wrapper commands are **small shell scripts installed on each laptop**. They are not magical global binaries shared across all machines.
+
+Each teammate must run:
 
 ```bash
-nanobot gateway
+python3 -m nanobot install-ui-command
 ```
 
-Both commands start the same gateway path.
+on their own clone.
 
-### 2. Browser-only CDP launcher
+The installed wrappers:
+
+- point to this repo checkout
+- export `NANOBOT_CONFIG_PATH` to this repo's [config.json](config.json)
+- prefer this repo's `.venv/bin/python` when available
+- run `python -m nanobot ui` or `python -m nanobot gateway` underneath
+
+That gives everyone the same command names, while still keeping storage and config anchored to their local clone of this project.
+
+---
+
+## Command Reference
+
+### Primary operator commands
+
+| Command | Purpose | Effect |
+|---|---|---|
+| `python3 -m nanobot install-ui-command` | one-time installer | installs global wrapper commands for this checkout |
+| `whatsapp-web-nanobot-ui` | normal daily start command | starts launcher if needed, then starts the frontend UI |
+| `whatsapp-web-nanobot-gateway` | backend-only start | starts the full gateway stack without the React UI |
+| `python3 -m nanobot ui` | non-wrapper UI start | starts the frontend and ensures launcher is reachable |
+| `python3 -m nanobot launcher` | launcher-only start | starts lightweight pre-login API/WS server on `3456` |
+| `python3 -m nanobot gateway` | full backend start | starts bridge, CDP, agent loop, channels, cron, heartbeat, API |
+
+### Setup and inspection commands
+
+| Command | Purpose |
+|---|---|
+| `python3 -m nanobot onboard` | initialize or refresh project config and workspace files |
+| `python3 -m nanobot status` | print config path, workspace path, and provider status |
+| `python3 -m nanobot agent -m "..."` | run the agent directly from terminal |
+| `python3 -m nanobot provider login <provider>` | authenticate an OAuth-based provider |
+
+### Channel management commands
+
+| Command group | Purpose |
+|---|---|
+| `python3 -m nanobot channels status` | show enabled channel configuration |
+| `python3 -m nanobot channels whatsapp-contacts init/list/add/remove` | manage local WhatsApp direct contacts |
+| `python3 -m nanobot channels whatsapp-groups init/list/add/remove` | manage WhatsApp group allowlist rules |
+
+---
+
+## Correct Flows and Their Effects
+
+### Flow A — Recommended daily UI workflow
 
 ```bash
-nanobot channels whatsapp-web
+whatsapp-web-nanobot-ui
 ```
 
-This launches or reuses the debuggable Chrome browser used for WhatsApp Web.
+Effect:
 
-Use it when you want to bring up the browser explicitly before starting the gateway.
+1. verifies or starts the launcher on `http://127.0.0.1:3456`
+2. starts Vite for [Insurance frontend](Insurance%20frontend)
+3. keeps the app in **UI-first** mode
+4. after UI login, starts the full gateway
+5. UI becomes the main control surface for sync, draft review, sending, and monitoring
 
-## Minimal Config
+Use this when a human agent is actively working from the dashboard.
 
-Nanobot reads config from `~/.nanobot/config.json`.
+### Flow B — Backend-only workflow
 
-A minimal WhatsApp-focused example looks like this:
+```bash
+whatsapp-web-nanobot-gateway
+```
+
+Effect:
+
+1. starts the full Python gateway immediately
+2. starts the bridge and CDP browser path
+3. starts the API server on `3456`
+4. lets you operate without launching the React UI
+
+Use this for backend debugging, service-style runs, or when you do not need the dashboard open.
+
+### Flow C — Development without wrappers
+
+```bash
+python3 -m nanobot launcher
+python3 -m nanobot ui
+```
+
+or
+
+```bash
+python3 -m nanobot gateway
+```
+
+Effect:
+
+- same runtime pieces as the wrappers
+- more explicit for development and debugging
+- useful if you do not want the installed global commands
+
+### Flow D — One-time machine setup
+
+```bash
+python3 -m nanobot install-ui-command
+```
+
+Effect:
+
+1. installs `whatsapp-web-nanobot-ui`
+2. installs `whatsapp-web-nanobot-gateway`
+3. optionally adds the install directory to shell `PATH`
+
+---
+
+## Project-Local Storage Map
+
+All important runtime files for this project should live under this repo:
+
+| Purpose | Path |
+|---|---|
+| project config | [config.json](config.json) |
+| contacts | [data/contacts/whatsapp.json](data/contacts/whatsapp.json) |
+| group members | [data/whatsapp_groups.csv](data/whatsapp_groups.csv) |
+| reply targets | [data/whatsapp_reply_targets.json](data/whatsapp_reply_targets.json) |
+| per-client long-term memory | [memory](memory) → `memory/{phone}/MEMORY.md` |
+| per-client summarized history | [memory](memory) → `memory/{phone}/HISTORY.md` |
+| shared operator knowledge | [memory/GLOBAL.md](memory/GLOBAL.md) |
+| session bundles | [sessions](sessions) |
+| journal | [state/activity_journal.jsonl](state/activity_journal.jsonl) |
+| WhatsApp web profile | [whatsapp-web](whatsapp-web) |
+| Baileys auth | [whatsapp-auth](whatsapp-auth) |
+| bridge debug/profile state | [whatsapp-web-debug](whatsapp-web-debug) |
+
+If you see commands or ad-hoc scripts pointing at `~/.nanobot/workspace`, treat those as legacy/manual paths, not the intended project runtime path.
+
+The same storage layout applies in containers: [docker-compose.yml](docker-compose.yml) bind-mounts these project folders into `/app/...` inside the container so runtime state stays tied to this repo checkout instead of any home-directory fallback.
+
+### Path Confinement Invariant
+
+All runtime state is strictly confined to this project directory. The codebase enforces this via a centralized path module (`nanobot/utils/paths.py`) that:
+
+- Derives the project root from the package location — no hard-coded home-directory fallbacks.
+- Provides `confine_path()` which raises `PathEscapeError` if any resolved path escapes the project tree.
+- Removes all `expanduser()` calls from runtime path resolution so that `~` is never silently expanded to the user's home directory.
+
+**What was removed:** The legacy `~/.nanobot` migration system and all `_HOME_ROOT = Path.home() / ".nanobot"` references. If you have state left in `~/.nanobot` from an older install, copy it manually into the project directories listed above.
+
+Run `nanobot status` to see all active paths and verify they are project-local.
+
+Regression tests in `tests/test_path_confinement.py` enforce this invariant.
+
+### Per-client isolation invariant
+
+For WhatsApp data, the rule is:
+
+> one client chat may read only that client's session bundle, that client's memory files, and shared global knowledge.
+
+The current implementation enforces this by:
+
+- normalizing every client phone through `ClientKey`
+- deriving `whatsapp:{phone}` session keys from that normalized identity
+- scoping `ContextBuilder` and `MemoryStore` to the same client key
+- rejecting history imports and reply-target matches that fail phone-level validation
+
+See [ISOLATION.md](ISOLATION.md) for the full invariant and forbidden patterns.
+
+---
+
+## Architecture Overview
+
+The system is two entirely separate processes that communicate via HTTP and WebSocket:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Process 1: InsureAI Frontend  (Vite dev server, Node.js)           │
+│  http://localhost:5173                                               │
+│                                                                     │
+│  React 18 + TypeScript + Tailwind CSS                               │
+│                                                                     │
+│  LoginPage → App → ClientList ──────────────────────────────────┐  │
+│                         │                                        │  │
+│                         ▼                                        ▼  │
+│                   ClientCard (blue toggle)          ClientProfile   │
+│                         │                           MessageThread  │
+│                         │                           Composer Box   │
+│                         └────── useNanobot hook ──────────────────┘  │
+│                                     │                               │
+│                          api.ts  websocket.ts                       │
+│                            │         │                              │
+│              Vite proxy: /api → :3456, /ws → :3456                 │
+└─────────────────────────────────────────────────────────────────────┘
+                              │ REST + WebSocket
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Process 2: Nanobot Gateway  (python3 -m nanobot gateway)           │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  ApiServer (aiohttp)  http://localhost:3456                  │   │
+│  │  REST: /api/login, /api/clients, /api/messages,             │   │
+│  │        /api/ai-draft, /api/ai-send, /api/auto-draft,        │   │
+│  │        /api/auto-reply, /api/broadcast, /api/sync,          │   │
+│  │        /api/status                                          │   │
+│  │  WS:   /ws  (new_message, ai_generating, ai_draft,          │   │
+│  │              auto_draft, auto_draft_changed, pong)          │   │
+│  └─────────────────────┬───────────────────────────────────────┘   │
+│                         │                                           │
+│  ┌──────────────────────▼────────────────────────────────────────┐  │
+│  │  MessageBus (asyncio queues)                                  │  │
+│  │  inbound queue ──► agent loop        outbound queue ◄─ agent  │  │
+│  │  inbound observers → ApiServer       outbound observers       │  │
+│  │                                                               │  │
+│  │  ui_connected = len(inbound_observers) > 0                    │  │
+│  │  ↳ True  → capture_only=True, _auto_draft_candidate=True      │  │
+│  │  ↳ False → agent processes and auto-replies directly          │  │
+│  └──────────────────────┬────────────────────────────────────────┘  │
+│           ┌─────────────┴────────────────┐                         │
+│           ▼                              ▼                         │
+│  ┌────────────────────┐      ┌───────────────────────┐            │
+│  │  AgentLoop (LLM)   │      │  ChannelManager        │            │
+│  │  litellm/OpenRouter│      │  WhatsApp channel       │            │
+│  │  process_direct()  │      │   ├─ Baileys bridge     │            │
+│  │  session snapshot  │      │   │  ws://localhost:3001 │            │
+│  │  rollback on draft │      │   └─ CDP browser        │            │
+│  └────────────────────┘      │      http://127.0.0.1:  │            │
+│                              │      9222 (remote debug)│            │
+│  ┌────────────────────┐      └───────────────────────┘            │
+│  │  SessionManager    │                                            │
+│  │  JSONL per contact │  CronService   HeartbeatService           │
+│  └────────────────────┘                                            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### WhatsApp connection layers
+
+There are three distinct layers that connect to WhatsApp, all started by the gateway:
+
+| Layer | Transport | Purpose | Auth |
+|---|---|---|---|
+| **Baileys bridge** | WebSocket `ws://localhost:3001` | Receives all live inbound messages via WhatsApp linked-device protocol; sends approved outbound messages after the agent clicks send in the UI | `whatsapp-auth/creds.json` |
+| **CDP browser** | Chrome DevTools Protocol `http://127.0.0.1:9222` | Scrapes WhatsApp Web DOM for chat history on demand only; not part of the normal send path | Chrome profile at `whatsapp-web/` |
+| **Frontend UI** | HTTP + WebSocket via Vite proxy | Agent-facing dashboard — the only place the human reviews and sends messages | UI login triggers `/api/login` on the launcher |
+
+Both the Baileys bridge and the CDP browser are started **automatically and simultaneously** when the gateway starts. Baileys auth and WhatsApp Web auth are independent sessions — refreshing one does not affect the other.
+
+### Two operating modes
+
+The gateway operates in one of two modes based on whether the frontend UI is connected:
+
+| Mode | Condition | Behavior |
+|---|---|---|
+| **Auto-reply (standalone)** | No UI WebSocket observer connected | Agent processes inbound messages, generates replies, and sends them to WhatsApp automatically via the channel. Used when the agent is away from the desk. |
+| **Auto-draft (UI connected)** | Frontend WebSocket is connected | Inbound WhatsApp messages get `capture_only=True`. Agent saves them to session history but sends no reply. `ApiServer` mirrors the message to the UI and, if the client has `auto_draft: true`, generates a draft into the composer instead. |
+
+The switch is automatic and instantaneous — it happens the moment the first WebSocket client connects or disconnects.
+
+---
+
+## End-to-End Workflow
+
+### Step 1. Start the UI wrapper or launcher/UI pair
+
+```bash
+whatsapp-web-nanobot-ui
+```
+
+This is the recommended path. It does **not** start the full gateway immediately.
+
+What starts first:
+
+1. the lightweight launcher on `http://localhost:3456`
+2. the Vite frontend for [Insurance frontend](Insurance%20frontend)
+
+At this stage the UI can load before WhatsApp services fully boot.
+
+If you prefer explicit development commands, the equivalent flow is:
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+python3 -m nanobot launcher
+
+cd /path/to/Nanobot-Whatsapp/Insurance\ frontend
+npm run dev
+```
+
+### Step 2. Log in from the frontend
+
+Open the frontend URL shown by Vite.
+
+On submit:
+
+1. the login page calls `POST /api/login`
+2. the launcher records the login and starts the full gateway in-process
+3. the UI stays connected to the launcher/API during bootstrap
+4. once the gateway is ready, the UI loads clients and opens live WebSocket updates
+
+This is the current **UI-first** runtime flow.
+
+### Step 3. What the full gateway starts after login
+
+After `/api/login`, the gateway performs startup in sequence:
+
+1. **Loads config** from `config.json` (or `NANOBOT_APP_CONFIG_PATH` / `NANOBOT_CONFIG_PATH`).
+2. **Starts the Baileys bridge** — spawns the Node.js process (`bridge/`) on `ws://localhost:3001`. This also attaches or launches the CDP browser for WhatsApp Web simultaneously.
+3. **Initializes core services** — `MessageBus`, `SessionManager`, `AgentLoop` (LLM), `ChannelManager`, `CronService`, `HeartbeatService`.
+4. **Starts the API server** on `http://localhost:3456` — REST + WebSocket, CORS-enabled, ready to accept frontend connections immediately.
+
+Vite proxies:
+- `/api/*` → `http://localhost:3456/api/*`
+- `/ws` → `ws://localhost:3456/ws`
+
+This keeps frontend API traffic relative and project-local.
+
+### Step 4. Baileys authenticates with WhatsApp
+
+The bridge checks `whatsapp-auth/creds.json` on startup (before the frontend is even opened):
+
+- **Valid session found:** reused silently. No QR code. The terminal shows `connected`.
+- **No session or expired:** the bridge prints a QR code in the terminal. Scan from WhatsApp → Linked Devices on your phone. The session is saved and reused on subsequent restarts.
+
+### Step 5. CDP browser attaches (for history scraping)
+
+When CDP mode is enabled, the gateway tries `http://127.0.0.1:9222`:
+
+- **Chrome already running with remote debugging:** Nanobot reuses the existing instance. If it has no `web.whatsapp.com` tab, it opens one.
+- **No Chrome found:** Nanobot launches Chrome with `--remote-debugging-port=9222` using the persistent profile at `whatsapp-web/`. Opens `https://web.whatsapp.com/`. Sign in once; the profile is reused.
+
+The bridge can reuse an existing logged-in WhatsApp Web browser, but CDP is only checked when a history scrape is requested.
+
+### Step 5b. CDP & Bridge health protection
+
+After startup the system continuously monitors the **Node bridge / Baileys path**, but CDP readiness for history scraping is checked **only on demand**:
+
+| Check | Interval | Behaviour |
+|---|---|---|
+| **On-demand CDP scrape check** | Only when `POST /api/sync/{phone}` or `POST /api/bridge/check` is called | Python asks the bridge for a fresh one-shot CDP status. The bridge checks whether it can connect to CDP, whether a WhatsApp Web tab exists, and whether that tab is logged in and ready. If no CDP browser is reachable, it tries to launch the dedicated Chrome profile automatically. |
+| **Bridge process monitor** | Every 5 s | `ApiServer` calls `bridge_proc.poll()`. This monitors the **Node.js bridge process itself** (which hosts Baileys and CDP helpers). If the process has exited, a `whatsapp_browser_status` WS event with `severity: "error"` is broadcast immediately. The frontend shows a **重启 Bridge** button. |
+| **WS reconnect escalation** | After 12 failures (60 s) | `WhatsAppChannel` monitors the **Python ↔ Node bridge WebSocket connection**. If reconnecting to `ws://localhost:3001` fails 12 consecutive times, the status is escalated from `warning` → `error` severity and the message tells the user the bridge may have crashed or become unreachable. |
+
+The on-demand CDP status returns precise scrape-readiness states:
+
+| State | Meaning |
+|---|---|
+| `ready` | Existing WhatsApp Web session is reusable for history sync right now |
+| `cdp_launch_failed` | Nanobot could not attach to CDP and also could not launch the dedicated Chrome profile |
+| `whatsapp_web_login_required` | CDP browser is reachable (or was launched), but WhatsApp Web must be logged in before scraping |
+| `scrape_not_ready` | CDP is reachable, but no usable WhatsApp Web tab is ready for history sync |
+
+**Frontend notifications** are severity-aware:
+
+| Severity | Colour | Title | Action button |
+|---|---|---|---|
+| `warning` | Yellow | 历史同步需要 WhatsApp Web | 检查 WhatsApp Web (`POST /api/bridge/check`) |
+| `error` | Red | Bridge 异常 | 重启 Bridge (`POST /api/bridge/restart`) |
+
+`POST /api/bridge/restart` performs a full kill → `rm -rf .bridge-build/` → rebuild from `bridge/` source → `npm start` → wait for WS readiness (up to 15 s).  
+`POST /api/bridge/check` triggers the same one-shot scrape-readiness check used by `POST /api/sync/{phone}` and returns the fresh result immediately.
+
+### Step 6. Startup history sync
+
+Once Baileys reports `connected`, the gateway triggers a history sync for all enabled targets in `data/whatsapp_reply_targets.json`:
+
+1. **Baileys history replay:** any direct-message history that Baileys already knows about is normalized and published into the `InboundHistoryBatch` queue.
+2. **WhatsApp Web DOM scrape:** the CDP browser builds a target list from enabled `direct_reply_targets`, opens each target chat in WhatsApp Web, scrolls upward through the timeline, and extracts message text + timestamps from the DOM.
+
+The sync path is intentionally strict:
+
+1. The backend builds each scrape target from the allowlist row in [data/whatsapp_reply_targets.json](data/whatsapp_reply_targets.json).
+2. Target matching prefers exact identifiers first: `phone` → bare `chat_id` → bare `sender_id` → normalized contact phone → names/labels only as fallback search terms.
+3. The bridge stamps each scraped message batch with the requested target's `chatId` and `phone` before sending it back to Python.
+4. Python re-matches every history message against the direct-reply allowlist using normalized phone and chat identifiers.
+5. The importer writes only into the matching canonical session key derived from normalized client identity: `whatsapp:{phone}`.
+6. Entries with an empty `phone` field are dropped before import.
+7. The final history import layer verifies that the entry phone matches the destination session phone before writing, so one client's messages cannot be written into another client's JSONL bundle.
+8. A final `ClientKey` assertion blocks any edge case where formatting differences still hide a client mismatch.
+
+Client naming is also strict during history import:
+
+- `push_name` from **client-authored** messages can update identity hints.
+- `push_name` from `fromMe` messages is **not** allowed to rename the client, because that value is the operator's own WhatsApp display name.
+- `push_name` and `label` are treated as hints for search and display, not as trusted direct-chat identity keys.
+
+Imported messages are:
+- Deduplicated by WhatsApp `message_id`.
+- Sorted chronologically before merge.
+- Written into the canonical bundled session JSONL at [sessions/whatsapp__{phone}/session.jsonl](sessions).
+- Reflected in [sessions/whatsapp__{phone}/meta.json](sessions) for display metadata.
+- Immediately queryable via `GET /api/messages/{phone}`.
+
+The agent can also trigger a manual sync for a single contact from the UI — the "一键同步 WhatsApp 聊天记录" button in `ClientProfile.tsx` calls `POST /api/sync/{phone}`.
+
+Manual sync now follows this exact CDP flow:
+
+1. UI calls `POST /api/sync/{phone}`
+2. backend asks the bridge for a **fresh one-shot CDP status**
+3. bridge checks:
+  - can attach to the CDP endpoint?
+  - is there a WhatsApp Web tab?
+  - is WhatsApp Web logged in and scrape-ready?
+4. if CDP is not reachable, the bridge tries to launch the dedicated Chrome profile automatically
+5. if WhatsApp Web still is not logged in, the API returns `409` with a precise state such as `whatsapp_web_login_required`
+6. after the operator logs in to WhatsApp Web, they click sync again to retry
+
+### Step 7. UI WebSocket connects — capture-only mode activates
+
+When `NanobotWebSocket.connect()` succeeds, the `useNanobot` hook registers itself as an observer on the `MessageBus` inbound queue.
+
+From this point, `MessageBus.ui_connected` is `True`. Every inbound WhatsApp message that is **not** a self-chat command now receives:
+
+```python
+msg.metadata["capture_only"] = True
+msg.metadata["_auto_draft_candidate"] = True
+```
+
+- `capture_only=True` tells the `AgentLoop` to save the message to session history but **not** generate or send a reply.
+- `_auto_draft_candidate=True` signals `ApiServer`'s inbound mirror task to consider auto-draft generation.
+
+The moment the WebSocket disconnects (agent closes the browser), `ui_connected` drops to `False` and the gateway reverts to autonomous auto-reply mode.
+
+### Step 8. A client sends a WhatsApp message
+
+Message flow from client → agent's UI:
+
+```
+Client's phone
+    │  (WhatsApp message)
+    ▼
+Baileys bridge  (ws://localhost:3001)
+    │  normalizes to InboundMessage{channel="whatsapp", chat_id=..., content=...}
+    ▼
+WhatsApp channel  (checks allowlist, updates metadata in reply targets JSON)
+    │
+    ▼
+MessageBus.publish_inbound()
+    │  capture_only=True → agent loop saves to JSONL, no reply generated
+    │  also fans out to all inbound observers
+    ▼
+ApiServer inbound mirror task
+    ├──► broadcasts new_message WS event → message appears in UI thread instantly
+    └──► if auto_draft == true for this client → spawns _auto_generate_draft()
+```
+
+### Step 9. AI draft generation (automatic or manual)
+
+There are two independent paths that both land a draft in the composer textarea:
+
+#### Path A — Automatic (blue toggle is ON)
+
+Triggered automatically when a client with `auto_draft: true` sends a message and the UI is connected:
+
+1. `ApiServer._auto_generate_draft(phone)` starts asynchronously.
+2. Takes a **session snapshot** (saves current JSONL state).
+3. Calls `agent.process_direct(message, ...)` — runs the full LLM pipeline including tool calls.
+4. **Rolls back the session** to the snapshot — the draft is not committed to history.
+5. Sends `{ type: "auto_draft", phone: ..., content: "..." }` via WebSocket to all connected clients.
+6. `useNanobot` receives the event and dispatches it to `App.tsx` → sets the composer textarea value for the matching client.
+
+#### Path B — Manual (✨ AI button)
+
+The agent clicks the ✨ button in the MessageInput toolbar at any time:
+
+1. `POST /api/ai-draft/{phone}` is called.
+2. Same generate → snapshot → rollback flow.
+3. Response `{ draft: "..." }` returned to the frontend.
+4. `useAIGeneration` hook loads it into the composer textarea.
+5. A `new_message` WebSocket event with `status: "completed"` is also broadcast.
+
+In both cases the draft arrives **in the Nanobot UI composer box as editable text** — not in the WhatsApp Web browser. There is no separate Approve/Discard step; the agent just edits and sends.
+
+### Step 10. Agent reviews, edits, and sends
+
+The composer textarea (`MessageInput.tsx`) is pre-populated with the draft text. The agent can:
+- Edit any part of the text.
+- Delete it all and write something fresh.
+- Send as-is immediately.
+
+**Sending a message:**
+
+- Press **Cmd+Enter** or click **发送**.
+- `MessageThread` / `MessageInput` determines if the content came from an AI draft (tracked via a local ref).
+
+| Content type | API call | Backend action |
+|---|---|---|
+| AI draft (auto or manual) | `POST /api/ai-send/{phone}` | Persists `{ role: "me", is_ai_approved: true }` to JSONL, publishes `OutboundMessage` to the bus |
+| Manually typed | `POST /api/messages/{phone}` | Persists `{ role: "me" }` to JSONL, publishes `OutboundMessage` to the bus |
+
+Both paths result in:
+1. `ChannelManager` routes the `OutboundMessage` to the WhatsApp channel.
+2. WhatsApp channel sends the approved message through **Baileys** via the linked-device protocol.
+3. A `new_message` WS event is broadcast → the sent message appears in the UI thread.
+
+### Step 11. Session and history update
+
+After each sent message:
+- `sessions/whatsapp__{phone}/session.jsonl` is updated with the new turn.
+- `sessions/whatsapp__{phone}/meta.json` is refreshed.
+- The next `GET /api/messages/{phone}` and the next AI draft generation will include the new message as conversation context.
+
+---
+
+## Feature Reference
+
+### Auto-draft toggle (blue button, per client)
+
+Each contact card in the left sidebar has a blue toggle. This controls `auto_draft` in `data/whatsapp_reply_targets.json`.
+
+| State | Label | Behavior |
+|---|---|---|
+| ON (blue) | AI自动草稿已开启 | Next inbound message from this client auto-generates a draft into the composer |
+| OFF (gray) | AI自动草稿已关闭 | No automatic draft; agent can still use ✨ AI manually |
+
+The toggle calls `PUT /api/auto-draft/{phone}` → backend updates the JSON file → broadcasts `auto_draft_changed` WS event to sync all open tabs.
+
+### Auto-reply (nanobot native, no UI toggle)
+
+Separately from the UI auto-draft system, the backend has its own auto-reply mechanism used when the UI is **not** connected. This is controlled by `PUT /api/auto-reply/{phone}` which sets a per-client `enabled`/`auto_reply` flag in the reply targets JSON. When enabled and the UI is disconnected, the full agent pipeline runs and sends replies autonomously. This path has no corresponding frontend toggle — it is managed via the API or self-chat commands.
+
+### Voice recording
+
+`ClientProfile.tsx` includes a `VoiceRecorder` component. Recorded audio is transcribed (via the browser `MediaRecorder` API) and the text is inserted into the composer box as a draft starting point.
+
+### Broadcast
+
+`BroadcastModal.tsx` calls `POST /api/broadcast` with a list of phone numbers and a message body. The gateway sends the message to each target sequentially using the same outbound path.
+
+### Manual sync
+
+The "一键同步 WhatsApp 聊天记录" button in `ClientProfile.tsx` calls `triggerSync(phone)` → `POST /api/sync/{phone}`.
+
+Manual sync is a **scoped** history sync for one phone only:
+
+1. the backend normalizes the requested phone through `ClientKey`
+2. it limits the scrape target list to that phone's allowlist row
+3. the bridge opens only that chat in WhatsApp Web
+4. scraped messages are stamped with that target's identifiers
+5. Python re-checks the phone/chat match before import
+6. only that client's session bundle and per-client prompt context are updated
+
+If the CDP browser cannot open WhatsApp Web or cannot focus the chat search box, the sync returns `not_ready` instead of silently writing to the wrong client.
+
+### Activity journal
+
+The backend keeps a concise append-only activity journal in [state/activity_journal.jsonl](state/activity_journal.jsonl).
+
+It is the authoritative operator activity log and is streamed to the frontend Logs panel.
+
+Typical journal events include:
+- login
+- inbound message observed
+- AI draft generated
+- message sent
+- broadcast sent
+- manual sync triggered
+- reply-target updates
+
+This log is backend-owned, not browser-local, so it survives page refreshes and keeps the UI aligned with the real runtime state.
+
+### AI thinking indicator
+
+While a draft is being generated, `ApiServer` sends a sequence of `ai_generating` WebSocket events:
+- `{ type: "ai_generating", status: "started", phone: ... }` — triggered at the start
+- `{ type: "ai_generating", status: "completed", phone: ... }` — on success
+- `{ type: "ai_generating", status: "error", phone: ..., content: "..." }` — on failure
+
+The `AIThinkingLoader` component and `useAIGeneration` hook consume these events to show a spinner in the MessageThread.
+
+---
+
+## Frontend Architecture
+
+```
+src/
+├── App.tsx                  Root component — auth state, routing, log handler
+├── services/
+│   ├── api.ts               Typed REST wrappers (fetch-based, relative URLs via Vite proxy)
+│   └── websocket.ts         Singleton WebSocket client with auto-reconnect and event emitter
+├── hooks/
+│   ├── useNanobot.ts        Master hook — fetches clients/messages, connects WS, handles all events
+│   ├── useAIGeneration.ts   Tracks ai_generating WS events → loading state in thread
+│   ├── useRecording.ts      MediaRecorder wrapper for voice input
+│   └── useLogger.ts         Backend journal client for the Logs panel (`/api/journal` + WS journal events)
+├── components/
+│   ├── Auth/LoginPage.tsx   Login form → POST /api/login → onLogin()
+│   ├── ClientList/
+│   │   ├── ClientList.tsx   Left sidebar list of contacts
+│   │   └── ClientCard.tsx   Single contact row — name, last message, blue auto-draft toggle
+│   ├── ClientDetail/
+│   │   ├── ClientProfile.tsx  Right panel — client info, sync button, voice recorder
+│   │   └── VoiceRecorder.tsx  MediaRecorder → transcription → composer pre-fill
+│   ├── MessageCenter/
+│   │   ├── MessageThread.tsx  Chat bubble list for selected client
+│   │   ├── MessageInput.tsx   Composer textarea + send button + ✨ AI button
+│   │   ├── AIThinkingLoader.tsx  Animated spinner shown during AI generation
+│   │   └── BroadcastModal.tsx  Multi-client broadcast form
+│   ├── Logs/LogViewer.tsx   Developer log panel (toggled from header)
+│   └── common/
+│       ├── AnimatedEllipsis.tsx  Typing animation
+│       └── PrivacyBadge.tsx      PII redaction badge
+├── store/mockData.ts        5 demo clients used in offline/demo mode
+└── types/
+    ├── index.ts             Client, Message, and other shared types
+    └── log.ts               LogEntry and LogAction union type
+```
+
+### Key data flow in the frontend
+
+```
+useNanobot(isAuthenticated)
+    ├── GET /api/clients → clients[]
+    ├── GET /api/messages/{phone} → messages[] (on client select)
+    ├── WS new_message → append to messages[]
+    ├── WS auto_draft → set composer value for matching client
+    ├── WS auto_draft_changed → update client.autoDraftEnabled
+    └── WS ai_generating → forward to useAIGeneration
+
+App.tsx
+    ├── handleToggleAutoDraft(phone, enabled) → PUT /api/auto-draft/{phone}
+    ├── handleSelectClient(client) → set selectedClient
+    └── handleLog(action, ...) → useLogger
+```
+
+---
+
+## Data Structures
+
+### Reply targets: `data/whatsapp_reply_targets.json`
+
+The authoritative record of which contacts the gateway watches and how to handle their messages.
 
 ```json
 {
-  "providers": {
-    "openrouter": {
-      "apiKey": "sk-or-v1-xxx"
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": "anthropic/claude-opus-4-5",
-      "provider": "openrouter"
-    }
-  },
-  "channels": {
-    "whatsapp": {
+  "version": 1,
+  "updated_at": "2026-03-30T00:49:41.108824+00:00",
+  "source": "self_chat_command",
+  "direct_reply_targets": [
+    {
+      "phone": "85268424658",
       "enabled": true,
-      "deliveryMode": "draft",
-      "bridgeUrl": "ws://localhost:3001",
-      "webBrowserMode": "cdp",
-      "webCdpUrl": "http://127.0.0.1:9222",
-      "webCdpChromePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      "webProfileDir": "~/.nanobot/whatsapp-web",
-      "contactsFile": "~/.nanobot/contacts/whatsapp.json",
-      "replyTargetsFile": "data/whatsapp_reply_targets.json"
+      "auto_draft": true,
+      "label": "",
+      "chat_id": "85268424658@s.whatsapp.net",
+      "sender_id": "85268424658@s.whatsapp.net",
+      "push_name": "+852 6842 4658",
+      "last_seen_at": "2026-03-30T00:49:41.108748+00:00"
     }
-  }
+  ],
+  "group_reply_targets": []
 }
 ```
 
-Important fields:
+| Field | Type | Description |
+|---|---|---|
+| `enabled` | bool | Gateway captures and processes messages from this client |
+| `auto_draft` | bool | UI automatically generates AI drafts when this client messages |
+| `chat_id` | string | WhatsApp JID used by Baileys internally |
+| `sender_id` | string | JID of the message sender (same as chat_id for DMs) |
+| `push_name` | string | Display name from WhatsApp |
+| `last_seen_at` | ISO datetime | Timestamp of last inbound message |
 
-- `deliveryMode`
-  - `draft`: paste the final reply into WhatsApp Web and do not send.
-  - `send`: use the legacy Baileys auto-send path.
+Important note:
 
-- `webBrowserMode`
-  - `cdp`: default. Use a Chrome debugger endpoint and persistent browser profile.
-  - `launch`: retained legacy mode. Not the default.
+- `push_name` is only a WhatsApp display-name hint.
+- `phone`, `chat_id`, and `sender_id` are the authoritative routing identifiers.
+- If `push_name` is wrong or stale, Nanobot should still route history by phone/chat identifiers, not by the visible name.
+- Direct chats do not use name-only fallback for final routing or session ownership.
+- Group rows matched by `group_name` alone must still match the member phone before they are accepted.
 
-- `webCdpUrl`
-  - The Chrome debugger endpoint Nanobot probes and attaches to.
+### Client identity: `nanobot.session.client_key.ClientKey`
 
-- `webCdpChromePath`
-  - Optional explicit path to Chrome.
-  - Recommended on macOS if Chrome is not in a standard location.
+WhatsApp client data now flows through one normalized identity type:
 
-- `replyTargetsFile`
-  - The authoritative JSON file for direct and group reply targets.
+```python
+from nanobot.session.client_key import ClientKey
 
-## Startup Workflow
-
-This is the exact high-level workflow the current code follows.
-
-### Step 1. Start the gateway
-
-You run one of:
-
-```bash
-whatsapp-web-nanobot-gateway
+key = ClientKey.normalize("+852-6842-4658")
+key.phone        # "85268424658"
+key.session_key  # "whatsapp:85268424658"
 ```
 
-or:
+What this changes:
 
-```bash
-nanobot gateway
+- different phone formats now map to the same client deterministically
+- similar but different numbers stay isolated
+- API lookup, session lookup, prompt assembly, and memory storage all use the same normalized identifier
+
+### Per-client memory: `memory/{phone}/`
+
+Client-specific memory is no longer shared across the whole workspace.
+
+Current layout:
+
+```text
+memory/
+├── GLOBAL.md
+├── 85268424658/
+│   ├── MEMORY.md
+│   └── HISTORY.md
+└── 85295119020/
+    ├── MEMORY.md
+    └── HISTORY.md
 ```
 
-### Step 2. Gateway checks the Baileys auth session
+Rules:
 
-When the bridge starts, it checks `~/.nanobot/whatsapp-auth/creds.json`.
+- `memory/{phone}/MEMORY.md` stores long-term facts for one client only
+- `memory/{phone}/HISTORY.md` stores summarized history for that client only
+- [memory/GLOBAL.md](memory/GLOBAL.md) is shared operator-curated knowledge and is the only intended shared memory layer
+- the legacy top-level `memory/MEMORY.md` is only treated as fallback global knowledge before per-client memory dirs exist
 
-- If the auth session exists and is valid:
-  - the bridge reuses it,
-  - no QR appears.
+### Session bundles: `sessions/whatsapp__{phone}/`
 
-- If the auth session is missing, expired, or logged out:
-  - the bridge resets the stale Baileys auth state,
-  - the bridge prints a fresh QR code,
-  - you scan it from WhatsApp Linked Devices.
+Each contact now has a bundle directory with:
 
-This auth check is for Baileys only.
+- `meta.json` — readable summary and identity hints
+- `session.jsonl` — authoritative chat history
 
-### Step 3. Gateway rigorously checks whether a CDP WhatsApp Web browser exists
+The JSONL file still uses a metadata header on line 1, followed by one message turn per line.
 
-When `deliveryMode` is `draft` and `webBrowserMode` is `cdp`, the gateway probes the configured CDP endpoint before the bridge starts.
-
-It checks the endpoint using Chrome DevTools Protocol discovery, not just a blind assumption.
-
-- If a CDP browser already exists at `webCdpUrl`:
-  - Nanobot reuses that browser.
-  - If a `web.whatsapp.com` tab already exists there, the bridge uses it directly.
-  - If the browser exists but no WhatsApp tab exists yet, the bridge opens a new WhatsApp Web tab in that same browser.
-
-- If the CDP endpoint does not exist:
-  - Nanobot launches a new Chrome instance itself with remote debugging enabled,
-  - using the configured `webProfileDir`,
-  - and opens `https://web.whatsapp.com/`.
-
-The launch command is effectively built from:
-
-```bash
-<chrome> \
-  --remote-debugging-port=<port> \
-  --remote-debugging-address=<host> \
-  --user-data-dir=<webProfileDir> \
-  --no-first-run \
-  --no-default-browser-check \
-  --new-window \
-  https://web.whatsapp.com/
+```jsonl
+{"_type":"metadata","key":"whatsapp:85268424658","created_at":"2026-03-15T...","updated_at":"2026-03-30T..."}
+{"role":"client","content":"Hi, I'd like to know about dental plans","timestamp":"2026-03-30T10:00:00Z","message_id":"3EB0ABC..."}
+{"role":"me","content":"Sure! We have several dental plans...","timestamp":"2026-03-30T10:01:00Z","message_id":"ai_send_1234","is_ai_approved":true}
 ```
 
-If the browser was launched but WhatsApp Web is not logged in yet, the first scrape or draft operation waits for the page to become ready. You sign in in that browser window once, and the same browser profile can be reused later.
+| Field | Values | Description |
+|---|---|---|
+| `role` | `client` / `me` | `client` = them, `me` = agent. Mapped to `user`/`assistant` at the LLM boundary. |
+| `is_ai_approved` | bool | Present and `true` when the message was originally an AI draft that the agent approved and sent |
+| `message_id` | string | WhatsApp message ID for deduplication; `ai_send_*` prefix for sent drafts |
 
-If the CDP browser disappears later during the session, the bridge repeats the same attach-or-launch logic the next time it needs to scrape history or prepare a draft.
+### Filters and ownership boundaries
 
-Important separation:
+There are now several separate filter layers in the runtime, each with a different job:
 
-- Baileys auth and WhatsApp Web auth are different sessions.
-- Refreshing or re-linking Baileys does not, by itself, require clearing or re-linking the CDP WhatsApp Web browser profile.
-- If WhatsApp Web is logged out, you sign in again in the browser profile.
+| Layer | File(s) | What it filters |
+|---|---|---|
+| direct contact allowlist | [data/contacts/whatsapp.json](data/contacts/whatsapp.json), [nanobot/channels/whatsapp_contacts.py](nanobot/channels/whatsapp_contacts.py) | which direct senders are locally allowed |
+| group member allowlist | [data/whatsapp_groups.csv](data/whatsapp_groups.csv), [nanobot/channels/whatsapp_group_members.py](nanobot/channels/whatsapp_group_members.py) | which group/member combinations are allowed |
+| reply-target routing filter | [data/whatsapp_reply_targets.json](data/whatsapp_reply_targets.json), [nanobot/channels/whatsapp_reply_targets.py](nanobot/channels/whatsapp_reply_targets.py) | which chats are tracked, drafted, and auto-replied |
+| per-client session ownership | [sessions](sessions), [nanobot/session/client_key.py](nanobot/session/client_key.py), [nanobot/session/manager.py](nanobot/session/manager.py) | which session bundle belongs to which client |
+| history import guard | [nanobot/agent/loop.py](nanobot/agent/loop.py) | whether imported history can be written into a session |
+| privacy masking filter | [PRIVACY_PIPELINE.md](PRIVACY_PIPELINE.md), [nanobot/privacy](nanobot/privacy) | what text can leave the machine toward a cloud LLM |
 
-### Step 4. After Baileys connects, Nanobot ensures WhatsApp Web is ready
+These filters are complementary. The allowlists decide whether a chat is in scope; `ClientKey` and session guards decide where data is allowed to land.
 
-After Baileys is connected, Nanobot uses the detected or launched CDP browser and checks whether WhatsApp Web is actually logged in and ready.
+---
 
-- If WhatsApp Web is already ready in the reused browser:
-  - Nanobot proceeds immediately.
+## API Reference
 
-- If the browser exists but WhatsApp Web is not logged in yet:
-  - Nanobot waits for you to sign in in that browser profile,
-  - then continues once the page is ready.
+### REST Endpoints
 
-- If no browser existed and Nanobot launched one:
-  - you sign in in that browser if needed,
-  - then Nanobot continues once the page is ready.
+All endpoints served on `http://localhost:3456`. The Vite proxy exposes them to the frontend at `/api`.
 
-### Step 5. Nanobot syncs already stored direct-target history automatically
+| Method | Path | Body / Params | Description |
+|---|---|---|---|
+| POST | `/api/login` | `{ username, password }` | Connectivity check — always returns `{ status: "ok", gateway_ready: true }` |
+| GET | `/api/clients` | — | List all clients from reply targets |
+| GET | `/api/clients/{phone}` | — | Get a single client |
+| GET | `/api/messages/{phone}` | — | Get full message history for a client |
+| GET | `/api/journal` | `?limit=` | Get recent backend activity journal entries |
+| POST | `/api/journal` | `{ action, phone?, clientName?, details? }` | Append a manual journal entry |
+| DELETE | `/api/journal` | — | Clear the backend activity journal |
+| POST | `/api/messages/{phone}` | `{ content }` | Send a manual (non-AI) message |
+| POST | `/api/ai-draft/{phone}` | — | Generate AI draft (snapshot → LLM → rollback); returns `{ draft }` |
+| POST | `/api/ai-send/{phone}` | `{ content }` | Persist and send an approved AI draft |
+| PUT | `/api/auto-draft/{phone}` | `{ enabled }` | Toggle UI auto-draft for a client |
+| PUT | `/api/auto-reply/{phone}` | `{ enabled }` | Toggle backend autonomous auto-reply (no-UI mode) |
+| POST | `/api/broadcast` | `{ phones[], content }` | Send one message to multiple clients |
+| POST | `/api/sync/{phone}` | — | Trigger CDP WhatsApp Web history scrape for a client |
+| POST | `/api/bridge/check` | — | Fire an immediate one-shot CDP scrape-readiness check |
+| POST | `/api/bridge/restart` | — | Kill → rebuild → restart the bridge process (15 s timeout) |
+| GET | `/api/status` | — | Gateway status, session count, WS client count, browser severity |
 
-When the WhatsApp channel receives bridge status `connected`, it immediately triggers internal command `sync_direct_history`.
+### WebSocket Events
 
-That command does two things:
+Connect to `ws://localhost:3456/ws`. The Vite proxy exposes this at `ws://localhost:5173/ws`.
 
-1. replay any direct history already cached from Baileys, and
-2. ask the browser layer to scrape WhatsApp Web history for all enabled `direct_reply_targets` in `data/whatsapp_reply_targets.json`.
+| Event type | Direction | Key fields | Description |
+|---|---|---|---|
+| `new_message` | Server → Client | `phone`, `content`, `sender`, `timestamp`, `metadata` | A new inbound or outbound message for a client |
+| `journal_entry` | Server → Client | `entry` | New backend journal entry appended |
+| `journal_cleared` | Server → Client | — | Backend journal was cleared |
+| `ai_generating` | Server → Client | `phone`, `status` (`started`/`completed`/`error`), `content` | AI generation lifecycle notification |
+| `ai_draft` | Server → Client | `phone`, `content` | Manual ✨ AI draft completed — load into composer |
+| `auto_draft` | Server → Client | `phone`, `content` | Automatic draft (auto-draft toggle) — load into composer |
+| `whatsapp_browser_status` | Server → Client | `mode`, `reusable`, `message`, `severity` | Bridge or CDP scrape-readiness change — severity is `warning` (yellow, usually login/retry needed) or `error` (red, bridge restart needed) |
+| `auto_draft_changed` | Server → Client | `phone`, `enabled` | Auto-draft toggle state changed — update client card |
+| `pong` | Server → Client | — | WebSocket keepalive response; also emitted locally on connect |
 
-This startup sync happens whether or not you have sent a new self control message in the current session.
+The frontend sends `{ type: "ping" }` every 30 seconds as a keepalive. The server responds with `pong`.
 
-### Step 6. During the session, a new self message rewrites the routing JSON and re-syncs history
-
-If you send yourself a new self control message with an individuals block, Nanobot:
-
-1. captures the self-chat message,
-2. does not call the LLM for that message,
-3. parses the routing block,
-4. rewrites `data/whatsapp_reply_targets.json`,
-5. updates local contact/group cache files,
-6. triggers a scoped direct-history sync for the phones listed in that self message.
-
-So the startup sync covers already stored direct targets, and the self message updates the target list during runtime.
+---
 
 ## Self Control Message Format
 
-Nanobot listens for self-chat messages in this exact marker format:
+Configure reply targets by sending a WhatsApp message **to yourself** (your own number):
 
 ```text
 #chatbot reply to individuals#
@@ -280,512 +991,240 @@ Another Group, +85299990000
 #chatbot reply to groups#
 ```
 
-You can include both blocks in one self message:
-
-```text
-#chatbot reply to individuals#
-+85212345678
-+85255556666
-#chatbot reply to individuals#
-
-#chatbot reply to groups#
-Group Name, +85212345678
-Another Group, +85299990000
-#chatbot reply to groups#
-```
-
 Rules:
+- One phone number per line in the individuals block.
+- Group format: `Group Name, Phone Number` per line.
+- Sending a new individuals block **replaces** `direct_reply_targets` entirely and triggers a history re-sync for all new targets.
+- Sending a new groups block replaces `group_reply_targets`.
 
-- Only the latest block of each type inside that message is used.
-- Individuals block:
-  - one phone number per line.
-- Groups block:
-  - one line per target as `Group Name, Phone Number`.
-- Full-width comma `，` is accepted in the group block.
-- If an individuals block is present, `direct_reply_targets` is rewritten from it.
-- If a groups block is present, `group_reply_targets` is rewritten from it.
-- A new direct individuals block also triggers direct history re-sync for those phones.
-
-## How Replies Are Put Into The WhatsApp Web Message Box
-
-This is the draft-reply workflow for a direct chat.
-
-1. A direct inbound WhatsApp message arrives through Baileys.
-2. The bridge normalizes the message.
-3. The Python WhatsApp channel checks whether the sender is allowed.
-4. In `draft` mode, the sender must also be present and enabled in `direct_reply_targets`.
-5. Nanobot runs the agent and produces a final reply.
-6. Progress messages are suppressed for WhatsApp draft mode.
-7. Only the final reply is sent to the browser layer as a `prepare_draft` command.
-8. The browser layer opens the target direct chat.
-9. It finds the compose box in WhatsApp Web.
-10. It inserts the final reply into that box.
-11. It does not press Enter.
-
-Safety rules:
-
-- It inserts the final reply only once.
-- It never auto-sends.
-- If the compose box already contains a different unsent draft, Nanobot does not overwrite it.
-- If the chat cannot be opened, the bridge returns `chat_not_found`.
-- If WhatsApp Web is not logged in or not ready, the bridge returns `not_ready`.
-
-Important result:
-
-Nanobot helps you prepare the message, but the final send action is still manual.
-
-## Inbound Message Flows
-
-### Direct chat message
-
-For a normal direct chat:
-
-1. Baileys emits a live `notify` event.
-2. The bridge normalizes the message into a stable payload:
-   - `id`
-   - `sender`
-   - `pn`
-   - `content`
-   - `timestamp`
-   - `pushName`
-   - media paths if files were downloaded
-3. The Python WhatsApp channel:
-   - resolves phone and sender identifiers,
-   - updates local direct storage metadata,
-   - updates direct identification fields in `whatsapp_reply_targets.json`,
-   - checks contact allowlist,
-   - in `draft` mode, checks `direct_reply_targets`.
-
-Direct-chat behavior by mode:
-
-- `draft` mode
-  - sender must pass the direct contact allowlist,
-  - sender must also be an enabled direct reply target to trigger reply generation,
-  - if not a reply target, the message is still captured and stored as history but no LLM reply is produced.
-
-- `send` mode
-  - the legacy Baileys outbound path remains available,
-  - no draft insertion is used.
-
-### Self manual message
-
-A self-chat control message is treated specially.
-
-Behavior:
-
-- It is captured as a self-chat message.
-- It is marked `capture_only`.
-- It is stored in history.
-- The LLM is not called for it.
-- Its routing blocks can rewrite:
-  - `direct_reply_targets`
-  - `group_reply_targets`
-  - local contacts cache
-  - local group cache
-
-If the message contains an individuals block, Nanobot also re-syncs direct history for those phones.
-
-### Group chat message
-
-Current behavior depends on delivery mode.
-
-- In `draft` mode:
-  - all group inbound messages are ignored before agent processing.
-
-- In `send` mode:
-  - group traffic is matched against enabled `group_reply_targets` in `data/whatsapp_reply_targets.json`,
-  - matching uses group name or group id plus member phone or member id,
-  - only matching rows are allowed through.
-
-For matched group rows, Nanobot also updates group identification metadata and storage folders.
-
-## History Synchronization
-
-Nanobot uses two sources of historical direct-chat data:
-
-### 1. Baileys full-history sync
-
-The bridge enables Baileys full-history sync with a desktop browser profile.
-
-It consumes:
-
-- `messaging-history.set`
-- non-`notify` `messages.upsert`
-
-These historical messages are normalized and forwarded as `history` batches.
-
-### 2. WhatsApp Web history scraping
-
-The browser layer opens each enabled direct reply target in WhatsApp Web and scrapes visible history from the chat pane.
-
-It scrolls upward, collects message DOM nodes by `data-id`, extracts:
-
-- message id,
-- text content,
-- timestamp from WhatsApp meta text,
-- whether the message is from you,
-- push name when present.
-
-### How imported history is filtered
-
-Historical import only accepts direct chats that match enabled `direct_reply_targets`.
-
-Group history is not imported into the direct history pipeline.
-
-### How imported history is merged
-
-Imported messages:
-
-- are deduped by WhatsApp `message_id`,
-- are mapped into the direct session for the canonical phone,
-- are inserted into the session in chronological order,
-- keep both sides of the conversation,
-- refresh visible history exports after save.
-
-The direct session key is:
-
-```text
-whatsapp:<phone>
-```
-
-## Message Cleaning And Normalization
-
-### Identifier normalization
-
-The bridge and channel normalize several forms of WhatsApp identity:
-
-- old-style phone JID:
-  - `85212345678@s.whatsapp.net`
-- old-style c.us JID:
-  - `85212345678@c.us`
-- LID sender ids:
-  - kept as sender ids until a phone is known
-- `pn` values:
-  - cleaned to a normalized phone form
-
-### Media normalization
-
-Live inbound media is handled like this:
-
-- image without text:
-  - `[Image]`
-- document without text:
-  - `[Document]`
-- video without text:
-  - `[Video]`
-
-When media files are downloaded by the bridge, the Python side appends path tags to the message content:
-
-- `[image: /path/to/file]`
-- `[file: /path/to/file]`
-
-Voice messages are currently stored as a placeholder:
-
-```text
-[Voice Message: Transcription not available for WhatsApp yet]
-```
-
-Historical media scraping does not download files. It records placeholders from the WhatsApp Web DOM when necessary.
-
-### Deduplication
-
-- Live inbound direct messages are deduped in memory by recent message id.
-- Historical imports are deduped on disk by `message_id`.
+---
 
 ## Storage Layout
 
-There are three important storage layers.
+| Path | Contents |
+|---|---|
+| `data/whatsapp_reply_targets.json` | Authoritative routing config — which clients get replies, auto-draft settings |
+| `data/contacts/whatsapp.json` | Direct-message allowlist / local contact cache |
+| `data/whatsapp_groups.csv` | Group/member allowlist |
+| `sessions/whatsapp__{phone}/session.jsonl` | Per-client conversation history in JSONL format |
+| `sessions/whatsapp__{phone}/meta.json` | Per-client bundle summary and identity hints |
+| `memory/{phone}/MEMORY.md` | Per-client long-term memory |
+| `memory/{phone}/HISTORY.md` | Per-client summarized history log |
+| `memory/GLOBAL.md` | Shared operator-curated knowledge |
+| `state/activity_journal.jsonl` | Append-only backend activity journal shown in the frontend Logs panel |
+| `state/wechat-toggle.json` | Local toggle/state file used by the project runtime |
+| `whatsapp-auth/` | Baileys linked-device credentials (QR scan result) |
+| `whatsapp-web/` | Chrome user data profile for WhatsApp Web (CDP browser) |
+| `config.json` | Nanobot configuration (LLM keys, WhatsApp settings, tool config) |
+| `.cli-history` | CLI prompt history |
 
-### 1. Reply target state
+For deeper detail on the two most sensitive pipelines, see [ISOLATION.md](ISOLATION.md) and [PRIVACY_PIPELINE.md](PRIVACY_PIPELINE.md).
 
-File:
+---
 
-```text
-data/whatsapp_reply_targets.json
+## Installation
+
+### Prerequisites
+
+- Python 3.11+
+- Node.js 18+ and `npm`
+- Google Chrome (for WhatsApp Web CDP in `draft` mode)
+
+### Backend
+
+```bash
+git clone <repo-url>
+cd Nanobot-Whatsapp
+python3 -m pip install -e .
+python3 -m nanobot onboard        # creates config.json
 ```
 
-This is the authoritative routing state used by the WhatsApp channel.
+Edit `config.json` to add your LLM API key.
 
-Example shape:
+### Frontend
+
+```bash
+cd "Insurance frontend"
+npm install
+```
+
+### Docker
+
+The container setup is for the **Nanobot backend/gateway stack**. It does not start the React UI from [Insurance frontend](Insurance%20frontend).
+
+[Dockerfile](Dockerfile) builds a single image that:
+
+- installs Python dependencies
+- installs and builds the WhatsApp bridge from [bridge](bridge)
+- creates project-local runtime directories under `/app`
+- runs `nanobot` as the entrypoint
+
+Build the image:
+
+```bash
+docker build -t nanobot .
+```
+
+Check the container wiring with the default status command:
+
+```bash
+docker run --rm -it nanobot
+```
+
+Run the backend gateway directly:
+
+```bash
+docker run --rm -it \
+  -p 18790:18790 \
+  -v "$(pwd)/config.json:/app/config.json" \
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/sessions:/app/sessions" \
+  -v "$(pwd)/state:/app/state" \
+  -v "$(pwd)/memory:/app/memory" \
+  -v "$(pwd)/whatsapp-auth:/app/whatsapp-auth" \
+  -v "$(pwd)/whatsapp-web:/app/whatsapp-web" \
+  -v "$(pwd)/whatsapp-web-debug:/app/whatsapp-web-debug" \
+  -v "$(pwd)/skills:/app/skills" \
+  nanobot gateway
+```
+
+Important Docker notes:
+
+- There is **no** `~/.nanobot` bind mount anymore.
+- Runtime state is expected to come from this repo's folders and [config.json](config.json).
+- The container exposes port `18790` for `nanobot gateway`.
+- If you want the React operator UI, run it separately on the host from [Insurance frontend](Insurance%20frontend).
+
+### Docker Compose
+
+[docker-compose.yml](docker-compose.yml) provides two services:
+
+- `nanobot-gateway` — long-running backend service on port `18790`
+- `nanobot-cli` — ad-hoc CLI container behind the `cli` profile
+
+Start the gateway service:
+
+```bash
+docker compose up --build nanobot-gateway
+```
+
+Run a one-off CLI container:
+
+```bash
+docker compose run --rm nanobot-cli
+```
+
+Compose keeps runtime state project-local by mounting these host paths into `/app`:
+
+| Host path | Container path | Purpose |
+|---|---|---|
+| [config.json](config.json) | `/app/config.json` | active config |
+| [data](data) | `/app/data` | contacts, reply targets, imported data |
+| [sessions](sessions) | `/app/sessions` | session bundles |
+| [state](state) | `/app/state` | journal and runtime toggles |
+| [memory](memory) | `/app/memory` | memory files |
+| [whatsapp-auth](whatsapp-auth) | `/app/whatsapp-auth` | Baileys auth |
+| [whatsapp-web](whatsapp-web) | `/app/whatsapp-web` | Chrome WhatsApp profile |
+| [whatsapp-web-debug](whatsapp-web-debug) | `/app/whatsapp-web-debug` | debug browser state |
+| [skills](skills) | `/app/skills` | custom project skills |
+
+### Configuration
+
+`config.json` is project-local by default. Only explicit overrides via `NANOBOT_APP_CONFIG_PATH` or `NANOBOT_CONFIG_PATH` can point elsewhere. In Docker and Compose, [config.json](config.json) is bind-mounted to `/app/config.json`, so the container uses the same project-local configuration and runtime folders as the host checkout.
+
+Example `config.json`:
 
 ```json
 {
-  "version": 1,
-  "updated_at": "2026-03-21T12:00:00+00:00",
-  "source": "self_chat_command",
-  "direct_reply_targets": [
-    {
-      "phone": "85212345678",
-      "enabled": true,
-      "label": "",
-      "chat_id": "85212345678@s.whatsapp.net",
-      "sender_id": "85212345678@s.whatsapp.net",
-      "push_name": "Alice",
-      "last_seen_at": "2026-03-21T12:00:00+00:00"
+  "providers": {
+    "openrouter": {
+      "apiKey": "sk-or-v1-xxx"
     }
-  ],
-  "group_reply_targets": [
-    {
-      "group_name": "My Group",
-      "member_phone": "85299990000",
-      "enabled": true,
-      "group_id": "120363400000000000@g.us",
-      "member_id": "123456789@lid",
-      "member_label": "Bob",
-      "last_seen_at": "2026-03-21T12:00:00+00:00"
+  },
+  "agents": {
+    "defaults": {
+      "workspace": ".",
+      "model": "anthropic/claude-opus-4-5",
+      "provider": "openrouter"
     }
-  ]
+  },
+  "tools": {
+    "restrictToWorkspace": true
+  },
+  "channels": {
+    "whatsapp": {
+      "enabled": true,
+      "deliveryMode": "draft",
+      "bridgeUrl": "ws://localhost:3001",
+      "webBrowserMode": "cdp",
+      "webCdpUrl": "http://127.0.0.1:9222",
+      "webCdpChromePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "webProfileDir": "whatsapp-web",
+      "contactsFile": "data/contacts/whatsapp.json",
+      "replyTargetsFile": "data/whatsapp_reply_targets.json"
+    }
+  }
 }
 ```
 
-### 2. Canonical session files
+| Config key | Values | Description |
+|---|---|---|
+| `deliveryMode` | `draft` / `send` | `send` is the normal UI workflow: after the agent clicks send, Baileys sends the approved message. `draft` is a legacy/manual browser-compose mode. |
+| `agents.defaults.workspace` | `.` or repo-relative subdir | The agent workspace root. Keep it inside this repo. |
+| `tools.restrictToWorkspace` | `true` / `false` | When `true`, shell/tool access is restricted to the configured workspace directory. |
+| `webBrowserMode` | `cdp` | Use Chrome DevTools Protocol for history scraping and draft insertion. |
+| `webCdpUrl` | `http://127.0.0.1:9222` | Remote debugging endpoint for Chrome. |
+| `webCdpChromePath` | fs path | Chrome executable. Used only when launching Chrome from scratch. |
+| `webProfileDir` | `whatsapp-web` | Persistent Chrome profile. Keeps WhatsApp Web logged in between restarts. |
+| `contactsFile` | `data/contacts/whatsapp.json` | Local direct-contact store. Keep it repo-relative. |
+| `replyTargetsFile` | `data/whatsapp_reply_targets.json` | Routing config file path (relative to workspace). |
 
-Directory:
+---
 
-```text
-<workspace>/sessions/
-```
-
-For a direct chat, the canonical session file is usually:
-
-```text
-<workspace>/sessions/whatsapp_85212345678.jsonl
-```
-
-The first line is session metadata.
-
-Following lines are the actual stored messages.
-
-For WhatsApp sessions, stored roles are:
-
-- `client`
-- `me`
-
-Example:
-
-```json
-{"_type":"metadata","key":"whatsapp:85212345678","created_at":"2026-03-09T10:11:37.000000","updated_at":"2026-03-21T12:00:00.000000","metadata":{},"last_consolidated":0}
-{"role":"client","content":"Hi","timestamp":"2026-03-09T10:11:37.718083","message_id":"3EB0...","from_me":false}
-{"role":"me","content":"Hi Alice, how can I help?","timestamp":"2026-03-09T10:11:37.900000","message_id":"3A1A...","from_me":true}
-```
-
-Internally, Nanobot maps these back to model-standard roles only at the provider boundary:
-
-- `client -> user`
-- `me -> assistant`
-
-This keeps the stored history human-readable without breaking LLM provider APIs.
-
-### 3. Visible chat history exports
-
-Nanobot also writes human-readable exports under:
-
-```text
-Chathistories/
-```
-
-Direct WhatsApp bundles use phone-derived names when the phone is known:
-
-```text
-Chathistories/whatsapp__85212345678/
-```
-
-Each bundle contains:
-
-- `meta.json`
-  - session metadata and path to the source session file
-- `history.jsonl`
-  - visible chat history with `client` / `me`
-
-### 4. WhatsApp storage index
-
-Workspace directory:
-
-```text
-<workspace>/whatsapp-storage/
-```
-
-This provides per-contact and per-group folders for operational inspection.
-
-Direct example:
-
-```text
-<workspace>/whatsapp-storage/direct/alice__85212345678/
-```
-
-Contents:
-
-- `meta.json`
-- `history.jsonl`
-
-Group example:
-
-```text
-<workspace>/whatsapp-storage/groups/row-001__my-group__bob/
-```
-
-Contents:
-
-- `meta.json`
-- `history.jsonl` or `history.path.txt`
-
-## Sending Logic
-
-The outbound logic is intentionally simple.
-
-### In `draft` mode
-
-- progress updates are suppressed for WhatsApp,
-- only the final LLM reply is used,
-- the bridge receives `prepare_draft`,
-- the reply is placed into the WhatsApp Web compose box,
-- sending remains manual.
-
-### In `send` mode
-
-- the bridge receives `send`,
-- Baileys sends the message directly,
-- the draft/browser insertion path is bypassed.
-
-## Auth Sessions And What They Mean
-
-### Baileys auth
-
-Path:
-
-```text
-~/.nanobot/whatsapp-auth
-```
-
-Purpose:
-
-- linked-device auth for inbound WhatsApp events,
-- QR appears only when this session is missing or invalid.
-
-### WhatsApp Web CDP browser profile
-
-Path:
-
-```text
-~/.nanobot/whatsapp-web
-```
-
-Purpose:
-
-- WhatsApp Web login for:
-  - history scraping,
-  - draft insertion into the compose box.
-
-These sessions are separate.
-
-You can have:
-
-- valid Baileys auth but logged-out WhatsApp Web,
-- or valid WhatsApp Web but invalid Baileys auth.
-
-Refreshing or re-linking Baileys does not automatically require refreshing the CDP browser profile.
-
-In normal operation:
-
-- if Baileys auth becomes invalid:
-  - the gateway re-links Baileys and shows a fresh QR code,
-  - the existing WhatsApp Web browser profile can still remain usable.
-
-- if the CDP browser profile is logged out:
-  - you sign in again in WhatsApp Web,
-  - the Baileys auth session can still remain usable.
-
-Both matter in `draft` mode.
-
-## Recommended Daily Usage
-
-### First-time setup
-
-1. Install the repo in editable mode.
-2. Configure `~/.nanobot/config.json`.
-3. Run:
+## Quick Start
 
 ```bash
-nanobot channels whatsapp-web
+# Terminal 1: gateway (WhatsApp + AI + API server)
+cd Nanobot-Whatsapp
+python3 -m nanobot gateway
+
+# Terminal 2: frontend (React UI)
+python3 -m nanobot ui
 ```
 
-4. In the opened Chrome window, log in to WhatsApp Web.
-5. Run:
+Open `http://localhost:5173`, enter any username and password, and you're live.
 
-```bash
-whatsapp-web-nanobot-gateway
-```
-
-6. If Baileys asks for a QR, scan it.
-7. Send yourself a control message to define direct reply targets.
-
-### Normal daily usage
-
-If both sessions are still valid, usually you only need:
-
-```bash
-whatsapp-web-nanobot-gateway
-```
-
-The gateway will:
-
-- reuse Baileys auth if possible,
-- reuse the existing CDP browser if possible,
-- otherwise launch a new debuggable Chrome,
-- sync history for already stored direct reply targets,
-- wait for new inbound traffic.
+---
 
 ## Troubleshooting
 
-### No Baileys QR appears
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| No QR code in terminal | Baileys auth is still valid | Expected — `connected` will appear. No action needed. |
+| `whatsapp_web_login_required` on sync | WhatsApp Web session is not logged in for scraping | Open the CDP browser, sign in to `web.whatsapp.com`, then click sync again. |
+| Message received but no reply | UI is connected → capture-only mode | Expected. AI drafts go to the composer, not direct WhatsApp. |
+| Draft not appearing in composer | `auto_draft` is `false` for this client | Turn on the blue toggle in the sidebar, or click ✨ AI manually. |
+| `cdp_launch_failed` on sync | Chrome could not be attached/launched for scraping | Verify Chrome exists at `webCdpChromePath`, then retry sync. |
+| Frontend shows "演示模式" | Backend is unreachable | Verify `python3 -m nanobot gateway` is running on port 3456. |
+| `sessions/` is empty | No history sync has run | Send yourself the `#chatbot reply to individuals#` message, or trigger manual sync from the UI. |
+| AI draft is slow | LLM API latency or long conversation | Expected for long contexts. Progress is indicated by the `ai_generating` thinking spinner. |
 
-That usually means the existing Baileys auth session is still valid.
-
-No QR is expected in that case.
-
-If the saved Baileys auth is detected as invalid or logged out, the bridge now clears the stale Baileys auth state and requests a fresh QR automatically.
-
-### WhatsApp Web does not seem to be reused
-
-Nanobot only reuses a browser that is available through the configured CDP endpoint.
-
-A normal Chrome window that was not started with remote debugging is not considered a reusable CDP browser.
-
-### The browser opens but history scrape or draft says `not_ready`
-
-That usually means WhatsApp Web is not logged in yet in the CDP browser profile.
-
-Log in in that browser window and retry.
-
-This does not necessarily mean Baileys auth is invalid.
-
-### A direct message was stored but did not trigger a reply
-
-In `draft` mode, that usually means one of these is true:
-
-- the sender was not allowed by contacts or `allowFrom`,
-- the sender was not in enabled `direct_reply_targets`,
-- the message was a self-chat command,
-- the message was a group chat.
-
-### The reply was not inserted because the compose box was busy
-
-Nanobot will not overwrite a different unsent draft already present in the WhatsApp Web message box.
-
-Clear the compose box manually, then retry.
+---
 
 ## Summary
 
-The working model is:
+```
+python3 -m nanobot gateway   ←  WhatsApp + LLM + API, port 3456
+python3 -m nanobot ui        ←  UI at port 5173, proxies to 3456
 
-1. `whatsapp-web-nanobot-gateway` starts the gateway.
-2. Baileys auth is checked first and reused or re-linked with QR.
-3. The CDP browser is then rigorously detected and reused if present.
-4. If no CDP browser exists, Nanobot launches one and opens WhatsApp Web.
-5. Nanobot ensures WhatsApp Web is logged in and ready in that browser before web tasks proceed.
-6. Startup history sync runs for already stored enabled `direct_reply_targets`, regardless of whether you sent a new self message in the current session.
-7. A new self message can rewrite the target JSON and trigger scoped history updates during runtime.
-8. Baileys auth and WhatsApp Web auth remain separate; refreshing one does not automatically require refreshing the other.
-9. Direct reply-target messages generate a final reply that is pasted into the WhatsApp Web message box and left unsent.
+Login → connects WS → MessageBus enters capture-only mode
+Client texts WhatsApp → Baileys → MessageBus → ApiServer
+  → new_message WS event (UI thread updates instantly)
+  → if auto_draft ON → agent.process_direct() + snapshot rollback
+  → auto_draft WS event → composer textarea fills with AI text
+Agent edits → Cmd+Enter
+  → POST /api/ai-send → JSONL persisted + OutboundMessage → WhatsApp
+  → new_message WS event (sent bubble appears in UI)
+```
 
-That is the current default WhatsApp workflow in this repository.
+The core invariant: **nothing is sent to WhatsApp without the agent pressing the send button.** The AI generates and suggests; the human approves and sends.

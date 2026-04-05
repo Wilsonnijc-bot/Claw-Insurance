@@ -4,6 +4,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from nanobot.utils.paths import confine_path, project_root
+
 
 def detect_image_mime(data: bytes) -> str | None:
     """Detect image MIME type from magic bytes, ignoring file extension."""
@@ -25,13 +27,25 @@ def ensure_dir(path: Path) -> Path:
 
 
 def get_data_path() -> Path:
-    """~/.nanobot data directory."""
-    return ensure_dir(Path.home() / ".nanobot")
+    """Project-local data directory."""
+    return ensure_dir(project_root())
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:
-    """Resolve and ensure workspace path. Defaults to ~/.nanobot/workspace."""
-    path = Path(workspace).expanduser() if workspace else Path.home() / ".nanobot" / "workspace"
+    """Resolve and ensure workspace path. Defaults to the project root.
+
+    Workspace must resolve inside the project root (path confinement).
+    The legacy ``expanduser()`` call has been removed — tilde is no longer
+    expanded so paths cannot silently escape to the home directory.
+    """
+    if workspace:
+        path = Path(workspace)
+        if not path.is_absolute():
+            path = project_root() / path
+        # Enforce confinement — workspace cannot escape the project tree
+        path = confine_path(path)
+    else:
+        path = project_root()
     return ensure_dir(path)
 
 
@@ -45,6 +59,32 @@ _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 def safe_filename(name: str) -> str:
     """Replace unsafe path characters with underscores."""
     return _UNSAFE_CHARS.sub("_", name).strip()
+
+
+def readable_session_bundle_name(key: str) -> str:
+    """Return a normalized readable bundle folder name for a session key."""
+    text = str(key or "").strip()
+    if not text:
+        return "session__unknown"
+
+    if not text.startswith("whatsapp:"):
+        return safe_filename(text.replace(":", "__"))
+
+    parts = text.split(":")
+    if len(parts) == 2:
+        identity = str(parts[1] or "").strip()
+        digits = "".join(ch for ch in identity if ch.isdigit())
+        if digits:
+            return safe_filename(f"whatsapp__{digits}")
+        return safe_filename(text.replace(":", "__"))
+
+    if len(parts) == 3:
+        group_id = str(parts[1] or "").strip()
+        member_identity = str(parts[2] or "").strip()
+        member_digits = "".join(ch for ch in member_identity if ch.isdigit())
+        return safe_filename(f"whatsapp__{group_id}__{member_digits or member_identity}")
+
+    return safe_filename(text.replace(":", "__"))
 
 
 def split_message(content: str, max_len: int = 2000) -> list[str]:
@@ -101,7 +141,9 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     for item in tpl.iterdir():
         if item.name.endswith(".md"):
             _write(item, workspace / item.name)
-    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
+    # Per-client memory dirs are created on-demand by MemoryStore.
+    # Only create the global knowledge file placeholder here.
+    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "GLOBAL.md")
     _write(None, workspace / "memory" / "HISTORY.md")
     (workspace / "skills").mkdir(exist_ok=True)
 

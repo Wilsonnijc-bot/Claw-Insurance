@@ -23,9 +23,9 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
-from nanobot.bus.events import InboundHistoryBatch, InboundMessage, OutboundMessage
+from nanobot.bus.events import HistoryImportResult, InboundHistoryBatch, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.privacy.sanitizer import TextPrivacySanitizer
+from nanobot.privacy.sanitizer import TextPrivacySanitizer, load_known_names
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import (
     Session,
@@ -201,7 +201,9 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
-        self.context = ContextBuilder(workspace)
+        self._known_names = load_known_names(workspace)
+        # Legacy fallback context (no client scoping) for non-WhatsApp sessions.
+        self.context = ContextBuilder(workspace, known_names=self._known_names)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -231,9 +233,31 @@ class AgentLoop:
         self._project_root = Path(__file__).resolve().parents[2]
         self._test_words_dir = self._project_root / "test_words"
         self._test_counter_file = self._test_words_dir / ".counter"
-        self._privacy_sanitizer = TextPrivacySanitizer(privacy_config or PrivacyGatewayConfig())
+        # Privacy pipeline companion path:
+        # AgentLoop writes local raw/sanitized snapshots for inspection using
+        # the same deterministic sanitizer that protects cloud-bound payloads.
+        self._privacy_sanitizer = TextPrivacySanitizer(
+            privacy_config or PrivacyGatewayConfig(),
+            known_names=load_known_names(workspace),
+        )
         self._ensure_test_words_dir()
         self._register_default_tools()
+
+    def _context_for_session(self, session_key: str) -> ContextBuilder:
+        """Return a ContextBuilder scoped to the client owning *session_key*.
+
+        For WhatsApp sessions the builder carries a per-client
+        :class:`MemoryStore` so that only that client's memory (plus the
+        optional global knowledge file) is injected into the prompt.
+
+        Non-WhatsApp sessions fall back to the unscoped builder.
+        """
+        from nanobot.session.client_key import ClientKey
+        try:
+            client_key = ClientKey.from_session_key(session_key)
+        except ValueError:
+            return self.context  # fallback for CLI / non-WA sessions
+        return ContextBuilder(self.workspace, client_key=client_key, known_names=self._known_names)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -259,8 +283,12 @@ class AgentLoop:
         if not self._test_counter_file.exists():
             self._test_counter_file.write_text("0\n", encoding="utf-8")
 
-    def _next_test_file_paths(self) -> tuple[Path, Path]:
-        """Return the next sequential raw+sanitized test_words file paths."""
+    def _next_test_file_paths(self, *, client_tag: str = "") -> tuple[Path, Path]:
+        """Return the next sequential raw+sanitized test_words file paths.
+
+        When *client_tag* is provided the phone is embedded in the filename
+        so that debug artefacts are visibly scoped to one client.
+        """
         try:
             raw = self._test_counter_file.read_text(encoding="utf-8").strip()
             current = int(raw) if raw else 0
@@ -268,8 +296,9 @@ class AgentLoop:
             current = 0
         next_index = current + 1
         self._test_counter_file.write_text(f"{next_index}\n", encoding="utf-8")
-        raw_path = self._test_words_dir / f"test_{next_index:05d}.txt"
-        sanitized_path = self._test_words_dir / f"test_{next_index:05d}_sanitized.txt"
+        tag = f"_{client_tag}" if client_tag else ""
+        raw_path = self._test_words_dir / f"test_{next_index:05d}{tag}.txt"
+        sanitized_path = self._test_words_dir / f"test_{next_index:05d}{tag}_sanitized.txt"
         return raw_path, sanitized_path
 
     @staticmethod
@@ -340,12 +369,24 @@ class AgentLoop:
             return
 
         try:
-            out_raw, out_sanitized = self._next_test_file_paths()
+            # Read per-client memory when possible; fall back to legacy global files.
+            from nanobot.session.client_key import ClientKey
+            client_key = ClientKey.try_normalize(
+                session_key.split(":", 1)[1] if ":" in session_key else session_key
+            )
+            client_tag = client_key.phone if client_key else ""
+            out_raw, out_sanitized = self._next_test_file_paths(client_tag=client_tag)
             generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S (%A) (%Z)")
             system_prompt = self._stringify_message_content(initial_messages[0].get("content", ""))
             user_payload = initial_messages[-1].get("content", "")
-            memory_file = self.workspace / "memory" / "MEMORY.md"
-            history_file = self.workspace / "memory" / "HISTORY.md"
+            if client_key:
+                per_client_mem = client_key.memory_dir(self.workspace) / "MEMORY.md"
+                per_client_hist = client_key.memory_dir(self.workspace) / "HISTORY.md"
+            else:
+                per_client_mem = None
+                per_client_hist = None
+            memory_file = per_client_mem if (per_client_mem and per_client_mem.exists()) else self.workspace / "memory" / "MEMORY.md"
+            history_file = per_client_hist if (per_client_hist and per_client_hist.exists()) else self.workspace / "memory" / "HISTORY.md"
             memory_text = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
             history_text = history_file.read_text(encoding="utf-8") if history_file.exists() else ""
 
@@ -360,8 +401,12 @@ class AgentLoop:
                 history_text=history_text,
                 user_payload=str(user_payload),
             )
+            # Local-only artifact: raw snapshot before privacy masking.
             out_raw.write_text(raw_text, encoding="utf-8")
 
+            # Privacy pipeline debug companion:
+            # sanitize the same turn snapshot so test_words/ can show a raw vs
+            # sanitized comparison using the identical masking rules.
             sanitized_result = self._privacy_sanitizer.sanitize_chat_payload(
                 {"messages": initial_messages},
                 headers={"x-session-affinity": session_key},
@@ -397,6 +442,7 @@ class AgentLoop:
                     "placeholder_map": sanitized_result.placeholder_map,
                 },
             )
+            # Local-only artifact: sanitized snapshot with placeholder metadata.
             out_sanitized.write_text(sanitized_text, encoding="utf-8")
         except Exception:
             logger.exception("Failed to write test_words snapshot")
@@ -442,10 +488,8 @@ class AgentLoop:
 
         try:
             stats = apply_self_routing_instruction(
-                workspace=self.workspace,
                 contacts_file=wa_cfg.contacts_file,
                 group_members_file=wa_cfg.group_members_file,
-                storage_dir=wa_cfg.storage_dir,
                 instruction=instruction,
             )
             targets_file = reply_targets_path(wa_cfg.reply_targets_file, self._project_root)
@@ -782,16 +826,19 @@ class AgentLoop:
 
         missing_fields = []
         no_fit_completed = False
+        catalog_unavailable = False
         if isinstance(find_result, dict):
             missing_fields = find_result.get("missing_fields") or []
+            catalog_unavailable = bool(find_result.get("catalog_unavailable"))
             candidates = find_result.get("candidates") or []
-            no_fit_completed = not missing_fields and not candidates
+            no_fit_completed = not catalog_unavailable and not missing_fields and not candidates
 
         research_completed = isinstance(research_result, dict) and "candidates" in research_result
         return {
             "find_products_used": find_result is not None,
             "research_products_used": research_result is not None,
             "missing_fields": missing_fields,
+            "catalog_unavailable": catalog_unavailable,
             "no_fit_completed": no_fit_completed,
             "research_completed": research_completed,
         }
@@ -1006,7 +1053,9 @@ class AgentLoop:
         """Process a historical import batch under the global lock."""
         async with self._processing_lock:
             try:
-                self._import_history_batch(batch)
+                result = self._import_history_batch(batch)
+                if result is not None:
+                    await self.bus.publish_history_result(result)
             except Exception:
                 logger.exception("Error importing historical batch for {}", batch.channel)
 
@@ -1030,35 +1079,33 @@ class AgentLoop:
         self._refresh_whatsapp_history_exports(session)
 
     def _refresh_whatsapp_history_exports(self, session: Session) -> None:
-        """Refresh materialized WhatsApp direct-chat exports after a save."""
-        if not session.key.startswith("whatsapp:") or session.key.count(":") != 1:
+        """Deprecated hook retained after consolidating WhatsApp data into session bundles."""
+        _ = session
+
+    def _import_history_batch(self, batch: InboundHistoryBatch) -> HistoryImportResult | None:
+        """Silently merge a historical batch into canonical session files."""
+        if batch.channel != "whatsapp":
             return
-        wa_cfg = getattr(self.channels_config, "whatsapp", None) if self.channels_config else None
-        if wa_cfg is None:
-            return
+
+        request_id = str(batch.metadata.get("request_id", "") or "").strip()
+        if not batch.entries:
+            if request_id:
+                return HistoryImportResult(
+                    channel=batch.channel,
+                    matched_entries=0,
+                    imported_entries=0,
+                    phones=[],
+                    metadata=dict(batch.metadata or {}),
+                )
+            return None
 
         from nanobot.channels.whatsapp_contacts import normalize_contact_id
-        from nanobot.channels.whatsapp_storage import refresh_direct_history_exports, storage_path
-
-        phone = normalize_contact_id(session.key.split(":", 1)[1])
-        if not phone:
-            return
-
-        try:
-            refresh_direct_history_exports(
-                storage_path(wa_cfg.storage_dir, self.workspace),
-                self.workspace,
-                phone=phone,
-            )
-        except Exception:
-            logger.exception("Failed to refresh WhatsApp direct history exports for {}", session.key)
-
-    def _import_history_batch(self, batch: InboundHistoryBatch) -> None:
-        """Silently merge a historical batch into canonical session files."""
-        if batch.channel != "whatsapp" or not batch.entries:
-            return
+        from nanobot.session.client_key import ClientKey, CrossClientError
 
         touched: dict[str, dict[str, Any]] = {}
+        matched_entries = 0
+        imported_entries = 0
+        phones_seen: set[str] = set()
         for raw in batch.entries:
             if not isinstance(raw, dict):
                 continue
@@ -1069,6 +1116,46 @@ class AgentLoop:
             phone = str(raw.get("phone", "") or "").strip()
             if not session_key or not message_id:
                 continue
+
+            # --- Per-client isolation guard (hardened) ---
+            # Require a non-empty phone on history entries so that an
+            # attacker/bug cannot bypass the guard by omitting the field.
+            if not phone:
+                logger.warning(
+                    "Skipping history entry {} — missing phone field (session {})",
+                    message_id, session_key,
+                )
+                continue
+
+            # Normalise both sides to digits-only before comparing so that
+            # formatting differences (+852-xxx vs 852xxx) never produce
+            # false matches or false rejections.
+            phone_norm = normalize_contact_id(phone)
+            session_phone_raw = session_key.split(":", 1)[1] if ":" in session_key else ""
+            session_phone_norm = normalize_contact_id(session_phone_raw)
+
+            if phone_norm and session_phone_norm and phone_norm != session_phone_norm:
+                logger.warning(
+                    "Skipping history entry {} — phone {} does not match session {}",
+                    message_id, phone, session_key,
+                )
+                continue
+
+            # Belt-and-suspenders: ClientKey assertion
+            try:
+                entry_key = ClientKey.normalize(phone)
+                session_client = ClientKey.from_session_key(session_key)
+                ClientKey.assert_same_client(entry_key, session_client)
+            except (ValueError, CrossClientError) as exc:
+                logger.warning(
+                    "Skipping history entry {} — client key mismatch: {}",
+                    message_id, exc,
+                )
+                continue
+
+            matched_entries += 1
+            if phone_norm:
+                phones_seen.add(phone_norm)
 
             bucket = touched.setdefault(
                 session_key,
@@ -1108,6 +1195,7 @@ class AgentLoop:
                 "from_me": bool(raw.get("from_me", False)),
             }
             bucket["imports"].append(entry)
+            imported_entries += 1
             existing_ids.add(message_id)
 
             entry_dt = self._history_sort_value(timestamp_iso)
@@ -1127,6 +1215,14 @@ class AgentLoop:
             session.updated_at = datetime.now()
             self._save_session(session)
             logger.info("Imported {} WhatsApp history messages into {}", len(imports), session_key)
+
+        return HistoryImportResult(
+            channel=batch.channel,
+            matched_entries=matched_entries,
+            imported_entries=imported_entries,
+            phones=sorted(phones_seen),
+            metadata=dict(batch.metadata or {}),
+        )
 
     def _merge_history_entries(self, existing: list[dict[str, Any]], imports: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Insert historical imports by timestamp without disturbing existing relative order."""
@@ -1213,7 +1309,7 @@ class AgentLoop:
                 max_messages=None if self._use_full_whatsapp_history_for_prompt(channel, key) else self.memory_window,
                 include_consolidated=self._use_full_whatsapp_history_for_prompt(channel, key),
             )
-            messages = self.context.build_messages(
+            messages = self._context_for_session(key).build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id, metadata=msg.metadata,
             )
@@ -1256,6 +1352,13 @@ class AgentLoop:
                 sender_id=msg.sender_id,
                 chat_id=msg.chat_id,
                 message_id=msg.metadata.get("message_id"),
+                sender=str(msg.metadata.get("sender") or msg.chat_id or ""),
+                sender_phone=str(msg.metadata.get("sender_phone") or msg.metadata.get("pn") or ""),
+                sender_name=str(msg.metadata.get("sender_name") or msg.metadata.get("push_name") or ""),
+                push_name=str(msg.metadata.get("push_name") or msg.metadata.get("sender_name") or ""),
+                reply_target_label=str(msg.metadata.get("reply_target_label") or ""),
+                reply_target_push_name=str(msg.metadata.get("reply_target_push_name") or ""),
+                from_me=bool(msg.metadata.get("is_self_chat")),
             )
             self._save_session(session)
             logger.info("Captured message without reply for {}:{} (capture_only)", msg.channel, msg.sender_id)
@@ -1341,7 +1444,7 @@ class AgentLoop:
             max_messages=None if use_full_history else self.memory_window,
             include_consolidated=use_full_history,
         )
-        initial_messages = self.context.build_messages(
+        initial_messages = self._context_for_session(session.key).build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
@@ -1437,8 +1540,17 @@ class AgentLoop:
         session.updated_at = datetime.now()
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
-        """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
+        """Delegate to a per-client MemoryStore.consolidate(). Returns True on success."""
+        from nanobot.session.client_key import ClientKey
+        try:
+            client_key = ClientKey.from_session_key(session.key)
+        except ValueError:
+            # Non-WhatsApp sessions (e.g. "cli:direct") — use a synthetic key
+            client_key = ClientKey.try_normalize(session.key.split(":", 1)[-1]) if ":" in session.key else None
+            if client_key is None:
+                logger.warning("Cannot derive ClientKey for session {}, skipping consolidation", session.key)
+                return True
+        return await MemoryStore(self.workspace, client_key).consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )

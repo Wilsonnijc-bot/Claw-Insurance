@@ -447,7 +447,7 @@ export class WhatsAppClient {
 
   private async downloadMedia(msg: any, mimetype?: string, fileName?: string): Promise<string | null> {
     try {
-      const mediaDir = join(homedir(), '.nanobot', 'media');
+      const mediaDir = join(process.cwd(), 'media');
       await mkdir(mediaDir, { recursive: true });
 
       const buffer = await downloadMediaMessage(msg, 'buffer', {}) as Buffer;

@@ -1,4 +1,12 @@
-"""Memory system for persistent agent memory."""
+"""Memory system for persistent agent memory.
+
+Per-client isolation invariant:
+    Each ``MemoryStore`` is scoped to exactly one client (identified by a
+    ``ClientKey``).  Consolidation writes to ``memory/<phone>/MEMORY.md``
+    and ``memory/<phone>/HISTORY.md``.  A separate *global* knowledge file
+    at ``memory/GLOBAL.md`` is operator-curated and never auto-populated
+    from client conversations.
+"""
 
 from __future__ import annotations
 
@@ -8,12 +16,15 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from nanobot.session.client_key import ClientKey
 from nanobot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session
 
+# Path to the operator-curated global knowledge base (never auto-written).
+_GLOBAL_KNOWLEDGE_FILENAME = "GLOBAL.md"
 
 _SAVE_MEMORY_TOOL = [
     {
@@ -42,11 +53,36 @@ _SAVE_MEMORY_TOOL = [
 ]
 
 
-class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+def _read_global_knowledge(workspace: Path) -> str:
+    """Read the optional operator-curated global knowledge file."""
+    gk = workspace / "memory" / _GLOBAL_KNOWLEDGE_FILENAME
+    if gk.exists():
+        return gk.read_text(encoding="utf-8")
+    # Backwards-compat: if legacy memory/MEMORY.md exists but no per-client
+    # dirs have been created yet, treat it as the global file.
+    legacy = workspace / "memory" / "MEMORY.md"
+    if legacy.exists():
+        # Only treat as global if there are no per-client memory dirs yet.
+        memory_root = workspace / "memory"
+        has_client_dirs = any(
+            p.is_dir() and p.name.isdigit()
+            for p in memory_root.iterdir()
+        ) if memory_root.exists() else False
+        if not has_client_dirs:
+            return legacy.read_text(encoding="utf-8")
+    return ""
 
-    def __init__(self, workspace: Path):
-        self.memory_dir = ensure_dir(workspace / "memory")
+
+class MemoryStore:
+    """Two-layer per-client memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log).
+
+    Each instance is bound to a single :class:`ClientKey`.
+    """
+
+    def __init__(self, workspace: Path, client_key: ClientKey):
+        self.workspace = workspace
+        self.client_key = client_key
+        self.memory_dir = ensure_dir(client_key.memory_dir(workspace))
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
 
@@ -63,8 +99,14 @@ class MemoryStore:
             f.write(entry.rstrip() + "\n\n")
 
     def get_memory_context(self) -> str:
+        parts: list[str] = []
         long_term = self.read_long_term()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        if long_term:
+            parts.append(f"## Client Memory\n{long_term}")
+        global_knowledge = _read_global_knowledge(self.workspace)
+        if global_knowledge:
+            parts.append(f"## Global Knowledge\n{global_knowledge}")
+        return "\n\n".join(parts)
 
     async def consolidate(
         self,
@@ -75,10 +117,17 @@ class MemoryStore:
         archive_all: bool = False,
         memory_window: int = 50,
     ) -> bool:
-        """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
+        """Consolidate old messages into per-client MEMORY.md + HISTORY.md via LLM tool call.
 
         Returns True on success (including no-op), False on failure.
+
+        Raises :class:`CrossClientError` when the session does not belong to
+        this store's client.
         """
+        # --- Per-client isolation guard ---
+        if session.key.startswith("whatsapp:"):
+            session_client = ClientKey.from_session_key(session.key)
+            ClientKey.assert_same_client(self.client_key, session_client)
         if archive_all:
             old_messages = session.messages
             keep_count = 0

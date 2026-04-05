@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import csv
+import os
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Protocol
+from urllib.parse import quote
+
+import httpx
+
+from nanobot.config.loader import load_config
+
+
+_CANONICAL_FIELDS = (
+    "plan_id",
+    "plan_name",
+    "provider_company",
+    "plan_category",
+    "coverage_description",
+    "pricing",
+    "age",
+    "customer_requirement",
+    "price_structure",
+    "additional_informations",
+    "product_brochure_route",
+    "url",
+)
+
+_DEFAULT_CACHE_TTL_SECONDS = 300
+_DEFAULT_PAGE_SIZE = 1000
+
+
+def normalize_header(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def normalize_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _normalize_row(mapping: dict[str, Any], *, source_file: str) -> dict[str, Any]:
+    normalized = {
+        normalize_header(str(key)): normalize_text(value)
+        for key, value in mapping.items()
+    }
+    normalized.setdefault("additional_informations", normalized.get("additional_info", ""))
+    row = {field: normalized.get(field, "") for field in _CANONICAL_FIELDS}
+    row["source_file"] = source_file
+    return row
+
+
+@dataclass(frozen=True)
+class CatalogSettings:
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_catalog_table: str = ""
+    supabase_catalog_tables: tuple[str, ...] = ()
+    cache_ttl_seconds: int = _DEFAULT_CACHE_TTL_SECONDS
+
+
+@dataclass
+class _CacheEntry:
+    rows: list[dict[str, Any]]
+    expires_at: float
+
+
+class CatalogUnavailableError(RuntimeError):
+    """Raised when the product catalog cannot be loaded."""
+
+
+class CatalogRepository(Protocol):
+    def get_rows(self) -> list[dict[str, Any]]:
+        """Return normalized catalog rows."""
+
+
+_CACHE: dict[tuple[str, str], _CacheEntry] = {}
+
+
+def clear_catalog_cache() -> None:
+    _CACHE.clear()
+
+
+def load_catalog_settings() -> CatalogSettings:
+    config = load_config()
+    configured = config.catalog.model_dump() if getattr(config, "catalog", None) else {}
+
+    def _pick(*keys: str, default: str = "") -> str:
+        for key in keys:
+            value = os.environ.get(key)
+            if value:
+                return value.strip()
+        return str(configured.get(default, "")).strip() if default else ""
+
+    raw_ttl = (
+        os.environ.get("CATALOG__CACHE_TTL_SECONDS")
+        or os.environ.get("SUPABASE_CACHE_TTL_SECONDS")
+        or configured.get("cache_ttl_seconds", _DEFAULT_CACHE_TTL_SECONDS)
+    )
+    try:
+        ttl = max(int(raw_ttl), 0)
+    except (TypeError, ValueError):
+        ttl = _DEFAULT_CACHE_TTL_SECONDS
+
+    raw_tables = (
+        os.environ.get("CATALOG__SUPABASE_CATALOG_TABLES")
+        or os.environ.get("SUPABASE_CATALOG_TABLES")
+        or configured.get("supabase_catalog_tables", [])
+    )
+    tables: list[str]
+    if isinstance(raw_tables, str):
+        tables = [item.strip() for item in raw_tables.split(",") if item.strip()]
+    elif isinstance(raw_tables, list):
+        tables = [str(item).strip() for item in raw_tables if str(item).strip()]
+    else:
+        tables = []
+
+    single_table = _pick(
+        "CATALOG__SUPABASE_CATALOG_TABLE",
+        "SUPABASE_CATALOG_TABLE",
+        default="supabase_catalog_table",
+    )
+    if single_table:
+        tables = [single_table]
+    if not tables:
+        tables = ["insurance_products", "dental_insurance"]
+
+    return CatalogSettings(
+        supabase_url=_pick("CATALOG__SUPABASE_URL", "SUPABASE_URL", default="supabase_url"),
+        supabase_anon_key=_pick(
+            "CATALOG__SUPABASE_ANON_KEY",
+            "SUPABASE_ANON_KEY",
+            "SUPABASE_KEY",
+            default="supabase_anon_key",
+        ),
+        supabase_catalog_table=single_table,
+        supabase_catalog_tables=tuple(tables),
+        cache_ttl_seconds=ttl,
+    )
+
+
+def get_default_catalog_repository() -> CatalogRepository:
+    return SupabaseCatalogRepository(load_catalog_settings())
+
+
+class StaticCatalogRepository:
+    """Simple in-memory repository for tests."""
+
+    def __init__(self, rows: list[dict[str, Any]], source_file: str = "supabase") -> None:
+        self._rows = [_normalize_row(row, source_file=source_file) for row in rows]
+
+    def get_rows(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._rows]
+
+
+class CsvCatalogRepository:
+    """CSV-backed repository used only for tests/dev overrides."""
+
+    def __init__(self, paths: list[Path]) -> None:
+        self._paths = list(paths)
+
+    def get_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for path in self._paths:
+            with path.open(newline="", encoding="utf-8-sig") as handle:
+                reader = csv.DictReader(handle)
+                for raw in reader:
+                    rows.append(_normalize_row(raw, source_file=path.name))
+        return rows
+
+
+class SupabaseCatalogRepository:
+    """Read-only Supabase-backed product catalog with a small in-process cache."""
+
+    def __init__(
+        self,
+        settings: CatalogSettings,
+        *,
+        client_factory: Callable[..., httpx.Client] = httpx.Client,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+    ) -> None:
+        self._settings = settings
+        self._client_factory = client_factory
+        self._page_size = max(page_size, 1)
+
+    def get_rows(self) -> list[dict[str, Any]]:
+        cache_key = (
+            self._settings.supabase_url.rstrip("/"),
+            ",".join(self._table_names()),
+        )
+        now = time.monotonic()
+        cached = _CACHE.get(cache_key)
+        if cached and cached.expires_at > now:
+            return [dict(row) for row in cached.rows]
+
+        try:
+            rows = self._fetch_rows()
+        except CatalogUnavailableError:
+            if cached:
+                return [dict(row) for row in cached.rows]
+            raise
+
+        _CACHE[cache_key] = _CacheEntry(
+            rows=[dict(row) for row in rows],
+            expires_at=now + max(self._settings.cache_ttl_seconds, 0),
+        )
+        return [dict(row) for row in rows]
+
+    def _fetch_rows(self) -> list[dict[str, Any]]:
+        settings = self._settings
+        if not settings.supabase_url:
+            raise CatalogUnavailableError("Supabase catalog is not configured: missing supabase_url.")
+        if not settings.supabase_anon_key:
+            raise CatalogUnavailableError("Supabase catalog is not configured: missing supabase_anon_key.")
+        table_names = self._table_names()
+        if not table_names:
+            raise CatalogUnavailableError(
+                "Supabase catalog is not configured: missing supabase catalog table names."
+            )
+
+        headers = {
+            "apikey": settings.supabase_anon_key,
+            "Authorization": f"Bearer {settings.supabase_anon_key}",
+            "Accept": "application/json",
+        }
+
+        rows: list[dict[str, Any]] = []
+        try:
+            with self._client_factory(timeout=10.0) as client:
+                for table_name in table_names:
+                    rows.extend(self._fetch_table_rows(client, settings.supabase_url, table_name, headers))
+        except CatalogUnavailableError:
+            raise
+        except Exception as exc:
+            raise CatalogUnavailableError(f"Supabase catalog request failed: {exc}") from exc
+
+        return rows
+
+    def _table_names(self) -> tuple[str, ...]:
+        if self._settings.supabase_catalog_tables:
+            return tuple(item.strip() for item in self._settings.supabase_catalog_tables if item.strip())
+        if self._settings.supabase_catalog_table.strip():
+            return (self._settings.supabase_catalog_table.strip(),)
+        return ()
+
+    def _fetch_table_rows(
+        self,
+        client: httpx.Client,
+        supabase_url: str,
+        table_name: str,
+        headers: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        url = supabase_url.rstrip("/") + "/rest/v1/" + quote(table_name.strip(), safe=".")
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            response = client.get(
+                url,
+                params={
+                    "select": "*",
+                    "limit": self._page_size,
+                    "offset": offset,
+                },
+                headers=headers,
+            )
+            if response.status_code >= 400:
+                detail = response.text.strip()[:300]
+                raise CatalogUnavailableError(
+                    f"Supabase catalog request failed for {table_name} ({response.status_code}): {detail}"
+                )
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise CatalogUnavailableError(
+                    f"Supabase catalog returned a non-list payload for {table_name}."
+                )
+            batch = [
+                _normalize_row(item, source_file="supabase")
+                for item in payload
+                if isinstance(item, dict)
+            ]
+            rows.extend(batch)
+            if len(payload) < self._page_size:
+                break
+            offset += len(payload)
+        return rows

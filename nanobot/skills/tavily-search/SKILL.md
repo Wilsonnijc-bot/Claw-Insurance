@@ -1,6 +1,6 @@
 ---
 name: tavily-search
-description: AI-optimized web search and URL extraction through Tavily. Use when brochure or web research is needed after a local shortlist already exists.
+description: AI-optimized web search and URL extraction through Tavily. Use when brochure or web research is needed after a catalog shortlist already exists.
 homepage: https://tavily.com
 metadata: {"nanobot":{"emoji":"🔍","requires":{"bins":["node"],"env":["TAVILY_API_KEY"]},"primaryEnv":"TAVILY_API_KEY"}}
 ---
@@ -13,7 +13,7 @@ Use this skill for focused web research and page extraction through the Tavily A
 
 - You already know the product or URL you need to research.
 - You need brochure extraction or narrow web verification.
-- Do not use this as open-ended research before the local shortlist exists.
+- Do not use this as open-ended research before the catalog shortlist exists.
 
 ## Search
 

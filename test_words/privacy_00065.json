@@ -1,0 +1,98 @@
+{
+  "created_at": "2026-04-05T15:25:42.181154+00:00",
+  "session_key": "affinity:ecf9bcf480fc496a9fc180e3b5f32607",
+  "blocked": false,
+  "reasons": [],
+  "upstream_url": "https://api.gptsapi.net/v1/chat/completions",
+  "sanitized_request": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."
+      },
+      {
+        "role": "user",
+        "content": "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n# Heartbeat Tasks\n\nThis file is checked every 30 minutes by your nanobot agent.\nAdd tasks below that you want the agent to work on periodically.\n\nIf this file has no tasks (only headers and comments), the agent will skip the heartbeat.\n\n## Active Tasks\n\n<!-- Add your periodic tasks below this line -->\n\n\n## Completed\n\n<!-- Move completed tasks here or delete them -->\n\n"
+      }
+    ],
+    "model": "gpt-5.1-chat",
+    "max_tokens": 4096,
+    "temperature": 0.7,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "heartbeat",
+          "description": "Report heartbeat decision after reviewing tasks.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "skip",
+                  "run"
+                ],
+                "description": "skip = nothing to do, run = has active tasks"
+              },
+              "tasks": {
+                "type": "string",
+                "description": "Natural-language summary of active tasks (required for run)"
+              }
+            },
+            "required": [
+              "action"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "response_status": 200,
+  "sanitized_response": {
+    "choices": [
+      {
+        "finish_reason": "tool_calls",
+        "index": 0,
+        "logprobs": null,
+        "message": {
+          "annotations": [],
+          "content": null,
+          "refusal": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"tasks\":\"No active tasks listed in HEARTBEAT.md\",\"action\":\"skip\"}",
+                "name": "heartbeat"
+              },
+              "id": "call_scw90fwAbchxn9bgA0hWXFt7",
+              "type": "function"
+            }
+          ]
+        }
+      }
+    ],
+    "created": 1775402740,
+    "id": "chatcmpl-DRJe0AUO56XgCl5lRGtrSDHzqccf4",
+    "model": "gpt-5.1-chat-2025-11-13",
+    "object": "chat.completion",
+    "system_fingerprint": null,
+    "usage": {
+      "completion_tokens": 36,
+      "completion_tokens_details": {
+        "accepted_prediction_tokens": 0,
+        "audio_tokens": 0,
+        "reasoning_tokens": 0,
+        "rejected_prediction_tokens": 0
+      },
+      "prompt_tokens": 266,
+      "prompt_tokens_details": {
+        "audio_tokens": 0,
+        "cached_tokens": 0
+      },
+      "total_tokens": 302
+    }
+  }
+}

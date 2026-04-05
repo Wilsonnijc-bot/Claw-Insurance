@@ -178,30 +178,6 @@ class TestSessionPersistence:
         session.clear()
         assert len(session.messages) == 0
 
-    def test_whatsapp_chat_history_bundle_uses_phone_for_legacy_phone_jid(self, temp_manager):
-        """Direct WhatsApp bundles should use phone-based folder names when the key is phone-derived."""
-        session = Session(key="whatsapp:85212345678@s.whatsapp.net")
-        session.add_message("user", "Hi")
-        temp_manager.save(session)
-
-        canonical_dir = temp_manager.chat_histories_dir / "whatsapp__85212345678"
-        legacy_dir = temp_manager.chat_histories_dir / "whatsapp__85212345678@s.whatsapp.net"
-
-        assert canonical_dir.is_dir()
-        assert not legacy_dir.exists()
-
-        meta = json.loads((canonical_dir / "meta.json").read_text(encoding="utf-8"))
-        assert meta["key"] == "whatsapp:85212345678@s.whatsapp.net"
-
-    def test_whatsapp_chat_history_bundle_keeps_non_phone_lid_identity(self, temp_manager):
-        """LID-based direct session keys should keep their non-phone bundle name."""
-        session = Session(key="whatsapp:169806078701749@lid")
-        session.add_message("user", "Hi")
-        temp_manager.save(session)
-
-        bundle_dir = temp_manager.chat_histories_dir / "whatsapp__169806078701749@lid"
-        assert bundle_dir.is_dir()
-
 
 class TestConsolidationTriggerConditions:
     """Test consolidation trigger conditions and logic."""

@@ -3,7 +3,15 @@ x-common-config: &common-config
     context: .
     dockerfile: Dockerfile
   volumes:
-    - ~/.nanobot:/root/.nanobot
+    - ./config.json:/app/config.json
+    - ./data:/app/data
+    - ./sessions:/app/sessions
+    - ./state:/app/state
+    - ./memory:/app/memory
+    - ./whatsapp-auth:/app/whatsapp-auth
+    - ./whatsapp-web:/app/whatsapp-web
+    - ./whatsapp-web-debug:/app/whatsapp-web-debug
+    - ./skills:/app/skills
 
 services:
   nanobot-gateway:

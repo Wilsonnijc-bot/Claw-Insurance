@@ -154,7 +154,7 @@ class MatrixChannel(BaseChannel):
         self._sync_task: asyncio.Task | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._restrict_to_workspace = restrict_to_workspace
-        self._workspace = workspace.expanduser().resolve() if workspace else None
+        self._workspace = workspace.resolve() if workspace else None
         self._server_upload_limit_bytes: int | None = None
         self._server_upload_limit_checked = False
 
@@ -228,7 +228,7 @@ class MatrixChannel(BaseChannel):
         for raw in media:
             if not isinstance(raw, str) or not raw.strip():
                 continue
-            path = Path(raw.strip()).expanduser()
+            path = Path(raw.strip())
             try:
                 key = str(path.resolve(strict=False))
             except OSError:
@@ -304,7 +304,7 @@ class MatrixChannel(BaseChannel):
         if not self.client:
             return _ATTACH_UPLOAD_FAILED.format(path.name or _DEFAULT_ATTACH_NAME)
 
-        resolved = path.expanduser().resolve(strict=False)
+        resolved = path.resolve(strict=False)
         filename = safe_filename(resolved.name) or _DEFAULT_ATTACH_NAME
         fail = _ATTACH_UPLOAD_FAILED.format(filename)
 

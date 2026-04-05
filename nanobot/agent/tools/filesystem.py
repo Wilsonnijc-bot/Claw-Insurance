@@ -10,8 +10,12 @@ from nanobot.agent.tools.base import Tool
 def _resolve_path(
     path: str, workspace: Path | None = None, allowed_dir: Path | None = None
 ) -> Path:
-    """Resolve path against workspace (if relative) and enforce directory restriction."""
-    p = Path(path).expanduser()
+    """Resolve path against workspace (if relative) and enforce directory restriction.
+
+    ``expanduser()`` is no longer called — tilde stays literal so agent
+    tools cannot silently read/write home-directory locations.
+    """
+    p = Path(path)
     if not p.is_absolute() and workspace:
         p = workspace / p
     resolved = p.resolve()

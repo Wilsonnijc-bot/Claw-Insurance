@@ -26,9 +26,15 @@ export interface ScrapedHistoryMessage {
 }
 
 export interface HistoryScrapeResult {
-  status: 'history_scraped' | 'chat_not_found' | 'not_ready';
+  status: 'history_scraped' | 'chat_not_found' | 'not_ready' | 'whatsapp_web_login_required' | 'cdp_launch_failed' | 'scrape_not_ready';
   detail?: string;
   messages?: ScrapedHistoryMessage[];
+}
+
+export interface BrowserStatusResult {
+  status: 'ready' | 'cdp_launch_failed' | 'whatsapp_web_login_required' | 'scrape_not_ready';
+  reusable: boolean;
+  detail: string;
 }
 
 interface KeyboardDriver {
@@ -104,6 +110,12 @@ const CDP_CONNECT_TIMEOUT_MS = 15000;
 const CDP_CONNECT_RETRY_WAIT_MS = 500;
 
 const SEARCH_BOX_SELECTORS = [
+  'input[aria-label="搜索或开始新聊天"]',
+  'input[placeholder="搜索或开始新聊天"]',
+  'input[aria-label="Search or start new chat"]',
+  'input[placeholder="Search or start new chat"]',
+  'input[role="textbox"][data-tab="3"]',
+  'input[role="textbox"]',
   'div[aria-label="Search input textbox"][contenteditable="true"]',
   'div[title="Search input textbox"][contenteditable="true"]',
   'div[contenteditable="true"][data-tab="3"]',
@@ -111,6 +123,10 @@ const SEARCH_BOX_SELECTORS = [
 ];
 
 const COMPOSE_BOX_SELECTORS = [
+  'footer [data-testid="conversation-compose-box-input"]',
+  'footer div[aria-label="输入消息"][contenteditable="true"]',
+  'footer div[aria-placeholder="输入消息"][contenteditable="true"]',
+  'footer div[aria-label="Type a message"][contenteditable="true"]',
   'footer div[aria-label="Type a message"][contenteditable="true"]',
   'footer div[contenteditable="true"][data-tab="10"]',
   'footer div[contenteditable="true"][role="textbox"]',
@@ -139,6 +155,10 @@ export class DraftComposer {
 
   async scrapeHistory(target: ChatTarget): Promise<HistoryScrapeResult> {
     return this._serialize(async () => this._scrapeHistory(target));
+  }
+
+  async getBrowserStatus(): Promise<BrowserStatusResult> {
+    return this._serialize(async () => this._getBrowserStatus());
   }
 
   async stop(): Promise<void> {
@@ -264,6 +284,77 @@ export class DraftComposer {
     };
   }
 
+  private async _getBrowserStatus(): Promise<BrowserStatusResult> {
+    if (this.browserMode !== 'cdp') {
+      return {
+        status: 'ready',
+        reusable: true,
+        detail: 'CDP mode is not enabled.',
+      };
+    }
+
+    let browser = await this._tryConnectOverCDP();
+    let launched = false;
+
+    if (!browser) {
+      try {
+        await this._launchCdpBrowser();
+        launched = true;
+        browser = await this._waitForCDPBrowser();
+      } catch (error) {
+        return {
+          status: 'cdp_launch_failed',
+          reusable: false,
+          detail: `Failed to launch the CDP browser for WhatsApp Web: ${String(error)}`,
+        };
+      }
+    }
+
+    if (!browser) {
+      return {
+        status: 'cdp_launch_failed',
+        reusable: false,
+        detail: 'Failed to launch or attach a CDP browser for WhatsApp Web history sync.',
+      };
+    }
+
+    try {
+      const readyAttached = await this._findAttachedWhatsAppPage(browser, true);
+      if (readyAttached) {
+        return {
+          status: 'ready',
+          reusable: true,
+          detail: 'Existing WhatsApp Web session is ready.',
+        };
+      }
+
+      const attached = await this._findAttachedWhatsAppPage(browser, false);
+      if (attached) {
+        return {
+          status: 'whatsapp_web_login_required',
+          reusable: false,
+          detail: 'WhatsApp Web is open in the CDP browser, but it is not logged in or not fully ready for history sync.',
+        };
+      }
+
+      if (launched) {
+        return {
+          status: 'whatsapp_web_login_required',
+          reusable: false,
+          detail: 'Opened the WhatsApp Web CDP browser. Log in to WhatsApp Web there, then retry history sync.',
+        };
+      }
+
+      return {
+        status: 'scrape_not_ready',
+        reusable: false,
+        detail: 'CDP browser is reachable, but no WhatsApp Web tab is ready for history sync.',
+      };
+    } finally {
+      await browser.close().catch(() => undefined);
+    }
+  }
+
   private async _ensurePage(): Promise<PageDriver> {
     if (this.page) {
       return this.page;
@@ -286,7 +377,13 @@ export class DraftComposer {
         this.context = null;
         this.page = null;
       });
-      this.context = this._pickAttachedContext(this.browser);
+      const attached = await this._findAttachedWhatsAppPage(this.browser, false);
+      if (attached) {
+        this.context = attached.context;
+        this.page = attached.page;
+      } else {
+        this.context = this._pickAttachedContext(this.browser);
+      }
       if (!this.context) {
         throw new Error(
           'CDP browser is connected, but no reusable browser context is available. Keep the manual Chrome window open.',
@@ -483,7 +580,52 @@ export class DraftComposer {
     return contexts.find((context) => context.pages().some((page) => this._isWhatsAppUrl(this._pageUrl(page)))) || contexts[0];
   }
 
+  private async _findAttachedWhatsAppPage(
+    browser: BrowserDriver,
+    requireReady: boolean,
+  ): Promise<{ context: BrowserContextDriver; page: PageDriver } | null> {
+    for (const context of browser.contexts()) {
+      for (const page of context.pages()) {
+        if (!this._isWhatsAppUrl(this._pageUrl(page))) {
+          continue;
+        }
+        if (!requireReady) {
+          return { context, page };
+        }
+        try {
+          const ready = await this._findVisibleLocator(
+            page,
+            [...SEARCH_BOX_SELECTORS, ...COMPOSE_BOX_SELECTORS],
+            READY_CHECK_TIMEOUT_MS,
+          );
+          if (ready) {
+            return { context, page };
+          }
+        } catch {
+          // Ignore detached/closed pages and keep scanning other attached tabs.
+        }
+      }
+    }
+    return null;
+  }
+
   private async _ensureWhatsAppPage(context: BrowserContextDriver): Promise<PageDriver> {
+    if (this.browserMode === 'cdp' && this.browser) {
+      const readyAttached = await this._findAttachedWhatsAppPage(this.browser, true);
+      if (readyAttached) {
+        this.context = readyAttached.context;
+        this.page = readyAttached.page;
+        return readyAttached.page;
+      }
+
+      const attached = await this._findAttachedWhatsAppPage(this.browser, false);
+      if (attached) {
+        this.context = attached.context;
+        this.page = attached.page;
+        return attached.page;
+      }
+    }
+
     const pages = context.pages();
     const existingWhatsAppPage = pages.find((page) => this._isWhatsAppUrl(this._pageUrl(page)));
 
@@ -491,6 +633,11 @@ export class DraftComposer {
     if (existingWhatsAppPage) {
       page = existingWhatsAppPage;
     } else if (this.browserMode === 'cdp') {
+      if (this.browser && !this.launchedCdpProcess) {
+        throw new Error(
+          'No reusable WhatsApp Web tab was found in the connected CDP browser. Keep the logged-in WhatsApp Web tab open and try again.',
+        );
+      }
       page = await context.newPage();
     } else {
       page = pages[0] ?? await context.newPage();
@@ -523,19 +670,21 @@ export class DraftComposer {
     return composeBox !== null;
   }
 
-  private async _searchAndOpenChat(page: PageDriver, terms: string[]): Promise<boolean> {
+  private async _searchAndOpenChat(page: PageDriver, target: ChatTarget): Promise<boolean> {
     const searchBox = await this._findVisibleLocator(page, SEARCH_BOX_SELECTORS, READY_TIMEOUT_MS);
     if (!searchBox) {
       return false;
     }
 
-    for (const rawTerm of terms) {
+    for (const rawTerm of target.searchTerms) {
       const term = rawTerm.trim();
       if (!term) {
         continue;
       }
 
-      await searchBox.click();
+      if (!(await this._focusFirstVisibleElement(page, SEARCH_BOX_SELECTORS))) {
+        continue;
+      }
       await this._clearFocusedTextbox(page);
       await page.keyboard.insertText(term);
       await page.waitForTimeout?.(250);
@@ -545,9 +694,11 @@ export class DraftComposer {
         continue;
       }
 
-      await result.click();
+      if (!(await this._clickFirstVisibleElement(page, this._chatResultSelectors(term)))) {
+        continue;
+      }
       const composeBox = await this._findVisibleLocator(page, COMPOSE_BOX_SELECTORS, SEARCH_TIMEOUT_MS);
-      if (composeBox) {
+      if (composeBox && await this._openedChatMatchesTarget(page, target, term)) {
         return true;
       }
     }
@@ -557,9 +708,50 @@ export class DraftComposer {
 
   private async _openTarget(page: PageDriver, target: ChatTarget): Promise<boolean> {
     return (
-      (target.phone ? await this._openChatByPhone(page, target.phone) : false)
-      || await this._searchAndOpenChat(page, target.searchTerms)
+      await this._searchAndOpenChat(page, target)
+      || (target.phone ? await this._openChatByPhone(page, target.phone) : false)
     );
+  }
+
+  private async _openedChatMatchesTarget(
+    page: PageDriver,
+    target: ChatTarget,
+    matchedTerm: string,
+  ): Promise<boolean> {
+    const snapshot = await page.evaluate(() => {
+      const header = document.querySelector('header');
+      return {
+        url: String(location.href || ''),
+        title: String(document.title || ''),
+        headerText: String((header as HTMLElement | null)?.innerText || ''),
+      };
+    }) as OpenedTargetSnapshot;
+
+    const normalize = (value: string): string => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
+
+    const combined = normalize(`${snapshot.title} ${snapshot.headerText}`);
+    const combinedDigits = digits(`${snapshot.title} ${snapshot.headerText}`);
+    const targetPhone = digits(target.phone || '');
+    const matchedDigits = digits(matchedTerm);
+
+    if (targetPhone) {
+      if (combinedDigits.includes(targetPhone)) {
+        return true;
+      }
+      if (snapshot.url.includes(`phone=${encodeURIComponent(target.phone || '')}`)) {
+        return true;
+      }
+      if (matchedDigits && matchedDigits !== targetPhone) {
+        return false;
+      }
+    }
+
+    const strictTerms = [matchedTerm, ...(target.searchTerms || [])]
+      .map((term) => normalize(term))
+      .filter((term) => term.length >= 4);
+
+    return strictTerms.some((term) => combined.includes(term));
   }
 
   private async _ensureWhatsAppReady(page: PageDriver): Promise<boolean> {
@@ -806,6 +998,63 @@ export class DraftComposer {
     return null;
   }
 
+  private async _focusFirstVisibleElement(page: PageDriver, selectors: string[]): Promise<boolean> {
+    return page.evaluate(({ selectors }) => {
+      const isVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+
+      for (const selector of selectors) {
+        for (const node of Array.from(document.querySelectorAll(selector))) {
+          if (!isVisible(node)) {
+            continue;
+          }
+          node.focus();
+          node.click();
+          return true;
+        }
+      }
+
+      return false;
+    }, { selectors });
+  }
+
+  private async _clickFirstVisibleElement(page: PageDriver, selectors: string[]): Promise<boolean> {
+    return page.evaluate(({ selectors }) => {
+      const isVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+
+      for (const selector of selectors) {
+        for (const node of Array.from(document.querySelectorAll(selector))) {
+          if (!isVisible(node)) {
+            continue;
+          }
+          node.click();
+          return true;
+        }
+      }
+
+      return false;
+    }, { selectors });
+  }
+
   private async _clearFocusedTextbox(page: PageDriver): Promise<void> {
     await this._tryPress(page.keyboard, 'Meta+A');
     await this._tryPress(page.keyboard, 'Control+A');
@@ -845,6 +1094,12 @@ interface RawScrapedHistoryMessage {
 interface HistorySnapshot {
   messages: RawScrapedHistoryMessage[];
   atTop: boolean;
+}
+
+interface OpenedTargetSnapshot {
+  url: string;
+  title: string;
+  headerText: string;
 }
 
 function cssEscape(value: string): string {

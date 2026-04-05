@@ -5,10 +5,11 @@ import json
 import mimetypes
 from collections import OrderedDict
 from pathlib import Path
+from uuid import uuid4
 
 from loguru import logger
 
-from nanobot.bus.events import InboundHistoryBatch, InboundMessage, OutboundMessage
+from nanobot.bus.events import HistoryImportResult, InboundHistoryBatch, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.whatsapp_contacts import (
@@ -21,11 +22,6 @@ from nanobot.channels.whatsapp_contacts import (
 from nanobot.channels.whatsapp_group_members import (
     WhatsAppGroupMember,
     normalize_member_id,
-)
-from nanobot.channels.whatsapp_storage import (
-    storage_path,
-    sync_direct_contact_storage,
-    sync_group_row_storage,
 )
 from nanobot.channels.whatsapp_reply_targets import (
     DirectReplyTarget,
@@ -41,6 +37,7 @@ from nanobot.channels.whatsapp_reply_targets import (
     reply_targets_path,
 )
 from nanobot.config.schema import WhatsAppConfig
+from nanobot.utils.helpers import get_workspace_path
 
 
 class WhatsAppChannel(BaseChannel):
@@ -56,15 +53,254 @@ class WhatsAppChannel(BaseChannel):
     def __init__(self, config: WhatsAppConfig, bus: MessageBus, workspace: Path | None = None):
         super().__init__(config, bus)
         self.config: WhatsAppConfig = config
-        self._workspace = Path(workspace).expanduser() if workspace else Path.home() / ".nanobot" / "workspace"
-        self._storage_dir = storage_path(self.config.storage_dir, self._workspace)
-        self._project_root = Path(__file__).resolve().parents[2]
+        self._workspace = get_workspace_path(str(workspace) if workspace else None)
+        from nanobot.utils.paths import project_root
+        self._project_root = project_root()
         self._reply_targets_file = reply_targets_path(self.config.reply_targets_file, self._project_root)
         init_reply_targets_store(self._reply_targets_file)
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._history_cache: OrderedDict[str, dict] = OrderedDict()
+        self._browser_reusable: bool | None = None
+        self._browser_message: str = ""
+        self._browser_severity: str = "warning"  # "warning" | "error"
+        self._auth_required: bool = False
+        self._auth_qr: str = ""
+        self._auth_message: str = ""
+        self._pending_browser_status: asyncio.Future | None = None
+        self._pending_history_sync_acks: dict[str, asyncio.Future] = {}
+        self._ws_reconnect_failures: int = 0
+        self._ws_max_reconnect_failures: int = 12  # 12 * 5s = 60s before escalating
+
+    def get_browser_status(self) -> dict[str, object]:
+        """Return the latest known WhatsApp Web CDP reuse status."""
+        return {
+            "mode": self.config.web_browser_mode,
+            "reusable": self._browser_reusable,
+            "message": self._browser_message,
+            "severity": self._browser_severity,
+        }
+
+    def get_auth_status(self) -> dict[str, object]:
+        """Return the latest known Baileys authentication status."""
+        return {
+            "required": self._auth_required,
+            "qr": self._auth_qr,
+            "message": self._auth_message,
+        }
+
+    def _set_browser_status(self, reusable: bool | None, message: str = "", severity: str = "warning") -> None:
+        self._browser_reusable = reusable
+        self._browser_message = str(message or "").strip()
+        self._browser_severity = severity
+
+    def _set_auth_status(self, required: bool, qr: str = "", message: str = "") -> None:
+        self._auth_required = bool(required)
+        self._auth_qr = str(qr or "").strip()
+        self._auth_message = str(message or "").strip()
+
+    async def _request_browser_status(self) -> None:
+        """Ask the bridge whether the attached WhatsApp Web tab is reusable."""
+        if self.config.web_browser_mode != "cdp":
+            self._set_browser_status(True, "CDP mode is not enabled.")
+            return
+        if not self._ws or not self._connected:
+            self._set_browser_status(False, "Bridge 连接中断，等待重连…", severity="error")
+            return
+        try:
+            await self._ws.send(json.dumps({"type": "cdp_status"}, ensure_ascii=False))
+        except Exception as e:
+            self._set_browser_status(False, "Bridge 连接中断，等待重连…", severity="error")
+            logger.error("Error requesting WhatsApp browser status: {}", e)
+
+    async def check_browser_status(self, timeout_s: float = 8.0) -> dict[str, object]:
+        """Run an on-demand CDP readiness check for history scraping.
+
+        This is intentionally *lazy*: CDP is only checked when the user
+        explicitly requests a history sync (or a manual bridge check), not in a
+        periodic background loop.
+        """
+        if self.config.web_browser_mode != "cdp":
+            result = {
+                "status": "ready",
+                "reusable": True,
+                "detail": "CDP mode is not enabled.",
+                "severity": "warning",
+            }
+            self._set_browser_status(True, str(result["detail"]))
+            return result
+
+        if not self._ws or not self._connected:
+            result = {
+                "status": "bridge_unreachable",
+                "reusable": False,
+                "detail": "Bridge 连接中断，无法检查 WhatsApp Web 历史同步状态。",
+                "severity": "error",
+            }
+            self._set_browser_status(False, str(result["detail"]), severity="error")
+            return result
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._pending_browser_status = future
+        try:
+            await self._request_browser_status()
+            try:
+                result = await asyncio.wait_for(future, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                result = {
+                    "status": "scrape_not_ready",
+                    "reusable": False,
+                    "detail": "CDP 检查超时，无法确认 WhatsApp Web 是否可用于历史同步。",
+                    "severity": "warning",
+                }
+                self._set_browser_status(False, str(result["detail"]), severity="warning")
+            return result
+        finally:
+            if self._pending_browser_status is future:
+                self._pending_browser_status = None
+
+    async def sync_direct_history(self, phones: list[str] | None = None, timeout_s: float = 30.0) -> dict[str, object]:
+        """Run a scoped direct-history sync and wait for scrape/import confirmation."""
+        scope_phones = self._normalize_direct_history_scope(phones)
+        await self._replay_cached_history(scope_phones)
+
+        targets = self._build_scoped_direct_history_targets_payload(scope_phones)
+        if not targets:
+            return {
+                "status": "chat_not_found",
+                "detail": "No enabled WhatsApp direct target is configured for this client.",
+                "severity": "warning",
+            }
+
+        if not self._ws or not self._connected:
+            return {
+                "status": "bridge_unreachable",
+                "detail": "Bridge 连接中断，无法执行 WhatsApp 历史同步。",
+                "severity": "error",
+            }
+
+        request_id = uuid4().hex
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout_s, 1.0)
+        ack_future: asyncio.Future = loop.create_future()
+        self._pending_history_sync_acks[request_id] = ack_future
+        observer = self.bus.add_history_result_observer()
+
+        try:
+            await self._ws.send(json.dumps({
+                "type": "scrape_direct_history",
+                "targets": targets,
+                "requestId": request_id,
+            }, ensure_ascii=False))
+
+            ack_timeout = max(0.1, min(15.0, deadline - loop.time()))
+            ack = await asyncio.wait_for(ack_future, timeout=ack_timeout)
+            status = str(ack.get("status", "") or "").strip() or "not_ready"
+            detail = str(ack.get("detail", "") or "").strip()
+            severity = "warning" if status != "bridge_unreachable" else "error"
+            scraped_targets = int(ack.get("scrapedTargets") or 0)
+            scraped_messages = int(ack.get("scrapedMessages") or 0)
+            missed_targets = int(ack.get("missedTargets") or 0)
+
+            if status != "history_scraped":
+                return {
+                    "status": status,
+                    "detail": detail or "WhatsApp Web 历史同步失败。",
+                    "severity": severity,
+                }
+
+            if scraped_targets <= 0:
+                return {
+                    "status": "chat_not_found" if missed_targets > 0 else "scrape_not_ready",
+                    "detail": detail or "WhatsApp Web 未找到可同步的聊天窗口。",
+                    "severity": "warning",
+                }
+
+            if scraped_messages <= 0:
+                return {
+                    "status": "history_scraped",
+                    "detail": "WhatsApp 历史同步完成，没有可导入的新消息。",
+                    "severity": "warning",
+                    "matched_entries": 0,
+                    "imported_entries": 0,
+                    "request_id": request_id,
+                }
+
+            import_timeout = max(0.1, deadline - loop.time())
+            result = await asyncio.wait_for(
+                self._wait_for_history_import_result(observer, request_id, scope_phones),
+                timeout=import_timeout,
+            )
+            matched_entries = int(result.matched_entries)
+            imported_entries = int(result.imported_entries)
+            imported_phones = set(self._normalize_direct_history_scope(result.phones))
+            requested_phones = set(scope_phones)
+
+            if requested_phones and not requested_phones.issubset(imported_phones):
+                return {
+                    "status": "sync_timeout",
+                    "detail": "历史抓取已完成，但未确认目标客户的导入结果。",
+                    "severity": "warning",
+                }
+
+            if matched_entries <= 0:
+                return {
+                    "status": "chat_not_found",
+                    "detail": "抓取完成，但没有确认到该客户的历史消息被导入。",
+                    "severity": "warning",
+                    "matched_entries": 0,
+                    "imported_entries": 0,
+                    "request_id": request_id,
+                }
+
+            return {
+                "status": "history_scraped",
+                "detail": "WhatsApp 历史同步完成。",
+                "severity": "warning",
+                "matched_entries": matched_entries,
+                "imported_entries": imported_entries,
+                "request_id": request_id,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "sync_timeout",
+                "detail": "等待 WhatsApp 历史同步结果超时，请重试。",
+                "severity": "warning",
+            }
+        except Exception as e:
+            logger.error("Error running WhatsApp direct history sync: {}", e)
+            return {
+                "status": "not_ready",
+                "detail": str(e),
+                "severity": "warning",
+            }
+        finally:
+            self.bus.remove_history_result_observer(observer)
+            pending = self._pending_history_sync_acks.pop(request_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
+
+    async def _wait_for_history_import_result(
+        self,
+        observer: asyncio.Queue[HistoryImportResult],
+        request_id: str,
+        phones: list[str] | None = None,
+    ) -> HistoryImportResult:
+        requested_phones = set(self._normalize_direct_history_scope(phones))
+        while True:
+            result = await observer.get()
+            if result.channel != self.name:
+                continue
+            metadata = result.metadata or {}
+            if str(metadata.get("request_id", "") or "").strip() != request_id:
+                continue
+            if not requested_phones:
+                return result
+            imported_phones = set(self._normalize_direct_history_scope(result.phones))
+            if requested_phones.issubset(imported_phones) or int(result.matched_entries) <= 0:
+                return result
 
     def get_allowed_contact(self, sender_id: str) -> WhatsAppContact | None:
         """Prefer the local WhatsApp contacts store when it exists."""
@@ -214,7 +450,6 @@ class WhatsAppChannel(BaseChannel):
         if reply_target is not None:
             for candidate in (
                 reply_target.push_name,
-                reply_target.label,
                 reply_target.phone,
                 self._bare_chat_id(reply_target.chat_id),
                 self._bare_chat_id(reply_target.sender_id),
@@ -249,13 +484,12 @@ class WhatsAppChannel(BaseChannel):
         search_terms: list[str] = []
         seen_terms: set[str] = set()
         for candidate in (
-            row.push_name,
-            row.label,
             row.phone,
             self._bare_chat_id(row.chat_id),
             self._bare_chat_id(row.sender_id),
-            contact.label if contact is not None else "",
             normalize_contact_id(contact.phone) if contact is not None else "",
+            row.push_name,
+            contact.label if contact is not None else "",
         ):
             self._append_search_term(search_terms, seen_terms, candidate)
 
@@ -373,6 +607,7 @@ class WhatsAppChannel(BaseChannel):
         if isinstance(raw_messages, list) and raw_messages:
             self._cache_history_messages(raw_messages)
         source = str(data.get("source", "") or "")
+        request_id = str(data.get("requestId", "") or "").strip()
 
         try:
             direct_targets = load_direct_reply_targets(self._reply_targets_file)
@@ -409,7 +644,13 @@ class WhatsAppChannel(BaseChannel):
                 continue
 
             session_key = f"{self.name}:{canonical_phone}"
+            is_from_me = bool(raw.get("fromMe", False))
             push_name = str(raw.get("pushName", "") or "").strip()
+            # Only treat push_name as the *client* identity when the
+            # message is NOT from us.  fromMe messages carry the
+            # operator's own WhatsApp display name, which must never
+            # overwrite the client's name.
+            client_push_name = push_name if not is_from_me else ""
             entry = {
                 "session_key": session_key,
                 "chat_id": sender,
@@ -419,7 +660,7 @@ class WhatsAppChannel(BaseChannel):
                 "content": str(raw.get("content", "") or ""),
                 "message_id": message_id,
                 "timestamp": raw.get("timestamp"),
-                "from_me": bool(raw.get("fromMe", False)),
+                "from_me": is_from_me,
                 "push_name": push_name,
             }
             entries.append(entry)
@@ -429,14 +670,31 @@ class WhatsAppChannel(BaseChannel):
                 {
                     "phone": canonical_phone,
                     "chat_id": sender,
-                    "push_name": push_name,
+                    "push_name": client_push_name,
                     "target": target,
                 },
             )
-            if push_name and not str(meta.get("push_name", "") or "").strip():
-                meta["push_name"] = push_name
+            if client_push_name and not str(meta.get("push_name", "") or "").strip():
+                meta["push_name"] = client_push_name
+
+        metadata = {
+            "source": source,
+            "syncType": data.get("syncType"),
+            "progress": data.get("progress"),
+            "isLatest": data.get("isLatest"),
+        }
+        if request_id:
+            metadata["request_id"] = request_id
 
         if not entries:
+            if request_id:
+                await self.bus.publish_history(
+                    InboundHistoryBatch(
+                        channel=self.name,
+                        entries=[],
+                        metadata=metadata,
+                    )
+                )
             return
 
         for meta in per_session_meta.values():
@@ -459,28 +717,11 @@ class WhatsAppChannel(BaseChannel):
                 except Exception:
                     logger.exception("Failed to update reply-target JSON direct identification from history")
 
-                try:
-                    contact = self._direct_contact_for_history(phone, label=target.label, push_name=push_name)
-                    sync_direct_contact_storage(
-                        self._storage_dir,
-                        self._workspace,
-                        contact,
-                        sender=chat_id,
-                        push_name=push_name or target.push_name,
-                    )
-                except Exception:
-                    logger.exception("Failed to update WhatsApp direct storage from history for {}", phone)
-
         await self.bus.publish_history(
             InboundHistoryBatch(
                 channel=self.name,
                 entries=entries,
-                metadata={
-                    "source": source,
-                    "syncType": data.get("syncType"),
-                    "progress": data.get("progress"),
-                    "isLatest": data.get("isLatest"),
-                },
+                metadata=metadata,
             )
         )
 
@@ -505,50 +746,16 @@ class WhatsAppChannel(BaseChannel):
         )
         await self.bus.publish_inbound(msg)
 
-    def _sync_storage_index(self) -> None:
-        """Create clear local folders from the JSON reply-target store."""
-        try:
-            for row in load_direct_reply_targets(self._reply_targets_file):
-                if not row.enabled:
-                    continue
-                contact = self._direct_contact_for_history(row.phone, label=row.label, push_name=row.push_name)
-                sync_direct_contact_storage(
-                    self._storage_dir,
-                    self._workspace,
-                    contact,
-                    sender=row.chat_id or row.sender_id,
-                    push_name=row.push_name,
-                )
-
-            for row_number, row in enumerate(load_group_reply_targets(self._reply_targets_file), start=1):
-                if not row.enabled:
-                    continue
-                sync_group_row_storage(
-                    self._storage_dir,
-                    self._workspace,
-                    row_number,
-                    WhatsAppGroupMember(
-                        group_id=row.group_id,
-                        group_name=row.group_name,
-                        member_id=row.member_id,
-                        member_pn=row.member_phone,
-                        member_label=row.member_label,
-                        enabled=row.enabled,
-                    ),
-                )
-        except Exception:
-            logger.exception("Failed to sync WhatsApp storage index")
-
     async def start(self) -> None:
         """Start the WhatsApp channel by connecting to the bridge."""
         import websockets
 
         bridge_url = self.config.bridge_url
-        self._sync_storage_index()
 
         logger.info("Connecting to WhatsApp bridge at {}...", bridge_url)
 
         self._running = True
+        self._ws_reconnect_failures = 0
 
         while self._running:
             try:
@@ -558,6 +765,8 @@ class WhatsAppChannel(BaseChannel):
                     if self.config.bridge_token:
                         await ws.send(json.dumps({"type": "auth", "token": self.config.bridge_token}))
                     self._connected = True
+                    self._ws_reconnect_failures = 0
+                    self._set_browser_status(None, "")
                     logger.info("Connected to WhatsApp bridge")
 
                     # Listen for messages
@@ -572,10 +781,24 @@ class WhatsAppChannel(BaseChannel):
             except Exception as e:
                 self._connected = False
                 self._ws = None
-                logger.warning("WhatsApp bridge connection error: {}", e)
+                self._ws_reconnect_failures += 1
+
+                if self._ws_reconnect_failures >= self._ws_max_reconnect_failures:
+                    self._set_browser_status(
+                        False,
+                        "Bridge 进程无响应，可能已崩溃。请点击重启按钮恢复连接。",
+                        severity="error",
+                    )
+                    logger.error(
+                        "Bridge unreachable after {} reconnect attempts — escalating to frontend",
+                        self._ws_reconnect_failures,
+                    )
+                else:
+                    self._set_browser_status(False, "Bridge 连接中断，等待重连…", severity="warning")
+                    logger.warning("WhatsApp bridge connection error: {}", e)
 
                 if self._running:
-                    logger.info("Reconnecting in 5 seconds...")
+                    logger.info("Reconnecting in 5 seconds... (attempt {})", self._ws_reconnect_failures)
                     await asyncio.sleep(5)
 
     async def stop(self) -> None:
@@ -725,23 +948,6 @@ class WhatsAppChannel(BaseChannel):
                 session_identity = normalize_contact_id(member_pn) or normalize_member_id(member_id)
                 session_key = f"{self.name}:{group_id}:{session_identity}" if session_identity else None
                 try:
-                    sync_group_row_storage(
-                        self._storage_dir,
-                        self._workspace,
-                        row_number + 1,
-                        WhatsAppGroupMember(
-                            group_id=row.group_id or group_id,
-                            group_name=row.group_name or group_name,
-                            member_id=row.member_id or member_id,
-                            member_pn=row.member_phone or member_pn,
-                            member_label=row.member_label,
-                            enabled=row.enabled,
-                        ),
-                        push_name=push_name,
-                    )
-                except Exception:
-                    logger.exception("Failed to update WhatsApp group storage for row {}", row_number + 1)
-                try:
                     observe_group_identification(
                         self._reply_targets_file,
                         group_name=row.group_name or group_name,
@@ -792,16 +998,6 @@ class WhatsAppChannel(BaseChannel):
                     return
 
             session_key = f"{self.name}:{session_identity}" if session_identity else None
-            try:
-                sync_direct_contact_storage(
-                    self._storage_dir,
-                    self._workspace,
-                    contact,
-                    sender=sender,
-                    push_name=push_name,
-                )
-            except Exception:
-                logger.exception("Failed to update WhatsApp direct storage for {}", sender_id)
             try:
                 observe_direct_identification(
                     self._reply_targets_file,
@@ -864,6 +1060,8 @@ class WhatsAppChannel(BaseChannel):
 
             if status == "connected":
                 self._connected = True
+                self._set_auth_status(False, "", "")
+                self._set_browser_status(None, "")
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel="whatsapp",
@@ -874,9 +1072,12 @@ class WhatsAppChannel(BaseChannel):
                 )
             elif status == "disconnected":
                 self._connected = False
+                self._set_browser_status(False, "WhatsApp 已断开连接，请重新登录", severity="error")
 
         elif msg_type == "qr":
             # QR code for authentication
+            qr = str(data.get("qr", "") or "")
+            self._set_auth_status(True, qr, "Scan the QR code in the UI to reconnect WhatsApp")
             logger.info("Scan QR code in the bridge terminal to connect WhatsApp")
 
         elif msg_type == "deleted":
@@ -970,6 +1171,29 @@ class WhatsAppChannel(BaseChannel):
             status = data.get("status", "unknown")
             to = data.get("to", "")
             detail = data.get("detail")
+            request_id = str(data.get("requestId", "") or "").strip()
+            if action == "cdp_status":
+                reusable = bool(data.get("reusable"))
+                severity = "warning" if status != "bridge_unreachable" else "error"
+                result = {
+                    "status": status,
+                    "reusable": reusable,
+                    "detail": str(detail or ("Existing WhatsApp Web session is ready." if reusable else "WhatsApp Web 历史同步不可用。")),
+                    "severity": severity,
+                }
+                self._set_browser_status(reusable, str(result["detail"]), severity=severity)
+                if self._pending_browser_status is not None and not self._pending_browser_status.done():
+                    self._pending_browser_status.set_result(result)
+            elif action in {"scrape_direct_history", "prepare_draft"}:
+                if status in {"history_scraped", "draft_prepared", "ready"}:
+                    self._set_browser_status(True, "Existing WhatsApp Web session is ready.")
+                elif status in {"not_ready", "whatsapp_web_login_required", "scrape_not_ready", "cdp_launch_failed", "chat_not_found"}:
+                    message = str(detail or "").strip() or "WhatsApp Web 历史同步不可用。"
+                    self._set_browser_status(False, message, severity="warning")
+                if action == "scrape_direct_history" and request_id:
+                    pending = self._pending_history_sync_acks.get(request_id)
+                    if pending is not None and not pending.done():
+                        pending.set_result(data)
             if detail:
                 logger.info("WhatsApp bridge {} ack for {}: {} ({})", action, to, status, detail)
             else:

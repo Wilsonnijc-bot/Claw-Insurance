@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-import csv
 import json
 import re
 from pathlib import Path
 from typing import Any
 
+from nanobot.insurance_catalog import (
+    CatalogRepository,
+    CatalogUnavailableError,
+    CsvCatalogRepository,
+    get_default_catalog_repository,
+)
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
+from nanobot.utils.paths import project_root
+
+REPO_ROOT = project_root()
 DEFAULT_CATALOGS = [
     REPO_ROOT / "data" / "Insurance_datas Mar3.csv",
     REPO_ROOT / "data" / "dental_insurance.csv",
@@ -226,16 +233,14 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def load_catalog_rows(paths: list[Path] | None = None) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for path in paths or DEFAULT_CATALOGS:
-        with path.open(newline="", encoding="utf-8-sig") as handle:
-            reader = csv.DictReader(handle)
-            for raw in reader:
-                row = {normalize_header(key): normalize_text(val) for key, val in raw.items()}
-                row["source_file"] = path.name
-                rows.append(row)
-    return rows
+def load_catalog_rows(
+    paths: list[Path] | None = None,
+    repository: CatalogRepository | None = None,
+) -> list[dict[str, Any]]:
+    active_repository = repository
+    if active_repository is None:
+        active_repository = CsvCatalogRepository(paths or DEFAULT_CATALOGS) if paths else get_default_catalog_repository()
+    return active_repository.get_rows()
 
 
 def get_domain_config(domain: str) -> dict[str, Any]:
@@ -495,6 +500,7 @@ def rank_products(
     facts: dict[str, Any] | None,
     catalog_paths: list[Path] | None = None,
     limit: int = 3,
+    repository: CatalogRepository | None = None,
 ) -> dict[str, Any]:
     canonical_domain = canonicalize_domain(domain)
     if not canonical_domain:
@@ -517,7 +523,12 @@ def rank_products(
     if activation_missing:
         return result
 
-    rows = load_catalog_rows(catalog_paths)
+    try:
+        rows = load_catalog_rows(catalog_paths, repository=repository)
+    except CatalogUnavailableError as exc:
+        result["catalog_unavailable"] = True
+        result["catalog_error"] = str(exc)
+        return result
     shortlisted = [row for row in rows if row.get("plan_category") in config["categories"]]
 
     scored = []

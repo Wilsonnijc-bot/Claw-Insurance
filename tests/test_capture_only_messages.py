@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nanobot.agent.loop import AgentLoop
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import HistoryImportResult, InboundHistoryBatch, InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.whatsapp import WhatsAppChannel
 from nanobot.channels.whatsapp_contacts import load_contacts
@@ -154,6 +154,43 @@ async def test_deleted_message_event_marks_existing_history_without_removing_con
     assert session.messages[0]["deleted_at"] == "2026-03-11T18:12:00"
     assert session.metadata["deleted_messages"][0]["message_id"] == "wa-msg-1"
     assert session.metadata["deleted_messages"][0]["matched_message"] is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_history_publishes_import_result_for_request_scoped_batch(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    observer = loop.bus.add_history_result_observer()
+    batch = InboundHistoryBatch(
+        channel="whatsapp",
+        entries=[
+            {
+                "session_key": "whatsapp:15550001111",
+                "chat_id": "15550001111@s.whatsapp.net",
+                "phone": "15550001111",
+                "sender": "15550001111@s.whatsapp.net",
+                "sender_id": "15550001111",
+                "content": "Hi",
+                "message_id": "wa-hist-1",
+                "timestamp": 1700000000,
+                "from_me": False,
+                "push_name": "Alice",
+            }
+        ],
+        metadata={"request_id": "req-123"},
+    )
+
+    try:
+        await loop._dispatch_history(batch)
+        result = await asyncio.wait_for(observer.get(), timeout=1)
+    finally:
+        loop.bus.remove_history_result_observer(observer)
+
+    assert isinstance(result, HistoryImportResult)
+    assert result.channel == "whatsapp"
+    assert result.metadata["request_id"] == "req-123"
+    assert result.matched_entries == 1
+    assert result.imported_entries == 1
+    assert result.phones == ["15550001111"]
 
 
 @pytest.mark.asyncio
@@ -326,23 +363,19 @@ async def test_whatsapp_history_batch_imports_both_sides_without_llm_and_updates
     assert [msg["content"] for msg in session.messages] == ["Hi", "Hello Alice"]
     assert [msg["message_id"] for msg in session.messages] == ["wa-hist-1", "wa-hist-2"]
 
-    direct_root = tmp_path / "whatsapp-storage" / "direct"
-    folders = list(direct_root.iterdir())
-    assert len(folders) == 1
-    visible_history = [
-        json.loads(line)
-        for line in (folders[0] / "history.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [item["role"] for item in visible_history] == ["client", "me"]
-    assert [item["from_me"] for item in visible_history] == [False, True]
+    bundle_meta = loop.sessions.get_session_meta_path(f"whatsapp:{normalized_phone}")
+    assert bundle_meta.exists()
+    meta = json.loads(bundle_meta.read_text(encoding="utf-8"))
+    assert meta["session_file"].endswith("session.jsonl")
 
-    bundle_history = [
-        json.loads(line)
-        for line in (loop.sessions.chat_histories_dir / f"whatsapp__{normalized_phone}" / "history.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [item["role"] for item in bundle_history] == ["client", "me"]
+    session.metadata["client_label"] = "Alice Chan"
+    session.metadata["client_push_name"] = "Alice"
+    loop.sessions.save(session)
+    meta = json.loads(bundle_meta.read_text(encoding="utf-8"))
+    assert meta["client_name"] == "Alice Chan"
+    assert meta["client"]["name"] == "Alice Chan"
+    assert meta["client"]["push_name"] == "Alice"
+    assert meta["metadata"]["client_name"] == "Alice Chan"
 
     loop._import_history_batch(batch)
     assert len(loop.sessions.get_or_create(f"whatsapp:{normalized_phone}").messages) == 2

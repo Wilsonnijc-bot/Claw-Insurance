@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 from nanobot.channels.whatsapp_contacts import (
     WhatsAppContact,
@@ -17,12 +16,6 @@ from nanobot.channels.whatsapp_group_members import (
     normalize_group_name,
     save_group_members,
 )
-from nanobot.channels.whatsapp_storage import (
-    storage_path,
-    sync_direct_contact_storage,
-    sync_group_row_storage,
-)
-
 _INDIVIDUAL_MARKER = "#chatbot reply to individuals#"
 _GROUP_MARKER = "#chatbot reply to groups#"
 
@@ -49,14 +42,11 @@ def parse_self_routing_instruction(text: str) -> SelfRoutingInstruction | None:
 
 def apply_self_routing_instruction(
     *,
-    workspace: Path,
     contacts_file: str,
     group_members_file: str,
-    storage_dir: str,
     instruction: SelfRoutingInstruction,
 ) -> dict[str, int]:
     """Apply parsed self-chat routing to local stores used by WhatsApp routing."""
-    storage_dir_path = storage_path(storage_dir, workspace)
     stats: dict[str, int] = {}
 
     if instruction.individuals is not None:
@@ -80,8 +70,6 @@ def apply_self_routing_instruction(
 
         if contacts_file:
             save_contacts(contacts_file, contacts)
-        for contact in contacts:
-            sync_direct_contact_storage(storage_dir_path, workspace, contact)
         stats["individual_count"] = len(contacts)
 
     if instruction.groups is not None:
@@ -120,8 +108,6 @@ def apply_self_routing_instruction(
 
         if group_members_file:
             save_group_members(group_members_file, rows)
-        for index, row in enumerate(rows, start=1):
-            sync_group_row_storage(storage_dir_path, workspace, index, row)
         stats["group_member_count"] = len(rows)
 
     return stats

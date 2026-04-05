@@ -125,7 +125,7 @@ def research_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     brochure_url = candidate.get("brochure_url", "")
     source_text = ""
     sources: list[str] = []
-    source_method = "csv_only"
+    source_method = "catalog_only"
     failures: list[str] = []
 
     try:

@@ -58,10 +58,11 @@ _POLICY_PATTERN = re.compile(
     r"(?P<value>(?=[A-Z0-9._/-]{5,}\b)(?=[A-Z0-9._/-]*\d)[A-Z0-9][A-Z0-9._/-]{4,})"
 )
 _ADDRESS_LINE_PATTERN = re.compile(
-    r"(?i)\b(?:room|flat|floor|block|tower|road|street|avenue|ave|district)\b[^\n,;。！？!?]{0,60}"
+    r"(?i)\b(?:(?:room|flat|floor|block|tower)\s+\d[\w-]*|"
+    r"\d+\s+(?:road|street|avenue|ave|district))\b[^\n,;。！？!?]{0,60}"
 )
 _ADDRESS_CJK_PATTERN = re.compile(
-    r"(?:(?:\d+[A-Za-z-]*\s*)?(?:室|樓|层|層|座|大廈|大厦|街|路|區|区))[^\n,;。！？!?]{0,40}"
+    r"\d+[A-Za-z-]*\s*(?:室|樓|层|層|座|大廈|大厦|街|路|區|区)[^\n,;。！？!?]{0,40}"
 )
 _ADDRESS_CUES = (
     re.compile(
@@ -98,6 +99,15 @@ _FAMILY_NAME_LINE = re.compile(
 )
 _UNKNOWN_RE = re.compile(r"Unknown (?:Phone Number|Sender Name|Insurance Ticket Number|Chat ID|Group Name|Occupation|Living Address|Family Member Name)")
 
+# Filesystem-path pattern: matches /Users/<user>/… or /home/<user>/… absolute paths.
+# Replaces the home prefix up to and including the first path component after home directory.
+UNKNOWN_PATH = "[HOME]"
+_HOME_PATH_PATTERN = re.compile(
+    r"(?:/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+|"
+    r"C:\\Users\\[A-Za-z0-9._-]+|C:/Users/[A-Za-z0-9._-]+)"
+    r"(?:[/\\][^\s\"'`,;)}\]>]+)?"
+)
+
 
 @dataclass
 class SanitizationResult:
@@ -111,11 +121,18 @@ class SanitizationResult:
 
 
 class TextPrivacySanitizer:
-    """Sanitize text payloads before they leave the local machine."""
+    """Sanitize text payloads before they leave the local machine.
 
-    def __init__(self, config: PrivacyGatewayConfig):
+    Privacy pipeline step 5 in ``PRIVACY_PIPELINE.md``.
+    The sanitizer is deterministic: it uses structured-field rules, regex
+    matching, and a session-scoped placeholder cache rather than another model.
+    """
+
+    def __init__(self, config: PrivacyGatewayConfig, *, known_names: set[str] | None = None):
         self.config = config
         self._session_cache: dict[str, dict[str, str]] = defaultdict(dict)
+        # Names that should always be redacted (loaded from contacts / reply targets).
+        self._known_names: set[str] = {n for n in (known_names or set()) if n and len(n) >= 2}
 
     def sanitize_chat_payload(
         self,
@@ -125,10 +142,14 @@ class TextPrivacySanitizer:
     ) -> SanitizationResult:
         body = copy.deepcopy(payload)
         messages = body.get("messages")
+        # The session key lets repeated private tokens be masked consistently
+        # across later turns and local debug snapshots.
         session_key = self._extract_session_key(messages, headers=headers)
         placeholder_map = dict(self._session_cache.get(session_key, {}))
         reasons: list[str] = []
 
+        # First sanitize every message and then sanitize any other top-level
+        # payload fields that may also carry private values.
         if isinstance(messages, list):
             body["messages"] = [self._sanitize_message(m, placeholder_map, reasons) for m in messages]
         for key, value in list(body.items()):
@@ -143,6 +164,8 @@ class TextPrivacySanitizer:
                 self._remember_token(placeholder_map, value, placeholder)
                 body[key] = placeholder
 
+    # Validation is a second pass: after masking, look again for anything
+    # that still resembles raw private data.
         validation = self._validate_payload(body, placeholder_map)
         reasons.extend(validation)
 
@@ -273,7 +296,16 @@ class TextPrivacySanitizer:
         reasons: list[str],
     ) -> str:
         clean = text
+        # Ordered masking pipeline:
+        # 1) exact previously seen tokens
+        # 2) structured field replacements
+        # 3) JSON-like field replacements
+        # 4) free-text patterns such as policy IDs, phones, chat IDs, addresses,
+        #    occupations, and family-member names
+        # 5) exact-token pass again to catch repeats revealed by new mappings
         clean = self._apply_exact_placeholders(clean, placeholder_map)
+        clean = self._replace_filesystem_paths(clean, placeholder_map)
+        clean = self._replace_known_names(clean, placeholder_map)
         clean = self._sanitize_structured_fields(clean, placeholder_map)
         clean = self._sanitize_json_fields(clean, placeholder_map)
         clean = self._replace_pattern(clean, _POLICY_PATTERN, UNKNOWN_TICKET, placeholder_map)
@@ -328,6 +360,24 @@ class TextPrivacySanitizer:
             return UNKNOWN_CHAT_ID
 
         return _CHAT_ID_PATTERN.sub(_repl, text)
+
+    def _replace_filesystem_paths(self, text: str, placeholder_map: dict[str, str]) -> str:
+        """Replace absolute home-directory paths with a generic placeholder."""
+        def _repl(match: re.Match[str]) -> str:
+            raw = match.group(0)
+            self._remember_token(placeholder_map, raw, UNKNOWN_PATH)
+            return UNKNOWN_PATH
+
+        return _HOME_PATH_PATTERN.sub(_repl, text)
+
+    def _replace_known_names(self, text: str, placeholder_map: dict[str, str]) -> str:
+        """Replace pre-loaded known names (from contacts/reply targets) with a placeholder."""
+        clean = text
+        for name in sorted(self._known_names, key=len, reverse=True):
+            if name in clean:
+                self._remember_token(placeholder_map, name, UNKNOWN_SENDER_NAME)
+                clean = clean.replace(name, UNKNOWN_SENDER_NAME)
+        return clean
 
     def _replace_addresses(self, text: str, placeholder_map: dict[str, str]) -> str:
         clean = text
@@ -432,6 +482,7 @@ class TextPrivacySanitizer:
         payload: dict[str, Any],
         placeholder_map: dict[str, str],
     ) -> list[str]:
+        # Fail-closed support: collect residual-risk reasons after sanitization.
         reasons: list[str] = []
         messages = payload.get("messages")
         if not isinstance(messages, list):
@@ -483,6 +534,8 @@ class TextPrivacySanitizer:
                 reasons.append(f"unmasked seen token: {placeholder}")
         if _CHAT_ID_PATTERN.search(text):
             reasons.append("chat identifier still present")
+        if _HOME_PATH_PATTERN.search(text):
+            reasons.append("filesystem path still present")
         for match in _PHONE_PATTERN.finditer(text):
             if _looks_like_datetime_fragment(match.group(0)):
                 continue
@@ -497,7 +550,7 @@ class TextPrivacySanitizer:
             if not match:
                 continue
             value = self._normalized_candidate(match.group("value"))
-            if not value:
+            if not value or len(value) < 3:
                 continue
             if value != UNKNOWN_ADDRESS:
                 reasons.append("address still present")
@@ -578,8 +631,37 @@ class TextPrivacySanitizer:
 
 
 def privacy_debug_dir(workspace: Path) -> Path:
-    """Return the local directory used for privacy debug payloads."""
-    return Path(__file__).resolve().parents[2] / "test_words"
+    """Return the local directory used for privacy debug payloads.
+
+    Note: the current implementation anchors this to the repo's ``test_words/``
+    directory rather than deriving it from ``workspace``.
+    """
+    from nanobot.utils.paths import project_path
+    return project_path("test_words")
+
+
+def load_known_names(workspace: Path) -> set[str]:
+    """Collect human names from whatsapp_reply_targets.json for privacy redaction.
+
+    Returns a set of non-trivial name strings (>= 2 chars, not purely numeric).
+    """
+    names: set[str] = set()
+    targets_file = workspace / "data" / "whatsapp_reply_targets.json"
+    if not targets_file.is_file():
+        return names
+    try:
+        data = json.loads(targets_file.read_text(encoding="utf-8"))
+        for group in ("direct_reply_targets", "group_reply_targets"):
+            for entry in data.get(group, []):
+                push = str(entry.get("push_name") or "").strip()
+                label = str(entry.get("label") or "").strip()
+                for raw in (push, label):
+                    # Skip empty, too-short, or purely-numeric values.
+                    if raw and len(raw) >= 2 and not raw.replace(" ", "").replace("+", "").isdigit():
+                        names.add(raw)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return names
 
 
 def _address_like_text_present(text: str) -> bool:

@@ -62,7 +62,8 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
     assert "Current Time:" in user_content
     assert "Channel: cli" in user_content
-    assert "Chat ID: direct" in user_content
+    # Chat ID is no longer injected into the prompt (privacy hardening)
+    assert "Chat ID:" not in user_content
     assert "Return exactly: OK" in user_content
 
 
@@ -88,7 +89,8 @@ def test_whatsapp_direct_runtime_context_includes_sender_metadata(tmp_path) -> N
     assert "Conversation Mode: whatsapp_direct" in user_content
     assert "Is Group: false" in user_content
     assert "Sender Name: Alice Chan" in user_content
-    assert "Sender Phone: +852 1234 5678" in user_content
+    # Sender Phone is omitted in DM contexts (privacy hardening)
+    assert "Sender Phone:" not in user_content
 
 
 def test_whatsapp_group_runtime_context_includes_group_metadata(tmp_path) -> None:
