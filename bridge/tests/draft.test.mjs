@@ -53,22 +53,32 @@ class FakePage {
     openByPhoneSuccess = true,
     searchVisible = true,
     searchMatch = false,
+    searchText = '',
+    searchResetWorks = true,
+    searchClickOpensChat = true,
     composeText = '',
     historySnapshots = [],
     readyAfterWaits = 0,
     initialUrl = 'about:blank',
     sidebarPages = [],
+    openedChatHeaderText = '',
+    pageHeaderText = '',
+    composeLabel = '',
+    composePlaceholder = '',
+    pageTitle = '',
   } = {}) {
     this.openByPhoneSuccess = openByPhoneSuccess;
     this.searchVisible = searchVisible;
     this.searchMatch = searchMatch;
+    this.searchResetWorks = searchResetWorks;
+    this.searchClickOpensChat = searchClickOpensChat;
     this.composeText = composeText;
     this.composeVisible = composeText.length > 0;
     this.focus = 'search';
     this.gotoUrls = [];
     this.insertedTexts = [];
     this.pressedKeys = [];
-    this.searchText = '';
+    this.searchText = searchText;
     this.historySnapshots = historySnapshots;
     this.historyIndex = 0;
     this.readyAfterWaits = readyAfterWaits;
@@ -76,6 +86,11 @@ class FakePage {
     this.currentUrl = initialUrl;
     this.sidebarPages = sidebarPages;
     this.sidebarIndex = 0;
+    this.openedChatHeaderText = openedChatHeaderText;
+    this.pageHeaderText = pageHeaderText;
+    this.composeLabel = composeLabel;
+    this.composePlaceholder = composePlaceholder;
+    this.pageTitle = pageTitle;
     this.keyboard = {
       insertText: async (text) => {
         this.insertedTexts.push(text);
@@ -132,6 +147,54 @@ class FakePage {
   }
 
   async evaluate(_fn, arg = {}) {
+    if (arg.action === 'opened_chat_snapshot') {
+      const headerText = this.openedChatHeaderText || this.searchText;
+      return {
+        url: this.currentUrl,
+        title: this.pageTitle || this.pageHeaderText || this.searchText,
+        headerText,
+        composeLabel: this.composeLabel || headerText,
+        composePlaceholder: this.composePlaceholder,
+      };
+    }
+    if (arg.action === 'search_box_state') {
+      return {
+        found: this.searchVisible,
+        value: this.searchVisible ? this.searchText.trim() : '',
+      };
+    }
+    if (arg.action === 'reset_search_box') {
+      if (!this.searchVisible || !this.searchResetWorks) {
+        return false;
+      }
+      this.focus = 'search';
+      this.searchText = '';
+      return true;
+    }
+    if (arg.action === 'focus_exact_search_box') {
+      if (!this.searchVisible) {
+        return false;
+      }
+      this.focus = 'search';
+      return true;
+    }
+    if (arg.action === 'search_result_row_visible') {
+      return this.searchMatch;
+    }
+    if (arg.action === 'click_search_result_row') {
+      if (!this.searchMatch) {
+        return false;
+      }
+      this.focus = 'result';
+      if (this.searchClickOpensChat) {
+        this.composeVisible = true;
+        this.currentUrl = 'https://web.whatsapp.com/';
+        if (!this.openedChatHeaderText) {
+          this.openedChatHeaderText = this.searchText;
+        }
+      }
+      return true;
+    }
     if (arg.action === 'extract_history') {
       return {
         messages: this.historySnapshots[this.historyIndex] || [],
@@ -156,6 +219,7 @@ class FakePage {
       if (visible.includes(arg.target?.chatId)) {
         this.composeVisible = true;
         this.currentUrl = 'https://web.whatsapp.com/';
+        this.openedChatHeaderText = arg.target?.phone || arg.target?.searchTerms?.[0] || arg.target?.chatId || '';
         return true;
       }
       return false;
@@ -189,8 +253,8 @@ class FakePage {
     if (Object.keys(arg).length === 0) {
       return {
         url: this.currentUrl,
-        title: this.searchText,
-        headerText: this.searchText,
+        title: this.pageTitle || this.searchText,
+        headerText: this.pageHeaderText || this.searchText,
       };
     }
     return null;
@@ -312,8 +376,12 @@ test('prepareDraft fills compose box without sending when phone lookup succeeds'
   assert.ok(!page.pressedKeys.includes('Enter'));
 });
 
-test('prepareDraft falls back to chat search when phone open is unavailable', async () => {
-  const page = new FakePage({ openByPhoneSuccess: false, searchMatch: true });
+test('prepareDraft clears stale search text before chat search when phone open is unavailable', async () => {
+  const page = new FakePage({
+    openByPhoneSuccess: false,
+    searchMatch: true,
+    searchText: 'Stale search',
+  });
   const composer = new DraftComposer('/tmp/wa-web', new FakeBrowserConnector(page), 'launch');
 
   const result = await composer.prepareDraft(
@@ -323,6 +391,7 @@ test('prepareDraft falls back to chat search when phone open is unavailable', as
 
   assert.equal(result.status, 'draft_prepared');
   assert.deepEqual(page.insertedTexts, ['Alice', 'Draft reply']);
+  assert.equal(page.searchText, 'Alice');
 });
 
 test('prepareDraft reports busy compose box instead of overwriting text', async () => {
@@ -415,9 +484,36 @@ test('scrapeHistory waits for WhatsApp Web login before scraping', async () => {
   assert.equal(result.messages[0].content, 'Hello after login');
 });
 
+test('scrapeHistory verifies the open chat from the main chat header instead of the first page header', async () => {
+  const page = new FakePage({
+    searchMatch: true,
+    pageHeaderText: '2',
+    openedChatHeaderText: '1234567890',
+    historySnapshots: [
+      [
+        {
+          id: 'false_msg-1',
+          content: 'Hello from main header',
+          fromMe: false,
+          metaText: '[10:11, 9/3/2026] Alice:',
+        },
+      ],
+    ],
+  });
+  const composer = new HistoryParser('/tmp/wa-web', new FakeBrowserConnector(page), 'launch');
+
+  const result = await composer.scrapeHistory(
+    { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+  );
+
+  assert.equal(result.status, 'history_scraped');
+  assert.equal(result.messages[0].content, 'Hello from main header');
+});
+
 test('scrapeReplyTargets scans visible sidebar chats without phone navigation', async () => {
   const page = new FakePage({
     initialUrl: 'https://web.whatsapp.com/',
+    searchText: 'Stale sidebar filter',
     sidebarPages: [['123@s.whatsapp.net']],
     historySnapshots: [
       [
@@ -441,6 +537,7 @@ test('scrapeReplyTargets scans visible sidebar chats without phone navigation', 
   assert.equal(result.results[0].status, 'history_scraped');
   assert.equal(result.results[0].messages[0].content, 'Hello from sidebar');
   assert.ok(!page.gotoUrls.some((url) => url.includes('/send?phone=')));
+  assert.equal(page.searchText, '');
 });
 
 test('prepareDraft in cdp mode is disabled before any CDP attach happens', async () => {
@@ -510,6 +607,7 @@ test('scrapeHistory does not reopen a CDP window for true chat_not_found results
     initialUrl: 'https://web.whatsapp.com/',
     searchVisible: true,
     searchMatch: false,
+    searchText: 'Poisoned query',
   });
   const connector = new FakeBrowserConnector(page);
   const spawnCalls = [];
@@ -531,6 +629,138 @@ test('scrapeHistory does not reopen a CDP window for true chat_not_found results
 
   assert.equal(result.status, 'chat_not_found');
   assert.equal(spawnCalls.length, 0);
+  assert.equal(page.searchText, 'Missing Client');
+});
+
+test('scrapeHistory retries in a fresh CDP window when attached page search cannot be reset cleanly', async () => {
+  const firstPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: true,
+    searchMatch: true,
+    searchText: 'Stale query',
+    searchResetWorks: false,
+  });
+  const secondPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchMatch: true,
+    historySnapshots: [
+      [
+        {
+          id: 'false_msg-1',
+          content: 'Hello after search reset retry',
+          fromMe: false,
+          metaText: '[10:11, 9/3/2026] Alice:',
+        },
+      ],
+    ],
+  });
+  const browsers = [
+    new FakeAttachedBrowser(new FakeContext([firstPage])),
+    new FakeAttachedBrowser(new FakeContext([secondPage])),
+  ];
+  const connector = {
+    launchCalls: 0,
+    connectCalls: [],
+    async launchPersistentContext() {
+      this.launchCalls += 1;
+      throw new Error('launch mode not expected');
+    },
+    async connectOverCDP(endpointURL) {
+      this.connectCalls.push(endpointURL);
+      return browsers[Math.min(this.connectCalls.length - 1, browsers.length - 1)];
+    },
+  };
+  const spawnCalls = [];
+
+  const composer = new HistoryParser(
+    '/tmp/wa-web',
+    connector,
+    'cdp',
+    'http://127.0.0.1:9222',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return new FakeSpawnedProcess();
+    },
+  );
+
+  const result = await composer.scrapeHistory(
+    { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+  );
+
+  assert.equal(result.status, 'history_scraped');
+  assert.equal(result.messages[0].content, 'Hello after search reset retry');
+  assert.equal(spawnCalls.length, 1);
+});
+
+test('scrapeHistory prefers the newest WhatsApp page after a fresh-window retry', async () => {
+  const firstPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: true,
+    searchMatch: true,
+    searchText: 'Stale query',
+    searchResetWorks: false,
+  });
+  const staleRetryPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: true,
+    searchMatch: true,
+    searchText: 'Older retry tab',
+    searchResetWorks: false,
+  });
+  const freshRetryPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchMatch: true,
+    historySnapshots: [
+      [
+        {
+          id: 'false_msg-1',
+          content: 'Hello from newest page',
+          fromMe: false,
+          metaText: '[10:11, 9/3/2026] Alice:',
+        },
+      ],
+    ],
+  });
+  const browsers = [
+    new FakeAttachedBrowser(new FakeContext([firstPage])),
+    new FakeAttachedBrowser(new FakeContext([staleRetryPage, freshRetryPage])),
+  ];
+  const connector = {
+    launchCalls: 0,
+    connectCalls: [],
+    async launchPersistentContext() {
+      this.launchCalls += 1;
+      throw new Error('launch mode not expected');
+    },
+    async connectOverCDP(endpointURL) {
+      this.connectCalls.push(endpointURL);
+      return browsers[Math.min(this.connectCalls.length - 1, browsers.length - 1)];
+    },
+  };
+  const spawnCalls = [];
+
+  const composer = new HistoryParser(
+    '/tmp/wa-web',
+    connector,
+    'cdp',
+    'http://127.0.0.1:9222',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return new FakeSpawnedProcess();
+    },
+  );
+
+  const result = await composer.scrapeHistory(
+    { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+  );
+
+  assert.equal(result.status, 'history_scraped');
+  assert.equal(result.messages[0].content, 'Hello from newest page');
+  assert.equal(spawnCalls.length, 1);
+  assert.deepEqual(staleRetryPage.insertedTexts, []);
+  assert.deepEqual(freshRetryPage.insertedTexts, ['Alice']);
 });
 
 test('scrapeHistory retries in a fresh CDP window when the attached page is not ready', async () => {

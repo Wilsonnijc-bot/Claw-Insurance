@@ -119,6 +119,21 @@ interface OpenedTargetSnapshot {
   url: string;
   title: string;
   headerText: string;
+  composeLabel: string;
+  composePlaceholder: string;
+}
+
+interface SearchBoxState {
+  found: boolean;
+  value: string;
+}
+
+type SearchOpenState = 'search_reset' | 'search_typed' | 'result_found' | 'chat_opened';
+
+interface OpenTargetResult {
+  status: 'opened' | 'chat_not_found' | 'session_unusable';
+  state?: SearchOpenState;
+  matchedTerm?: string;
 }
 
 export class WhatsAppWebSession {
@@ -127,6 +142,7 @@ export class WhatsAppWebSession {
   protected page: PageDriver | null = null;
   protected queue: Promise<void> = Promise.resolve();
   protected launchedCdpProcess: SpawnedBrowserProcess | null = null;
+  protected preferNewestAttachedPage: boolean = false;
 
   constructor(
     protected readonly userDataDir: string,
@@ -168,6 +184,7 @@ export class WhatsAppWebSession {
       this.browser = null;
       this.context = null;
       this.page = null;
+      this.preferNewestAttachedPage = false;
     }
 
     if (this.page) {
@@ -175,6 +192,9 @@ export class WhatsAppWebSession {
     }
 
     const context = await this._ensureContext();
+    if (this.page) {
+      return this.page;
+    }
     this.page = await this._ensureWhatsAppPage(context);
     return this.page;
   }
@@ -190,13 +210,16 @@ export class WhatsAppWebSession {
         this.browser = null;
         this.context = null;
         this.page = null;
+        this.preferNewestAttachedPage = false;
       });
-      const attached = await this._findAttachedWhatsAppPage(this.browser, false);
+      const attached = await this._findAttachedWhatsAppPage(this.browser, false, this.preferNewestAttachedPage);
       if (attached) {
         this.context = attached.context;
         this.page = attached.page;
+        this.preferNewestAttachedPage = false;
       } else {
-        this.context = this._pickAttachedContext(this.browser);
+        this.context = this._pickAttachedContext(this.browser, this.preferNewestAttachedPage);
+        this.preferNewestAttachedPage = false;
       }
       if (!this.context) {
         throw new Error(
@@ -387,8 +410,8 @@ export class WhatsAppWebSession {
     return value.includes('/') || value.includes('\\');
   }
 
-  protected _pickAttachedContext(browser: BrowserDriver): BrowserContextDriver | null {
-    const contexts = browser.contexts();
+  protected _pickAttachedContext(browser: BrowserDriver, preferNewest: boolean = false): BrowserContextDriver | null {
+    const contexts = preferNewest ? [...browser.contexts()].reverse() : browser.contexts();
     if (contexts.length === 0) {
       return null;
     }
@@ -399,9 +422,12 @@ export class WhatsAppWebSession {
   protected async _findAttachedWhatsAppPage(
     browser: BrowserDriver,
     requireReady: boolean,
+    preferNewest: boolean = false,
   ): Promise<{ context: BrowserContextDriver; page: PageDriver } | null> {
-    for (const context of browser.contexts()) {
-      for (const page of context.pages()) {
+    const contexts = preferNewest ? [...browser.contexts()].reverse() : browser.contexts();
+    for (const context of contexts) {
+      const pages = preferNewest ? [...context.pages()].reverse() : context.pages();
+      for (const page of pages) {
         if (!this._isWhatsAppUrl(this._pageUrl(page))) {
           continue;
         }
@@ -427,23 +453,26 @@ export class WhatsAppWebSession {
 
   protected async _ensureWhatsAppPage(context: BrowserContextDriver): Promise<PageDriver> {
     if (this.browserMode === 'cdp' && this.browser) {
-      const readyAttached = await this._findAttachedWhatsAppPage(this.browser, true);
+      const readyAttached = await this._findAttachedWhatsAppPage(this.browser, true, this.preferNewestAttachedPage);
       if (readyAttached) {
         this.context = readyAttached.context;
         this.page = readyAttached.page;
+        this.preferNewestAttachedPage = false;
         return readyAttached.page;
       }
 
-      const attached = await this._findAttachedWhatsAppPage(this.browser, false);
+      const attached = await this._findAttachedWhatsAppPage(this.browser, false, this.preferNewestAttachedPage);
       if (attached) {
         this.context = attached.context;
         this.page = attached.page;
+        this.preferNewestAttachedPage = false;
         return attached.page;
       }
     }
 
     const pages = context.pages();
-    const existingWhatsAppPage = pages.find((page) => this._isWhatsAppUrl(this._pageUrl(page)));
+    const orderedPages = this.preferNewestAttachedPage ? [...pages].reverse() : pages;
+    const existingWhatsAppPage = orderedPages.find((page) => this._isWhatsAppUrl(this._pageUrl(page)));
 
     let page: PageDriver;
     if (existingWhatsAppPage) {
@@ -462,6 +491,7 @@ export class WhatsAppWebSession {
     if (!this._isWhatsAppUrl(this._pageUrl(page))) {
       await page.goto(WHATSAPP_WEB_URL, { waitUntil: 'domcontentloaded' });
     }
+    this.preferNewestAttachedPage = false;
     return page;
   }
 
@@ -513,10 +543,12 @@ export class WhatsAppWebSession {
     return composeBox !== null;
   }
 
-  protected async _searchAndOpenChat(page: PageDriver, target: ChatTarget): Promise<boolean> {
-    const searchBox = await this._findVisibleLocator(page, SEARCH_BOX_SELECTORS, READY_TIMEOUT_MS);
-    if (!searchBox) {
-      return false;
+  protected async _searchAndOpenChat(page: PageDriver, target: ChatTarget): Promise<OpenTargetResult> {
+    const searchBoxState = await this._getSearchBoxState(page);
+    if (!searchBoxState.found) {
+      return {
+        status: 'session_unusable',
+      };
     }
 
     for (const rawTerm of target.searchTerms) {
@@ -525,43 +557,78 @@ export class WhatsAppWebSession {
         continue;
       }
 
-      if (!(await this._focusFirstVisibleElement(page, SEARCH_BOX_SELECTORS))) {
-        continue;
-      }
-      await this._clearFocusedTextbox(page);
-      await page.keyboard.insertText(term);
-      await page.waitForTimeout?.(250);
-
-      const result = await this._findVisibleLocator(page, this._chatResultSelectors(term), SEARCH_TIMEOUT_MS);
-      if (!result) {
-        continue;
+      if (!await this._resetSearchBox(page)) {
+        return {
+          status: 'session_unusable',
+        };
       }
 
-      if (!(await this._clickFirstVisibleElement(page, this._chatResultSelectors(term)))) {
+      if (!await this._typeSearchQuery(page, term)) {
+        return {
+          status: 'session_unusable',
+          state: 'search_reset',
+          matchedTerm: term,
+        };
+      }
+
+      if (!await this._waitForMatchingSearchResultRow(page, target, term, SEARCH_TIMEOUT_MS)) {
         continue;
       }
-      const composeBox = await this._findVisibleLocator(page, COMPOSE_BOX_SELECTORS, SEARCH_TIMEOUT_MS);
-      if (composeBox && await this._openedChatMatchesTarget(page, target, term)) {
-        return true;
+
+      if (!await this._clickMatchingSearchResultRow(page, target, term)) {
+        return {
+          status: 'session_unusable',
+          state: 'result_found',
+          matchedTerm: term,
+        };
       }
+
+      if (await this._waitForOpenedChat(page, target, term, SEARCH_TIMEOUT_MS)) {
+        return {
+          status: 'opened',
+          state: 'chat_opened',
+          matchedTerm: term,
+        };
+      }
+
+      return {
+        status: 'session_unusable',
+        state: 'result_found',
+        matchedTerm: term,
+      };
     }
 
-    return false;
+    return {
+      status: 'chat_not_found',
+    };
   }
 
   protected async _openTarget(page: PageDriver, target: ChatTarget): Promise<boolean> {
-    return this._openTargetWithOptions(page, target, { allowPhoneNavigation: true });
+    const result = await this._openTargetWithOptions(page, target, { allowPhoneNavigation: true });
+    return result.status === 'opened';
   }
 
   protected async _openTargetWithOptions(
     page: PageDriver,
     target: ChatTarget,
     options: { allowPhoneNavigation: boolean },
-  ): Promise<boolean> {
-    return (
-      await this._searchAndOpenChat(page, target)
-      || (options.allowPhoneNavigation && target.phone ? await this._openChatByPhone(page, target.phone) : false)
-    );
+  ): Promise<OpenTargetResult> {
+    const searchResult = await this._searchAndOpenChat(page, target);
+    if (searchResult.status === 'opened') {
+      return searchResult;
+    }
+
+    if (options.allowPhoneNavigation && target.phone) {
+      const openedByPhone = await this._openChatByPhone(page, target.phone);
+      if (openedByPhone) {
+        return {
+          status: 'opened',
+          state: 'chat_opened',
+        };
+      }
+    }
+
+    return searchResult;
   }
 
   protected async _openedChatMatchesTarget(
@@ -569,20 +636,43 @@ export class WhatsAppWebSession {
     target: ChatTarget,
     matchedTerm: string,
   ): Promise<boolean> {
-    const snapshot = await page.evaluate(() => {
-      const header = document.querySelector('header');
+    const snapshot = await page.evaluate(({ action }) => {
+      if (action !== 'opened_chat_snapshot') {
+        return {
+          url: '',
+          title: '',
+          headerText: '',
+          composeLabel: '',
+          composePlaceholder: '',
+        };
+      }
+
+      const header = document.querySelector('#main header')
+        || document.querySelector('main header')
+        || document.querySelector('[data-testid="conversation-header"]');
+      const compose = document.querySelector('footer [data-testid="conversation-compose-box-input"]')
+        || document.querySelector('footer div[aria-label][contenteditable="true"]')
+        || document.querySelector('footer div[aria-placeholder][contenteditable="true"]')
+        || document.querySelector('footer div[contenteditable="true"][role="textbox"]')
+        || document.querySelector('footer div[contenteditable="true"]');
       return {
         url: String(location.href || ''),
         title: String(document.title || ''),
         headerText: String((header as HTMLElement | null)?.innerText || ''),
+        composeLabel: String((compose as HTMLElement | null)?.getAttribute('aria-label') || ''),
+        composePlaceholder: String((compose as HTMLElement | null)?.getAttribute('aria-placeholder') || ''),
       };
-    }) as OpenedTargetSnapshot;
+    }, { action: 'opened_chat_snapshot' }) as OpenedTargetSnapshot;
 
     const normalize = (value: string): string => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
     const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
 
-    const combined = normalize(`${snapshot.title} ${snapshot.headerText}`);
-    const combinedDigits = digits(`${snapshot.title} ${snapshot.headerText}`);
+    const combined = normalize(
+      `${snapshot.title} ${snapshot.headerText} ${snapshot.composeLabel} ${snapshot.composePlaceholder}`,
+    );
+    const combinedDigits = digits(
+      `${snapshot.title} ${snapshot.headerText} ${snapshot.composeLabel} ${snapshot.composePlaceholder}`,
+    );
     const targetPhone = digits(target.phone || '');
     const matchedDigits = digits(matchedTerm);
 
@@ -605,6 +695,23 @@ export class WhatsAppWebSession {
     return strictTerms.some((term) => combined.includes(term));
   }
 
+  protected async _waitForOpenedChat(
+    page: PageDriver,
+    target: ChatTarget,
+    matchedTerm: string,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + Math.max(timeoutMs, READY_CHECK_TIMEOUT_MS);
+    while (Date.now() < deadline) {
+      const composeBox = await this._findVisibleLocator(page, COMPOSE_BOX_SELECTORS, READY_CHECK_TIMEOUT_MS);
+      if (composeBox && await this._openedChatMatchesTarget(page, target, matchedTerm)) {
+        return true;
+      }
+      await page.waitForTimeout?.(200);
+    }
+    return false;
+  }
+
   protected async _ensureWhatsAppReady(page: PageDriver, timeoutMs: number = LOGIN_WAIT_TIMEOUT_MS): Promise<boolean> {
     const selectors = [...SEARCH_BOX_SELECTORS, ...COMPOSE_BOX_SELECTORS];
     if (await this._findVisibleLocator(page, selectors, READY_CHECK_TIMEOUT_MS)) {
@@ -620,6 +727,401 @@ export class WhatsAppWebSession {
     }
 
     return false;
+  }
+
+  protected async _getSearchBoxState(page: PageDriver): Promise<SearchBoxState> {
+    return page.evaluate(({ action, selectors }) => {
+      if (action !== 'search_box_state') {
+        return { found: false, value: '' };
+      }
+
+      const isVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+
+      const readValue = (node: HTMLElement): string => {
+        if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+          return node.value;
+        }
+        return node.innerText || node.textContent || '';
+      };
+
+      const normalize = (value: string): string => String(value || '')
+        .replace(/\u200B/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      for (const selector of selectors) {
+        for (const node of Array.from(document.querySelectorAll(selector))) {
+          if (!isVisible(node) || node.closest('footer')) {
+            continue;
+          }
+          return {
+            found: true,
+            value: normalize(readValue(node as HTMLElement)),
+          };
+        }
+      }
+
+      return { found: false, value: '' };
+    }, { action: 'search_box_state', selectors: SEARCH_BOX_SELECTORS });
+  }
+
+  protected async _resetSearchBox(page: PageDriver): Promise<boolean> {
+    const cleared = await page.evaluate(({ action, selectors }) => {
+      if (action !== 'reset_search_box') {
+        return false;
+      }
+
+      const isVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+
+      const readValue = (node: HTMLElement): string => {
+        if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+          return node.value;
+        }
+        return node.innerText || node.textContent || '';
+      };
+
+      const normalize = (value: string): string => String(value || '')
+        .replace(/\u200B/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const clearNode = (node: HTMLElement): void => {
+        if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+          node.value = '';
+          node.dispatchEvent(new Event('input', { bubbles: true }));
+          node.dispatchEvent(new Event('change', { bubbles: true }));
+          return;
+        }
+
+        node.textContent = '';
+        try {
+          node.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            inputType: 'deleteContentBackward',
+            data: null,
+          }));
+        } catch {
+          node.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      };
+
+      for (const selector of selectors) {
+        for (const node of Array.from(document.querySelectorAll(selector))) {
+          if (!isVisible(node) || node.closest('footer')) {
+            continue;
+          }
+          const element = node as HTMLElement;
+          element.focus();
+          element.click();
+          clearNode(element);
+          return normalize(readValue(element)) === '';
+        }
+      }
+
+      return false;
+    }, { action: 'reset_search_box', selectors: SEARCH_BOX_SELECTORS });
+
+    if (!cleared) {
+      return false;
+    }
+
+    await page.waitForTimeout?.(150);
+    const state = await this._getSearchBoxState(page);
+    return state.found && state.value === '';
+  }
+
+  protected async _typeSearchQuery(page: PageDriver, term: string): Promise<boolean> {
+    if (!(await this._focusExactSearchBox(page))) {
+      return false;
+    }
+
+    await page.keyboard.insertText(term);
+    await page.waitForTimeout?.(250);
+
+    const state = await this._getSearchBoxState(page);
+    return state.found && state.value === this._normalizeSearchValue(term);
+  }
+
+  protected async _focusExactSearchBox(page: PageDriver): Promise<boolean> {
+    return page.evaluate(({ action, selectors }) => {
+      if (action !== 'focus_exact_search_box') {
+        return false;
+      }
+
+      const isVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+
+      for (const selector of selectors) {
+        for (const node of Array.from(document.querySelectorAll(selector))) {
+          if (!isVisible(node) || node.closest('footer')) {
+            continue;
+          }
+          (node as HTMLElement).focus();
+          (node as HTMLElement).click();
+          return true;
+        }
+      }
+
+      return false;
+    }, { action: 'focus_exact_search_box', selectors: SEARCH_BOX_SELECTORS });
+  }
+
+  protected async _waitForMatchingSearchResultRow(
+    page: PageDriver,
+    target: ChatTarget,
+    query: string,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + Math.max(timeoutMs, READY_CHECK_TIMEOUT_MS);
+    while (Date.now() < deadline) {
+      if (await this._hasMatchingSearchResultRow(page, target, query)) {
+        return true;
+      }
+      await page.waitForTimeout?.(200);
+    }
+    return false;
+  }
+
+  protected async _hasMatchingSearchResultRow(
+    page: PageDriver,
+    target: ChatTarget,
+    query: string,
+  ): Promise<boolean> {
+    return page.evaluate(({ action, target, query }) => {
+      if (action !== 'search_result_row_visible') {
+        return false;
+      }
+
+      const isVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+
+      const normalize = (value: string): string => String(value || '')
+        .toLowerCase()
+        .replace(/\u200B/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
+
+      const root = document.querySelector('#pane-side');
+      if (!(root instanceof HTMLElement) || !isVisible(root)) {
+        return false;
+      }
+
+      const seen = new Set<HTMLElement>();
+      const rows: HTMLElement[] = [];
+      const selectors = [
+        '[role="listitem"]',
+        'div[data-testid="cell-frame-container"]',
+        'a[role="link"]',
+      ];
+
+      const addRow = (node: Element | null): void => {
+        if (!(node instanceof HTMLElement) || !root.contains(node) || !isVisible(node) || seen.has(node)) {
+          return;
+        }
+        seen.add(node);
+        rows.push(node);
+      };
+
+      for (const selector of selectors) {
+        for (const node of Array.from(root.querySelectorAll(selector))) {
+          addRow(node);
+        }
+      }
+
+      for (const node of Array.from(root.querySelectorAll('*'))) {
+        if (!(node instanceof HTMLElement) || !isVisible(node)) {
+          continue;
+        }
+        const row = node.closest(
+          '[role="listitem"], [role="button"], a[role="link"], div[data-testid="cell-frame-container"], div[tabindex="0"], div[tabindex="-1"]',
+        );
+        addRow(row);
+      }
+
+      const targetPhone = digits(String(target.phone || ''));
+      const queryDigits = digits(String(query || ''));
+      const queryTerm = normalize(String(query || ''));
+      const terms = [queryTerm, ...(Array.isArray(target.searchTerms) ? target.searchTerms : [])]
+        .map((value) => normalize(String(value || '')))
+        .filter((value, index, all) => value && all.indexOf(value) === index && (value.length >= 4 || value === queryTerm));
+
+      const scoreRow = (row: HTMLElement): number => {
+        const rowText = normalize(row.innerText || row.textContent || '');
+        const rowDigits = digits(rowText);
+        if (!rowText && !rowDigits) {
+          return 0;
+        }
+
+        let score = 0;
+        if (targetPhone && rowDigits.includes(targetPhone)) {
+          score = Math.max(score, 1000);
+        }
+        if (queryDigits && rowDigits.includes(queryDigits)) {
+          score = Math.max(score, 700 + queryDigits.length);
+        }
+        for (const term of terms) {
+          if (rowText.includes(term)) {
+            score = Math.max(score, 400 + term.length);
+          }
+        }
+        return score;
+      };
+
+      return rows.some((row) => scoreRow(row) > 0);
+    }, { action: 'search_result_row_visible', target, query });
+  }
+
+  protected async _clickMatchingSearchResultRow(
+    page: PageDriver,
+    target: ChatTarget,
+    query: string,
+  ): Promise<boolean> {
+    return page.evaluate(({ action, target, query }) => {
+      if (action !== 'click_search_result_row') {
+        return false;
+      }
+
+      const isVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+
+      const normalize = (value: string): string => String(value || '')
+        .toLowerCase()
+        .replace(/\u200B/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
+
+      const root = document.querySelector('#pane-side');
+      if (!(root instanceof HTMLElement) || !isVisible(root)) {
+        return false;
+      }
+
+      const seen = new Set<HTMLElement>();
+      const rows: HTMLElement[] = [];
+      const selectors = [
+        '[role="listitem"]',
+        'div[data-testid="cell-frame-container"]',
+        'a[role="link"]',
+      ];
+
+      const addRow = (node: Element | null): void => {
+        if (!(node instanceof HTMLElement) || !root.contains(node) || !isVisible(node) || seen.has(node)) {
+          return;
+        }
+        seen.add(node);
+        rows.push(node);
+      };
+
+      for (const selector of selectors) {
+        for (const node of Array.from(root.querySelectorAll(selector))) {
+          addRow(node);
+        }
+      }
+
+      for (const node of Array.from(root.querySelectorAll('*'))) {
+        if (!(node instanceof HTMLElement) || !isVisible(node)) {
+          continue;
+        }
+        const row = node.closest(
+          '[role="listitem"], [role="button"], a[role="link"], div[data-testid="cell-frame-container"], div[tabindex="0"], div[tabindex="-1"]',
+        );
+        addRow(row);
+      }
+
+      const targetPhone = digits(String(target.phone || ''));
+      const queryDigits = digits(String(query || ''));
+      const queryTerm = normalize(String(query || ''));
+      const terms = [queryTerm, ...(Array.isArray(target.searchTerms) ? target.searchTerms : [])]
+        .map((value) => normalize(String(value || '')))
+        .filter((value, index, all) => value && all.indexOf(value) === index && (value.length >= 4 || value === queryTerm));
+
+      const scoreRow = (row: HTMLElement): number => {
+        const rowText = normalize(row.innerText || row.textContent || '');
+        const rowDigits = digits(rowText);
+        if (!rowText && !rowDigits) {
+          return 0;
+        }
+
+        let score = 0;
+        if (targetPhone && rowDigits.includes(targetPhone)) {
+          score = Math.max(score, 1000);
+        }
+        if (queryDigits && rowDigits.includes(queryDigits)) {
+          score = Math.max(score, 700 + queryDigits.length);
+        }
+        for (const term of terms) {
+          if (rowText.includes(term)) {
+            score = Math.max(score, 400 + term.length);
+          }
+        }
+        return score;
+      };
+
+      let bestRow: HTMLElement | null = null;
+      let bestScore = 0;
+      for (const row of rows) {
+        const score = scoreRow(row);
+        if (score > bestScore) {
+          bestScore = score;
+          bestRow = row;
+        }
+      }
+
+      if (!bestRow || bestScore <= 0) {
+        return false;
+      }
+
+      bestRow.click();
+      return true;
+    }, { action: 'click_search_result_row', target, query });
   }
 
   protected _chatResultSelectors(term: string): string[] {
@@ -736,6 +1238,13 @@ export class WhatsAppWebSession {
     } finally {
       release();
     }
+  }
+
+  protected _normalizeSearchValue(value: string): string {
+    return String(value || '')
+      .replace(/\u200B/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 }
 

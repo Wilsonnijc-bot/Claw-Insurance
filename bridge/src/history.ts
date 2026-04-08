@@ -130,6 +130,10 @@ export class HistoryParser extends WhatsAppWebSession {
         };
       }
 
+      if (!await this._resetSearchBox(page)) {
+        throw new ParseSessionUnavailableError('WhatsApp Web sidebar search could not be reset before bulk history parsing.');
+      }
+
       const results = await this._scanSidebarAndScrapeTargets(page, normalizedTargets);
       return {
         status: 'history_scraped',
@@ -211,6 +215,7 @@ export class HistoryParser extends WhatsAppWebSession {
     this.page = null;
     this.context = null;
     this.browser = null;
+    this.preferNewestAttachedPage = true;
     await this._launchCdpBrowser(true);
     this.browser = await this._waitForCDPBrowser();
     if (!this.browser) {
@@ -228,8 +233,11 @@ export class HistoryParser extends WhatsAppWebSession {
     options: { allowPhoneNavigation: boolean },
   ): Promise<'opened' | 'chat_not_found' | 'session_unusable'> {
     const opened = await this._openTargetWithOptions(page, target, options);
-    if (opened) {
+    if (opened.status === 'opened') {
       return 'opened';
+    }
+    if (opened.status === 'session_unusable') {
+      return 'session_unusable';
     }
     if (!await this._ensureWhatsAppReady(page, READY_CHECK_TIMEOUT_MS)) {
       return 'session_unusable';
