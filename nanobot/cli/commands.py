@@ -6,8 +6,10 @@ import select
 import shlex
 import signal
 import socket
+import subprocess
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -45,6 +47,18 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+DEV_RUNTIME_PORTS = (5173, 5174, 3456, 3001)
+_DEV_RUNTIME_ROOT_TOKENS = (
+    "-m nanobot ui",
+    "-m nanobot launcher",
+    "-m nanobot.privacy.gateway_server",
+)
+_DEV_RUNTIME_PARENT_TOKENS = ("npm run dev", "npm start")
+_DEV_RUNTIME_CHILD_TOKENS = (
+    "node_modules/.bin/vite",
+    "node dist/index.js",
+    "esbuild --service=",
+)
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -52,6 +66,159 @@ EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 
 _PROMPT_SESSION: PromptSession | None = None
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
+
+
+def _run_text_command(args: list[str]) -> str:
+    """Run a local command and return stdout as text."""
+    try:
+        result = subprocess.run(args, check=False, capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        return ""
+    return result.stdout or ""
+
+
+def _read_process_table() -> dict[int, tuple[int, str]]:
+    """Return ``pid -> (ppid, command)`` for local processes."""
+    processes: dict[int, tuple[int, str]] = {}
+    output = _run_text_command(["ps", "-axo", "pid=,ppid=,command="])
+    for line in output.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        processes[pid] = (ppid, parts[2])
+    return processes
+
+
+def _list_listening_pids(ports: tuple[int, ...]) -> set[int]:
+    """Return PIDs listening on the requested TCP ports."""
+    if not ports:
+        return set()
+    args = ["lsof", "-nP", "-t"]
+    args.extend(f"-iTCP:{port}" for port in ports)
+    args.append("-sTCP:LISTEN")
+    output = _run_text_command(args)
+    return {int(line) for line in output.splitlines() if line.strip().isdigit()}
+
+
+def _command_contains_any(command: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in command for token in tokens)
+
+
+def _is_dev_runtime_root_command(command: str) -> bool:
+    return _command_contains_any(command, _DEV_RUNTIME_ROOT_TOKENS)
+
+
+def _is_dev_runtime_parent_command(command: str) -> bool:
+    return _command_contains_any(command, _DEV_RUNTIME_PARENT_TOKENS)
+
+
+def _is_dev_runtime_child_command(command: str) -> bool:
+    return (
+        _is_dev_runtime_root_command(command)
+        or _is_dev_runtime_parent_command(command)
+        or _command_contains_any(command, _DEV_RUNTIME_CHILD_TOKENS)
+    )
+
+
+def _collect_nanobot_dev_runtime_pids() -> dict[int, str]:
+    """Collect local Nanobot UI runtime PIDs from ports plus process signatures."""
+    processes = _read_process_table()
+    if not processes:
+        return {}
+
+    children: dict[int, set[int]] = defaultdict(set)
+    for pid, (ppid, _command) in processes.items():
+        children[ppid].add(pid)
+
+    targets: dict[int, str] = {}
+    for pid, (_ppid, command) in processes.items():
+        if _is_dev_runtime_root_command(command):
+            targets[pid] = command
+
+    for pid in _list_listening_pids(DEV_RUNTIME_PORTS):
+        if pid in processes:
+            targets[pid] = processes[pid][1]
+
+    queue = list(targets)
+    index = 0
+    while index < len(queue):
+        pid = queue[index]
+        index += 1
+
+        current = pid
+        while current in processes:
+            parent_pid = processes[current][0]
+            if parent_pid not in processes:
+                break
+            parent_command = processes[parent_pid][1]
+            if not (_is_dev_runtime_root_command(parent_command) or _is_dev_runtime_parent_command(parent_command)):
+                break
+            if parent_pid not in targets:
+                targets[parent_pid] = parent_command
+                queue.append(parent_pid)
+            current = parent_pid
+
+        for child_pid in children.get(pid, set()):
+            child_command = processes[child_pid][1]
+            if _is_dev_runtime_child_command(child_command) and child_pid not in targets:
+                targets[child_pid] = child_command
+                queue.append(child_pid)
+
+    return dict(sorted(targets.items()))
+
+
+def _signal_pids(pids: set[int] | list[int], sig: int) -> set[int]:
+    """Send one signal to every PID that still exists."""
+    signaled: set[int] = set()
+    for pid in sorted(set(pids)):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        signaled.add(pid)
+    return signaled
+
+
+def _live_pids(pids: set[int] | list[int]) -> set[int]:
+    """Return the subset of PIDs that are still alive."""
+    live: set[int] = set()
+    for pid in set(pids):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            live.add(pid)
+        else:
+            live.add(pid)
+    return live
+
+
+def _stop_local_dev_runtime(wait_seconds: float = 1.0) -> tuple[dict[int, str], set[int], set[int], set[int]]:
+    """Stop the local Nanobot UI development runtime."""
+    matched = _collect_nanobot_dev_runtime_pids()
+    if not matched:
+        return {}, set(), set(), set()
+
+    terminated = _signal_pids(set(matched), signal.SIGTERM)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+    remaining = _live_pids(set(matched))
+    killed: set[int] = set()
+    if remaining:
+        killed = _signal_pids(remaining, signal.SIGKILL)
+        time.sleep(0.2)
+        remaining = _live_pids(remaining)
+
+    return matched, terminated, killed, remaining
 
 
 def _flush_pending_tty_input() -> None:
@@ -402,6 +569,31 @@ def ui(
         raise typer.Exit(e.returncode or 1)
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("stop-dev")
+def stop_dev():
+    """Stop the local Nanobot UI development runtime."""
+    matched, terminated, killed, remaining = _stop_local_dev_runtime()
+
+    if not matched:
+        console.print(
+            "[green]✓[/green] No active Nanobot local dev processes found "
+            "(checked ports 5173, 5174, 3456, 3001)"
+        )
+        return
+
+    stopped = terminated | killed
+    console.print(
+        f"[green]✓[/green] Stopped {len(stopped)} Nanobot local dev process(es) "
+        "(checked ports 5173, 5174, 3456, 3001)"
+    )
+    if remaining:
+        console.print(
+            "[red]Some Nanobot local dev processes are still running: "
+            f"{', '.join(str(pid) for pid in sorted(remaining))}[/red]"
+        )
         raise typer.Exit(1)
 
 
@@ -1252,132 +1444,6 @@ def _ensure_whatsapp_bridge_browser(bridge_dir: Path, config: Config, env: dict[
         raise typer.Exit(1)
 
 
-def _cdp_probe_url(endpoint: str) -> str:
-    """Return the CDP JSON/version probe URL for an endpoint."""
-    parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
-    scheme = "https" if parsed.scheme == "wss" else "http"
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 9222
-    return f"{scheme}://{host}:{port}/json/version"
-
-
-def _whatsapp_cdp_running(config: Config) -> bool:
-    """Return True when the configured CDP endpoint responds like a Chrome debugger."""
-    import json
-    import urllib.request
-
-    endpoint = config.channels.whatsapp.web_cdp_url
-    try:
-        with urllib.request.urlopen(_cdp_probe_url(endpoint), timeout=0.5) as response:
-            if response.status != 200:
-                return False
-            payload = json.loads(response.read().decode("utf-8", errors="ignore") or "{}")
-            return bool(payload.get("webSocketDebuggerUrl") or payload.get("Browser"))
-    except Exception:
-        parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 9222
-        try:
-            with socket.create_connection((host, port), timeout=0.3):
-                return True
-        except OSError:
-            return False
-
-
-def _resolve_whatsapp_cdp_chrome_command(config: Config) -> str:
-    """Resolve the Chrome/Chromium executable used for CDP launch."""
-    import shutil
-
-    path_separators = tuple(sep for sep in (os.sep, os.altsep) if sep)
-    configured = os.path.expanduser(config.channels.whatsapp.web_cdp_chrome_path.strip())
-    if configured:
-        if any(sep in configured for sep in path_separators) and not Path(configured).exists():
-            console.print(f"[red]Configured webCdpChromePath does not exist: {configured}[/red]")
-            raise typer.Exit(1)
-        return configured
-
-    candidates = [
-        os.environ.get("CHROME_PATH", ""),
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        str(Path.home() / "Applications" / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome"),
-        str(Path.home() / "Applications" / "Chromium.app" / "Contents" / "MacOS" / "Chromium"),
-        shutil.which("google-chrome") or "",
-        shutil.which("google-chrome-stable") or "",
-        shutil.which("chromium") or "",
-        shutil.which("chromium-browser") or "",
-        shutil.which("microsoft-edge") or "",
-        shutil.which("msedge") or "",
-    ]
-    for candidate in candidates:
-        expanded = os.path.expanduser(candidate.strip())
-        if not expanded:
-            continue
-        if Path(expanded).exists() or not any(sep in expanded for sep in path_separators):
-            return expanded
-
-    console.print(
-        "[red]No Chrome/Chromium executable was found for WhatsApp CDP launch. "
-        "Set channels.whatsapp.webCdpChromePath in config.[/red]"
-    )
-    raise typer.Exit(1)
-
-
-def _build_whatsapp_cdp_launch_command(config: Config) -> list[str]:
-    """Build the Chrome command used for WhatsApp CDP mode."""
-    parsed = urlparse(config.channels.whatsapp.web_cdp_url if "://" in config.channels.whatsapp.web_cdp_url else f"http://{config.channels.whatsapp.web_cdp_url}")
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 9222
-    profile_dir = config.channels.whatsapp.web_profile_dir
-    return [
-        _resolve_whatsapp_cdp_chrome_command(config),
-        f"--remote-debugging-port={port}",
-        f"--remote-debugging-address={host}",
-        f"--user-data-dir={profile_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--new-window",
-        "https://web.whatsapp.com/",
-    ]
-
-
-def _ensure_whatsapp_cdp_browser(config: Config):
-    """Launch or reuse the configured CDP browser for WhatsApp Web."""
-    import subprocess
-
-    wa = config.channels.whatsapp
-    if wa.web_browser_mode != "cdp":
-        return None
-
-    if _whatsapp_cdp_running(config):
-        console.print("[green]✓[/green] WhatsApp Web CDP browser ready")
-        return None
-
-    command = _build_whatsapp_cdp_launch_command(config)
-    console.print("WhatsApp Web CDP browser not detected, launching Chrome...")
-    proc = subprocess.Popen(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            console.print(f"[red]WhatsApp Web CDP browser exited early with code {proc.returncode}[/red]")
-            raise typer.Exit(1)
-        if _whatsapp_cdp_running(config):
-            console.print("[green]✓[/green] WhatsApp Web CDP browser ready")
-            return proc
-        time.sleep(0.2)
-
-    console.print("[red]WhatsApp Web CDP browser did not become ready in time[/red]")
-    raise typer.Exit(1)
-
-
 def _whatsapp_bridge_running(config: Config) -> bool:
     """Return True when the local WhatsApp bridge accepts a stable WebSocket connection."""
     bridge_url = config.channels.whatsapp.bridge_url
@@ -1447,9 +1513,6 @@ def _start_whatsapp_bridge(config: Config):
 
     if not config.channels.whatsapp.enabled:
         return None
-
-    if config.channels.whatsapp.web_browser_mode == "cdp":
-        _ensure_whatsapp_cdp_browser(config)
 
     if _whatsapp_bridge_running(config):
         console.print("[green]✓[/green] WhatsApp bridge already running")
@@ -1585,15 +1648,12 @@ def channels_login():
 
 @channels_app.command("whatsapp-web")
 def channels_whatsapp_web():
-    """Launch or reuse the WhatsApp Web CDP browser."""
-    from nanobot.config.loader import load_config
-
-    config = load_config()
-    if config.channels.whatsapp.web_browser_mode != "cdp":
-        console.print("[red]channels.whatsapp.webBrowserMode must be set to 'cdp' for this command.[/red]")
-        raise typer.Exit(1)
-
-    _ensure_whatsapp_cdp_browser(config)
+    """Explain that standalone WhatsApp Web CDP launch is disabled."""
+    console.print(
+        "[red]Standalone WhatsApp Web CDP launch is disabled. "
+        "CDP is managed only during WhatsApp history parsing.[/red]"
+    )
+    raise typer.Exit(1)
 
 
 @whatsapp_contacts_app.command("init")

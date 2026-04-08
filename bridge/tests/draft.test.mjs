@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { DraftComposer } from '../dist/draft.js';
+import { HistoryParser } from '../dist/history.js';
 
 class FakeLocator {
   constructor(page, role) {
@@ -56,6 +57,7 @@ class FakePage {
     historySnapshots = [],
     readyAfterWaits = 0,
     initialUrl = 'about:blank',
+    sidebarPages = [],
   } = {}) {
     this.openByPhoneSuccess = openByPhoneSuccess;
     this.searchVisible = searchVisible;
@@ -72,6 +74,8 @@ class FakePage {
     this.readyAfterWaits = readyAfterWaits;
     this.waitCalls = 0;
     this.currentUrl = initialUrl;
+    this.sidebarPages = sidebarPages;
+    this.sidebarIndex = 0;
     this.keyboard = {
       insertText: async (text) => {
         this.insertedTexts.push(text);
@@ -140,6 +144,54 @@ class FakePage {
         return true;
       }
       return false;
+    }
+    if (arg.action === 'find_sidebar_targets') {
+      const visible = this.sidebarPages[this.sidebarIndex] || [];
+      return (arg.targets || [])
+        .map((target) => target.chatId)
+        .filter((chatId) => visible.includes(chatId));
+    }
+    if (arg.action === 'open_sidebar_target') {
+      const visible = this.sidebarPages[this.sidebarIndex] || [];
+      if (visible.includes(arg.target?.chatId)) {
+        this.composeVisible = true;
+        this.currentUrl = 'https://web.whatsapp.com/';
+        return true;
+      }
+      return false;
+    }
+    if (arg.action === 'scroll_sidebar_down') {
+      if (this.sidebarIndex < this.sidebarPages.length - 1) {
+        this.sidebarIndex += 1;
+        return true;
+      }
+      return false;
+    }
+    if (arg.action === 'sidebar_ready') {
+      return this.currentUrl === 'https://web.whatsapp.com/';
+    }
+    if (Array.isArray(arg.selectors)) {
+      const selectors = arg.selectors.join(' ');
+      if ((selectors.includes('Search input textbox') || selectors.includes('data-tab="3"')) && this.searchVisible) {
+        this.focus = 'search';
+        return true;
+      }
+      if (
+        (selectors.includes('title=') || selectors.includes('title*=') || selectors.includes('aria-label*=') || selectors.includes('data-testid*='))
+        && this.searchMatch
+      ) {
+        this.focus = 'result';
+        this.composeVisible = true;
+        return true;
+      }
+      return false;
+    }
+    if (Object.keys(arg).length === 0) {
+      return {
+        url: this.currentUrl,
+        title: this.searchText,
+        headerText: this.searchText,
+      };
     }
     return null;
   }
@@ -288,7 +340,7 @@ test('prepareDraft reports busy compose box instead of overwriting text', async 
 
 test('scrapeHistory collects visible and older messages without sending anything', async () => {
   const page = new FakePage({
-    openByPhoneSuccess: true,
+    searchMatch: true,
     historySnapshots: [
       [
         {
@@ -314,7 +366,7 @@ test('scrapeHistory collects visible and older messages without sending anything
       ],
     ],
   });
-  const composer = new DraftComposer('/tmp/wa-web', new FakeBrowserConnector(page), 'launch');
+  const composer = new HistoryParser('/tmp/wa-web', new FakeBrowserConnector(page), 'launch');
 
   const result = await composer.scrapeHistory(
     { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
@@ -339,7 +391,7 @@ test('scrapeHistory collects visible and older messages without sending anything
 
 test('scrapeHistory waits for WhatsApp Web login before scraping', async () => {
   const page = new FakePage({
-    openByPhoneSuccess: true,
+    searchMatch: true,
     readyAfterWaits: 1,
     historySnapshots: [
       [
@@ -352,7 +404,7 @@ test('scrapeHistory waits for WhatsApp Web login before scraping', async () => {
       ],
     ],
   });
-  const composer = new DraftComposer('/tmp/wa-web', new FakeBrowserConnector(page), 'launch');
+  const composer = new HistoryParser('/tmp/wa-web', new FakeBrowserConnector(page), 'launch');
 
   const result = await composer.scrapeHistory(
     { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
@@ -363,7 +415,35 @@ test('scrapeHistory waits for WhatsApp Web login before scraping', async () => {
   assert.equal(result.messages[0].content, 'Hello after login');
 });
 
-test('prepareDraft attaches to existing CDP WhatsApp tab without launching a separate profile', async () => {
+test('scrapeReplyTargets scans visible sidebar chats without phone navigation', async () => {
+  const page = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    sidebarPages: [['123@s.whatsapp.net']],
+    historySnapshots: [
+      [
+        {
+          id: 'false_msg-1',
+          content: 'Hello from sidebar',
+          fromMe: false,
+          metaText: '[10:11, 9/3/2026] Alice:',
+        },
+      ],
+    ],
+  });
+  const connector = new FakeBrowserConnector(page);
+  const composer = new HistoryParser('/tmp/wa-web', connector, 'cdp', 'http://127.0.0.1:9222');
+
+  const result = await composer.scrapeReplyTargets([
+    { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+  ]);
+
+  assert.equal(result.status, 'history_scraped');
+  assert.equal(result.results[0].status, 'history_scraped');
+  assert.equal(result.results[0].messages[0].content, 'Hello from sidebar');
+  assert.ok(!page.gotoUrls.some((url) => url.includes('/send?phone=')));
+});
+
+test('prepareDraft in cdp mode is disabled before any CDP attach happens', async () => {
   const page = new FakePage({
     openByPhoneSuccess: true,
     initialUrl: 'https://web.whatsapp.com/',
@@ -376,20 +456,34 @@ test('prepareDraft attaches to existing CDP WhatsApp tab without launching a sep
     'Hello Alice',
   );
 
-  assert.equal(result.status, 'draft_prepared');
-  assert.deepEqual(connector.connectCalls, ['http://127.0.0.1:9222']);
+  assert.equal(result.status, 'not_ready');
+  assert.equal(
+    result.detail,
+    'WhatsApp Web draft placement is disabled in CDP mode; CDP is reserved for history parsing.',
+  );
+  assert.deepEqual(connector.connectCalls, []);
   assert.equal(connector.launchCalls, 0);
   assert.ok(!page.gotoUrls.includes('https://web.whatsapp.com/'));
 });
 
-test('prepareDraft launches a debuggable Chrome when CDP is missing and then attaches', async () => {
+test('scrapeHistory reuses an attached CDP page when it is already usable', async () => {
   const page = new FakePage({
-    openByPhoneSuccess: true,
     initialUrl: 'https://web.whatsapp.com/',
+    searchMatch: true,
+    historySnapshots: [
+      [
+        {
+          id: 'false_msg-1',
+          content: 'Hello from reused session',
+          fromMe: false,
+          metaText: '[10:11, 9/3/2026] Alice:',
+        },
+      ],
+    ],
   });
-  const connector = new FakeBrowserConnector(page, { failConnectCalls: 1 });
+  const connector = new FakeBrowserConnector(page);
   const spawnCalls = [];
-  const composer = new DraftComposer(
+  const composer = new HistoryParser(
     '/tmp/wa-web',
     connector,
     'cdp',
@@ -401,17 +495,176 @@ test('prepareDraft launches a debuggable Chrome when CDP is missing and then att
     },
   );
 
-  const result = await composer.prepareDraft(
+  const result = await composer.scrapeHistory(
     { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
-    'Hello Alice',
   );
 
-  assert.equal(result.status, 'draft_prepared');
-  assert.equal(connector.launchCalls, 0);
-  assert.deepEqual(connector.connectCalls, ['http://127.0.0.1:9222', 'http://127.0.0.1:9222']);
-  assert.equal(spawnCalls.length, 1);
-  assert.equal(spawnCalls[0].command, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
-  assert.ok(spawnCalls[0].args.includes('--remote-debugging-port=9222'));
-  assert.ok(spawnCalls[0].args.includes('--user-data-dir=/tmp/wa-web'));
-  assert.ok(spawnCalls[0].args.includes('https://web.whatsapp.com/'));
+  assert.equal(result.status, 'history_scraped');
+  assert.equal(result.messages[0].content, 'Hello from reused session');
+  assert.equal(spawnCalls.length, 0);
+  assert.deepEqual(connector.connectCalls, ['http://127.0.0.1:9222']);
+});
+
+test('scrapeHistory does not reopen a CDP window for true chat_not_found results', async () => {
+  const page = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: true,
+    searchMatch: false,
+  });
+  const connector = new FakeBrowserConnector(page);
+  const spawnCalls = [];
+  const composer = new HistoryParser(
+    '/tmp/wa-web',
+    connector,
+    'cdp',
+    'http://127.0.0.1:9222',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return new FakeSpawnedProcess();
+    },
+  );
+
+  const result = await composer.scrapeHistory(
+    { chatId: 'missing@s.whatsapp.net', phone: '9999999999', searchTerms: ['Missing Client'] },
+  );
+
+  assert.equal(result.status, 'chat_not_found');
+  assert.equal(spawnCalls.length, 0);
+});
+
+test('scrapeHistory retries in a fresh CDP window when the attached page is not ready', async () => {
+  const firstPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: false,
+  });
+  const secondPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchMatch: true,
+    historySnapshots: [
+      [
+        {
+          id: 'false_msg-1',
+          content: 'Hello after fresh window',
+          fromMe: false,
+          metaText: '[10:11, 9/3/2026] Alice:',
+        },
+      ],
+    ],
+  });
+  const browsers = [
+    new FakeAttachedBrowser(new FakeContext([firstPage])),
+    new FakeAttachedBrowser(new FakeContext([secondPage])),
+  ];
+  const connector = {
+    launchCalls: 0,
+    connectCalls: [],
+    async launchPersistentContext() {
+      this.launchCalls += 1;
+      throw new Error('launch mode not expected');
+    },
+    async connectOverCDP(endpointURL) {
+      this.connectCalls.push(endpointURL);
+      return browsers[Math.min(this.connectCalls.length - 1, browsers.length - 1)];
+    },
+  };
+  const spawnCalls = [];
+  const originalDateNow = Date.now;
+  const nowValues = [0, 200000, 200000, 200000];
+  let currentNow = 0;
+  Date.now = () => {
+    if (nowValues.length > 0) {
+      currentNow = nowValues.shift();
+    }
+    return currentNow;
+  };
+
+  const composer = new HistoryParser(
+    '/tmp/wa-web',
+    connector,
+    'cdp',
+    'http://127.0.0.1:9222',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return new FakeSpawnedProcess();
+    },
+  );
+
+  try {
+    const result = await composer.scrapeHistory(
+      { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+    );
+
+    assert.equal(result.status, 'history_scraped');
+    assert.equal(result.messages[0].content, 'Hello after fresh window');
+    assert.equal(spawnCalls.length, 1);
+    assert.ok(connector.connectCalls.length >= 2);
+    assert.ok(connector.connectCalls.every((value) => value === 'http://127.0.0.1:9222'));
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
+
+test('scrapeHistory returns login_required after a fresh-window retry when WhatsApp Web is still not ready', async () => {
+  const firstPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: false,
+    readyAfterWaits: Number.POSITIVE_INFINITY,
+  });
+  const secondPage = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: false,
+    readyAfterWaits: Number.POSITIVE_INFINITY,
+  });
+  const browsers = [
+    new FakeAttachedBrowser(new FakeContext([firstPage])),
+    new FakeAttachedBrowser(new FakeContext([secondPage])),
+  ];
+  const connector = {
+    launchCalls: 0,
+    connectCalls: [],
+    async launchPersistentContext() {
+      this.launchCalls += 1;
+      throw new Error('launch mode not expected');
+    },
+    async connectOverCDP(endpointURL) {
+      this.connectCalls.push(endpointURL);
+      return browsers[Math.min(this.connectCalls.length - 1, browsers.length - 1)];
+    },
+  };
+  const spawnCalls = [];
+  const originalDateNow = Date.now;
+  const nowValues = [0, 200000, 200000, 200000, 200000, 400000];
+  let currentNow = 0;
+  Date.now = () => {
+    if (nowValues.length > 0) {
+      currentNow = nowValues.shift();
+    }
+    return currentNow;
+  };
+
+  const composer = new HistoryParser(
+    '/tmp/wa-web',
+    connector,
+    'cdp',
+    'http://127.0.0.1:9222',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return new FakeSpawnedProcess();
+    },
+  );
+
+  try {
+    const result = await composer.scrapeHistory(
+      { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+    );
+
+    assert.equal(result.status, 'login_required');
+    assert.equal(spawnCalls.length, 1);
+    assert.ok(connector.connectCalls.length >= 2);
+  } finally {
+    Date.now = originalDateNow;
+  }
 });

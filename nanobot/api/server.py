@@ -10,6 +10,7 @@ Designed to run inside the existing gateway asyncio event loop.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import traceback
 from datetime import datetime
@@ -20,6 +21,10 @@ from aiohttp import web, WSMsgType
 from loguru import logger
 
 from nanobot.api.journal import ActivityJournal
+
+CDP_DRAFT_DISABLED_DETAIL = (
+    "WhatsApp Web draft placement is disabled in CDP mode; CDP is reserved for history parsing."
+)
 
 
 class ApiServer:
@@ -48,9 +53,9 @@ class ApiServer:
         self._site: web.TCPSite | None = None
         self._outbound_task: asyncio.Task | None = None
         self._inbound_task: asyncio.Task | None = None
+        self._persisted_history_task: asyncio.Task | None = None
         self._status_task: asyncio.Task | None = None
         self._bridge_monitor_task: asyncio.Task | None = None
-        self._last_browser_status: dict[str, Any] | None = None
         self._last_auth_status: dict[str, Any] | None = None
 
         self.app = web.Application(middlewares=[self._cors_middleware])
@@ -63,6 +68,7 @@ class ApiServer:
     def _setup_routes(self) -> None:
         self.app.router.add_get("/api/clients", self._handle_get_clients)
         self.app.router.add_get("/api/clients/{phone}", self._handle_get_client)
+        self.app.router.add_delete("/api/clients/{phone}", self._handle_delete_client)
         self.app.router.add_get("/api/messages/{phone}", self._handle_get_messages)
         self.app.router.add_post("/api/messages/{phone}", self._handle_send_message)
         self.app.router.add_post("/api/ai-draft/{phone}", self._handle_ai_draft)
@@ -77,7 +83,6 @@ class ApiServer:
         self.app.router.add_get("/api/status", self._handle_status)
         self.app.router.add_post("/api/login", self._handle_login)
         self.app.router.add_post("/api/reply-targets", self._handle_add_reply_target)
-        self.app.router.add_post("/api/bridge/check", self._handle_bridge_check)
         self.app.router.add_post("/api/bridge/restart", self._handle_bridge_restart)
         self.app.router.add_get("/ws", self._handle_ws)
         # CORS preflight
@@ -143,7 +148,8 @@ class ApiServer:
         self._outbound_task = asyncio.create_task(self._mirror_outbound())
         # Start the inbound listener for auto-draft generation
         self._inbound_task = asyncio.create_task(self._mirror_inbound())
-        self._status_task = asyncio.create_task(self._monitor_whatsapp_browser_status())
+        self._persisted_history_task = asyncio.create_task(self._mirror_persisted_history())
+        self._status_task = asyncio.create_task(self._monitor_whatsapp_auth_status())
         self._bridge_monitor_task = asyncio.create_task(self._monitor_bridge_process())
         logger.info("API server running on http://{}:{}", host, port)
 
@@ -159,6 +165,12 @@ class ApiServer:
             self._inbound_task.cancel()
             try:
                 await self._inbound_task
+            except asyncio.CancelledError:
+                pass
+        if self._persisted_history_task:
+            self._persisted_history_task.cancel()
+            try:
+                await self._persisted_history_task
             except asyncio.CancelledError:
                 pass
         if self._status_task:
@@ -191,14 +203,12 @@ class ApiServer:
         self._ws_clients.add(ws)
         logger.info("WebSocket client connected (total: {})", len(self._ws_clients))
 
-        browser_status = self._get_whatsapp_browser_status()
-        if browser_status.get("mode") == "cdp":
-            await ws.send_json({
-                "type": "whatsapp_browser_status",
-                "reusable": browser_status.get("reusable"),
-                "message": browser_status.get("message"),
-                "mode": browser_status.get("mode"),
-            })
+        bridge_status = self._get_whatsapp_bridge_status()
+        await ws.send_json({
+            "type": "whatsapp_bridge_status",
+            "bridgeError": bridge_status.get("error"),
+            "message": bridge_status.get("message"),
+        })
         auth_status = self._get_whatsapp_auth_status()
         await ws.send_json({
             "type": "whatsapp_auth_status",
@@ -239,17 +249,17 @@ class ApiServer:
         for ws in closed:
             self._ws_clients.discard(ws)
 
-    def _get_whatsapp_browser_status(self) -> dict[str, Any]:
-        """Return the latest WhatsApp Web browser reuse status."""
+    def _get_whatsapp_bridge_status(self) -> dict[str, Any]:
+        """Return the latest WhatsApp bridge-process status."""
         whatsapp = self.channel_manager.get_channel("whatsapp") if self.channel_manager else None
-        if whatsapp and hasattr(whatsapp, "get_browser_status"):
+        if whatsapp and hasattr(whatsapp, "get_bridge_status"):
             try:
-                status = whatsapp.get_browser_status()
+                status = whatsapp.get_bridge_status()
                 if isinstance(status, dict):
                     return status
             except Exception:
-                logger.exception("Failed to read WhatsApp browser status")
-        return {"mode": None, "reusable": None, "message": ""}
+                logger.exception("Failed to read WhatsApp bridge status")
+        return {"error": False, "message": ""}
 
     def _get_whatsapp_auth_status(self) -> dict[str, Any]:
         """Return the latest WhatsApp Baileys auth status."""
@@ -263,25 +273,10 @@ class ApiServer:
                 logger.exception("Failed to read WhatsApp auth status")
         return {"required": False, "qr": "", "message": ""}
 
-    async def _monitor_whatsapp_browser_status(self) -> None:
-        """Broadcast WhatsApp browser reuse state changes to UI clients."""
+    async def _monitor_whatsapp_auth_status(self) -> None:
+        """Broadcast WhatsApp auth-state changes to UI clients."""
         try:
             while True:
-                status = self._get_whatsapp_browser_status()
-                comparable = {
-                    "mode": status.get("mode"),
-                    "reusable": status.get("reusable"),
-                    "message": status.get("message"),
-                    "severity": status.get("severity", "warning"),
-                }
-                if comparable != self._last_browser_status:
-                    self._last_browser_status = comparable
-                    if comparable.get("mode") == "cdp":
-                        await self._broadcast_ws({
-                            "type": "whatsapp_browser_status",
-                            **comparable,
-                        })
-
                 auth_status = self._get_whatsapp_auth_status()
                 auth_comparable = {
                     "required": auth_status.get("required"),
@@ -316,19 +311,15 @@ class ApiServer:
                 if exit_code is not None:
                     logger.error("Bridge process exited with code {} — notifying frontend", exit_code)
                     whatsapp = self.channel_manager.get_channel("whatsapp") if self.channel_manager else None
-                    if whatsapp and hasattr(whatsapp, "_set_browser_status"):
-                        whatsapp._set_browser_status(
-                            False,
+                    if whatsapp and hasattr(whatsapp, "_set_bridge_status"):
+                        whatsapp._set_bridge_status(
+                            True,
                             f"Bridge 进程已崩溃 (exit {exit_code})。请点击重启按钮恢复连接。",
-                            severity="error",
                         )
-                    # Force-broadcast immediately instead of waiting for the 1 s monitor
                     await self._broadcast_ws({
-                        "type": "whatsapp_browser_status",
-                        "mode": "cdp",
-                        "reusable": False,
+                        "type": "whatsapp_bridge_status",
+                        "bridgeError": True,
                         "message": f"Bridge 进程已崩溃 (exit {exit_code})。请点击重启按钮恢复连接。",
-                        "severity": "error",
                     })
                     # Clear the reference so we stop polling a dead process
                     self.bridge_proc = None
@@ -348,7 +339,6 @@ class ApiServer:
             _get_bridge_dir,
             _build_whatsapp_bridge_env,
             _whatsapp_bridge_running,
-            _ensure_whatsapp_cdp_browser,
         )
 
         # 1. Kill existing bridge
@@ -359,14 +349,7 @@ class ApiServer:
                 logger.warning("Failed to stop old bridge — it may have already exited")
             self.bridge_proc = None
 
-        # 2. Ensure CDP Chrome is still alive
-        try:
-            if self.config.channels.whatsapp.web_browser_mode == "cdp":
-                _ensure_whatsapp_cdp_browser(self.config)
-        except Exception as e:
-            logger.error("Failed to ensure CDP Chrome browser: {}", e)
-
-        # 3. Rebuild bridge from source (invalidates the cache)
+        # 2. Rebuild bridge from source (invalidates the cache)
         import shutil
         build_dir = Path(__file__).resolve().parents[2] / ".bridge-build"
         if build_dir.exists():
@@ -375,7 +358,7 @@ class ApiServer:
 
         bridge_dir = _get_bridge_dir()
 
-        # 4. Restart bridge
+        # 3. Restart bridge
         env = _build_whatsapp_bridge_env(self.config)
         proc = subprocess.Popen(
             ["npm", "start"],
@@ -384,7 +367,7 @@ class ApiServer:
             start_new_session=True,
         )
 
-        # 5. Wait for bridge to become reachable
+        # 4. Wait for bridge to become reachable
         import time
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -442,16 +425,31 @@ class ApiServer:
         except asyncio.CancelledError:
             self.bus._outbound_observers.remove(observer_queue)
 
-    async def _broadcast_inbound(self, phone: str, content: str, sender: str = "client", **extra) -> None:
-        """Notify WebSocket clients about a new inbound message."""
-        await self._broadcast_ws({
-            "type": "new_message",
-            "phone": phone,
-            "content": content,
-            "sender": sender,
-            "timestamp": datetime.now().isoformat(),
-            **extra,
-        })
+    async def _mirror_persisted_history(self) -> None:
+        """Mirror persisted JSONL history updates to the existing frontend event shape."""
+        observer_queue = self.bus.add_persisted_history_observer()
+
+        try:
+            while True:
+                event = await observer_queue.get()
+                await self._broadcast_ws({
+                    "type": "new_message",
+                    "channel": event.channel,
+                    "phone": event.phone,
+                    "chat_id": event.chat_id,
+                    "content": event.content,
+                    "sender": event.sender,
+                    "timestamp": event.timestamp or datetime.now().isoformat(),
+                    "metadata": {
+                        "changeType": event.change_type,
+                        **{
+                            k: v for k, v in (event.metadata or {}).items()
+                            if not str(k).startswith("_")
+                        },
+                    },
+                })
+        except asyncio.CancelledError:
+            self.bus.remove_persisted_history_observer(observer_queue)
 
     async def _append_journal(
         self,
@@ -513,11 +511,11 @@ class ApiServer:
         return text[: limit - 1] + "…"
 
     async def _mirror_inbound(self) -> None:
-        """Mirror inbound bus messages to WebSocket and trigger auto-draft.
+        """Observe inbound bus messages for journaling and auto-draft only.
 
         When the UI is connected, the MessageBus marks WhatsApp inbound
         messages as capture_only + _auto_draft_candidate.  This task:
-        1. Forwards every inbound message to WS so the thread updates live.
+        1. Logs inbound activity for the operator journal.
         2. For auto_draft_candidate messages from clients with auto_draft
            enabled, spawns an AI draft that arrives directly in the UI
            composer box.
@@ -536,16 +534,6 @@ class ApiServer:
                 if not phone or not content:
                     continue
 
-                # 1. Broadcast the new client message to UI in real time
-                await self._broadcast_inbound(
-                    phone,
-                    content,
-                    sender="client",
-                    metadata={
-                        k: v for k, v in (msg.metadata or {}).items()
-                        if not str(k).startswith("_")
-                    },
-                )
                 client_name = self._journal_client_name(phone)
                 await self._append_journal(
                     action="INBOUND_MESSAGE",
@@ -592,22 +580,13 @@ class ApiServer:
             # Wait briefly for the agent loop to finish capturing the message
             await asyncio.sleep(0.3)
 
-            # Snapshot session length so we can roll back
-            session = self.session_manager.get_or_create(key)
-            snapshot_len = len(session.messages)
-
             response = await self.agent.process_direct(
                 client_message,
                 session_key=key,
                 channel="whatsapp",
                 chat_id=chat_id,
+                persist_history=False,
             )
-
-            # Roll back — only persist when user actually sends
-            session = self.session_manager.get_or_create(key)
-            if len(session.messages) > snapshot_len:
-                session.messages = session.messages[:snapshot_len]
-                self.session_manager.save(session)
 
             if response and self._ws_clients:
                 await self._broadcast_ws({
@@ -661,6 +640,24 @@ class ApiServer:
         data["updated_at"] = datetime.now().isoformat()
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def _remove_reply_target(self, phone: str) -> bool:
+        """Remove a direct reply target by normalized phone."""
+        from nanobot.channels.whatsapp_contacts import normalize_contact_id
+
+        target_phone = normalize_contact_id(phone)
+        data = self._load_reply_targets()
+        direct_targets = data.get("direct_reply_targets", [])
+        kept_targets = [
+            target
+            for target in direct_targets
+            if normalize_contact_id(str(target.get("phone") or "")) != target_phone
+        ]
+        removed = len(kept_targets) != len(direct_targets)
+        if removed:
+            data["direct_reply_targets"] = kept_targets
+            self._save_reply_targets(data)
+        return removed
+
     def _resolve_client_key(self, phone: str) -> "ClientKey":
         """Derive a validated ClientKey from a raw phone string."""
         from nanobot.session.client_key import ClientKey
@@ -669,10 +666,47 @@ class ApiServer:
     def _phone_to_session_key(self, phone: str) -> str:
         return self._resolve_client_key(phone).session_key
 
+    def _draft_delivery_disabled_response(self) -> web.Response | None:
+        """Block UI send flows when draft delivery would require parse-only CDP."""
+        channels = getattr(self.config, "channels", None)
+        whatsapp_cfg = getattr(channels, "whatsapp", None)
+        if whatsapp_cfg is None:
+            return None
+
+        if (
+            str(getattr(whatsapp_cfg, "delivery_mode", "") or "") == "draft"
+            and str(getattr(whatsapp_cfg, "web_browser_mode", "") or "") == "cdp"
+        ):
+            return web.json_response(
+                {
+                    "error": CDP_DRAFT_DISABLED_DETAIL,
+                    "code": "draft_delivery_disabled",
+                },
+                status=409,
+            )
+        return None
+
+    def _save_whatsapp_session(
+        self,
+        session: Any,
+        *,
+        change_type: str = "updated",
+        metadata: dict[str, Any] | None = None,
+        notify_observers: bool = False,
+    ) -> None:
+        """Persist a WhatsApp session through the canonical JSONL write path."""
+        self.session_manager.save_history(
+            session,
+            bus=self.bus,
+            change_type=change_type,
+            metadata=metadata,
+            notify_observers=notify_observers,
+        )
+
     def _get_session_messages(self, phone: str) -> list[dict]:
         """Return visible messages for a WhatsApp phone session."""
         client = self._resolve_client_key(phone)
-        session = self.session_manager.get_for_client(client)
+        session = self.session_manager.read_persisted_for_client(client)
         messages = []
         for m in session.messages:
             role = m.get("role", "")
@@ -695,6 +729,222 @@ class ApiServer:
                 "fromMe": role in ("me", "assistant"),
             })
         return messages
+
+    def _render_messages_view_html(self, phone: str, messages: list[dict]) -> str:
+        """Render a standalone transcript document from session-backed messages."""
+        targets = self._load_reply_targets()
+        target = next(
+            (item for item in targets.get("direct_reply_targets", []) if str(item.get("phone") or "") == phone),
+            None,
+        )
+        client_name = str(
+            (target or {}).get("label")
+            or (target or {}).get("push_name")
+            or (f"+{phone}" if phone else "Client")
+        )
+        masked_name = f"{client_name[:1]}**" if client_name else "Client"
+
+        def render_timestamp(value: str) -> str:
+            formatted = _format_time(value)
+            return formatted or ""
+
+        rows: list[str] = []
+        for index, message in enumerate(messages):
+            sender = str(message.get("sender") or "agent")
+            role_class = {
+                "client": "client",
+                "ai": "ai",
+                "agent": "agent",
+            }.get(sender, "agent")
+            avatar = (
+                html.escape(client_name[:1] or "C")
+                if role_class == "client"
+                else ("AI" if role_class == "ai" else "\u6211")
+            )
+            content = html.escape(str(message.get("content") or ""))
+            timestamp = html.escape(render_timestamp(str(message.get("timestamp") or "")))
+            rows.append(
+                f"""
+                <article class="row {role_class}" style="animation-delay: {index * 50}ms">
+                  <div class="avatar">{avatar}</div>
+                  <div class="bubble-wrap">
+                    <div class="bubble">{content}</div>
+                    <div class="timestamp">{timestamp}</div>
+                  </div>
+                </article>
+                """
+            )
+
+        empty_state = ""
+        if not rows:
+            empty_state = f"""
+              <section class="empty">
+                <div class="empty-icon">AI</div>
+                <h2>\u5f00\u59cb\u4e0e {html.escape(masked_name)} \u7684\u5bf9\u8bdd</h2>
+                <p>AI\u52a9\u624b\u5c06\u5e2e\u52a9\u60a8\u63d0\u4f9b\u4e13\u4e1a\u7684\u4fdd\u9669\u5efa\u8bae</p>
+              </section>
+            """
+
+        transcript = "".join(rows)
+        safe_title = html.escape(client_name)
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{safe_title}</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        --bg-start: #ffffff;
+        --bg-end: #f8fafc;
+        --ink: #0f172a;
+        --muted: #64748b;
+        --line: #e2e8f0;
+        --client: #ffffff;
+        --ai: #e0f2fe;
+        --agent: #1d4ed8;
+      }}
+      * {{ box-sizing: border-box; }}
+      html, body {{ margin: 0; padding: 0; min-height: 100%; }}
+      body {{
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: linear-gradient(180deg, var(--bg-start), var(--bg-end));
+        color: var(--ink);
+        padding: 20px;
+      }}
+      .thread {{
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        min-height: calc(100vh - 40px);
+      }}
+      .empty {{
+        margin: auto;
+        text-align: center;
+        max-width: 320px;
+        color: var(--muted);
+      }}
+      .empty-icon {{
+        width: 64px;
+        height: 64px;
+        margin: 0 auto 16px;
+        border-radius: 20px;
+        display: grid;
+        place-items: center;
+        font-weight: 700;
+        color: #0f172a;
+        border: 1px solid rgba(29, 78, 216, 0.1);
+        background: linear-gradient(135deg, rgba(29, 78, 216, 0.08), rgba(29, 78, 216, 0.02));
+      }}
+      .empty h2 {{
+        margin: 0 0 6px;
+        font-size: 18px;
+        color: var(--ink);
+      }}
+      .empty p {{
+        margin: 0;
+        font-size: 14px;
+        line-height: 1.6;
+      }}
+      .row {{
+        display: flex;
+        gap: 10px;
+        max-width: 80%;
+        animation: fade-in 220ms ease both;
+      }}
+      .row.client {{
+        align-self: flex-start;
+      }}
+      .row.ai,
+      .row.agent {{
+        align-self: flex-end;
+        flex-direction: row-reverse;
+      }}
+      .avatar {{
+        width: 32px;
+        height: 32px;
+        border-radius: 999px;
+        flex: 0 0 auto;
+        display: grid;
+        place-items: center;
+        font-size: 12px;
+        font-weight: 700;
+        color: #ffffff;
+        background: linear-gradient(135deg, #0f4c81, #12355b);
+      }}
+      .row.ai .avatar {{
+        background: #e0f2fe;
+        color: #0f172a;
+        border: 1px solid rgba(14, 165, 233, 0.25);
+      }}
+      .bubble-wrap {{
+        display: flex;
+        flex-direction: column;
+      }}
+      .bubble {{
+        padding: 10px 14px;
+        border-radius: 18px;
+        font-size: 14px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }}
+      .row.client .bubble {{
+        background: var(--client);
+        border: 1px solid var(--line);
+        border-top-left-radius: 6px;
+        box-shadow: 0 10px 25px rgba(15, 23, 42, 0.05);
+      }}
+      .row.ai .bubble {{
+        background: var(--ai);
+        border: 1px solid rgba(14, 165, 233, 0.18);
+        border-top-right-radius: 6px;
+      }}
+      .row.agent .bubble {{
+        background: var(--agent);
+        color: #ffffff;
+        border-top-right-radius: 6px;
+        box-shadow: 0 10px 20px rgba(29, 78, 216, 0.18);
+      }}
+      .timestamp {{
+        margin-top: 4px;
+        font-size: 10px;
+        color: var(--muted);
+      }}
+      .row.client .timestamp {{
+        margin-left: 4px;
+      }}
+      .row.ai .timestamp,
+      .row.agent .timestamp {{
+        margin-right: 4px;
+        text-align: right;
+      }}
+      @keyframes fade-in {{
+        from {{
+          opacity: 0;
+          transform: translateY(8px);
+        }}
+        to {{
+          opacity: 1;
+          transform: translateY(0);
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="thread">
+      {empty_state}
+      {transcript}
+    </main>
+    <script>
+      window.addEventListener('load', function () {{
+        window.scrollTo({{ top: document.body.scrollHeight, behavior: 'auto' }});
+      }});
+    </script>
+  </body>
+</html>
+"""
 
     def _client_summary(self, target: dict, session_messages: list[dict]) -> dict:
         """Build a client summary object for the frontend."""
@@ -783,12 +1033,42 @@ class ApiServer:
             logger.exception("Error getting client {}", phone)
             return web.json_response({"error": "Internal error"}, status=500)
 
+    async def _handle_delete_client(self, request: web.Request) -> web.Response:
+        """DELETE /api/clients/:phone — delete a client session and target."""
+        raw_phone = request.match_info["phone"]
+        try:
+            client = self._resolve_client_key(raw_phone)
+            phone = client.phone
+            self.session_manager.delete_session(client.session_key)
+            self._remove_reply_target(phone)
+
+            await self._broadcast_ws({
+                "type": "client_deleted",
+                "phone": phone,
+            })
+
+            return web.json_response({"status": "deleted", "phone": phone})
+        except ValueError:
+            return web.json_response({"error": "Invalid client phone"}, status=400)
+        except Exception:
+            logger.exception("Error deleting client {}", raw_phone)
+            return web.json_response({"error": "Internal error"}, status=500)
+
     async def _handle_get_messages(self, request: web.Request) -> web.Response:
         """GET /api/messages/:phone — message history for a client."""
         phone = request.match_info["phone"]
+        query = getattr(request, "query", {})
         try:
             messages = self._get_session_messages(phone)
-            return web.json_response({"messages": messages, "phone": phone})
+            if query.get("format") == "html":
+                document = self._render_messages_view_html(phone, messages)
+                response = web.Response(text=document, content_type="text/html")
+            else:
+                response = web.json_response({"messages": messages, "phone": phone})
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            return response
         except Exception:
             logger.exception("Error getting messages for {}", phone)
             return web.json_response({"error": "Internal error"}, status=500)
@@ -801,12 +1081,14 @@ class ApiServer:
             content = body.get("content", "").strip()
             if not content:
                 return web.json_response({"error": "Empty message"}, status=400)
+            if blocked := self._draft_delivery_disabled_response():
+                return blocked
 
             # 1. Save to session
             key = self._phone_to_session_key(phone)
             session = self.session_manager.get_or_create(key)
             session.add_message("me", content, message_id=f"api_{datetime.now().timestamp()}")
-            self.session_manager.save(session)
+            self._save_whatsapp_session(session)
 
             # 2. Send via WhatsApp channel
             from nanobot.bus.events import OutboundMessage
@@ -857,7 +1139,7 @@ class ApiServer:
             chat_id = self._resolve_chat_id(phone)
 
             # Get the latest client message to generate a response for
-            session = self.session_manager.get_or_create(key)
+            session = self.session_manager.read_persisted(key)
             last_client_msg = ""
             for m in reversed(session.messages):
                 role = m.get("role", "")
@@ -881,9 +1163,6 @@ class ApiServer:
                     "content": text,
                 })
 
-            # Snapshot session length before generation so we can roll back
-            session_snapshot_len = len(session.messages)
-
             # Run agent to generate response
             response = await self.agent.process_direct(
                 last_client_msg,
@@ -891,17 +1170,8 @@ class ApiServer:
                 channel="whatsapp",
                 chat_id=chat_id,
                 on_progress=on_progress,
+                persist_history=False,
             )
-
-            # Roll back: remove messages added by process_direct so the
-            # session JSONL only records what is actually sent.  The user
-            # may edit the draft — we persist the *final* version in
-            # _handle_ai_send when they click Send.
-            session = self.session_manager.get_or_create(key)
-            if len(session.messages) > session_snapshot_len:
-                session.messages = session.messages[:session_snapshot_len]
-                self.session_manager.save(session)
-                logger.debug("Rolled back draft from session {} (kept {} msgs)", key, session_snapshot_len)
 
             if response:
                 await self._broadcast_ws({
@@ -945,6 +1215,8 @@ class ApiServer:
             content = body.get("content", "").strip()
             if not content:
                 return web.json_response({"error": "Empty content"}, status=400)
+            if blocked := self._draft_delivery_disabled_response():
+                return blocked
 
             # 1. Persist the approved message to session JSONL
             key = self._phone_to_session_key(phone)
@@ -954,7 +1226,7 @@ class ApiServer:
                 message_id=f"ai_send_{datetime.now().timestamp()}",
                 is_ai_approved=True,
             )
-            self.session_manager.save(session)
+            self._save_whatsapp_session(session)
 
             # 2. Send via WhatsApp
             from nanobot.bus.events import OutboundMessage
@@ -1063,6 +1335,8 @@ class ApiServer:
             content = body.get("content", "").strip()
             if not phones or not content:
                 return web.json_response({"error": "Missing phones or content"}, status=400)
+            if blocked := self._draft_delivery_disabled_response():
+                return blocked
 
             from nanobot.bus.events import OutboundMessage
             results = []
@@ -1077,7 +1351,7 @@ class ApiServer:
                 key = self._phone_to_session_key(phone)
                 session = self.session_manager.get_or_create(key)
                 session.add_message("me", f"[广播] {content}", message_id=f"broadcast_{datetime.now().timestamp()}")
-                self.session_manager.save(session)
+                self._save_whatsapp_session(session)
                 results.append({"phone": phone, "status": "sent"})
 
             await self._append_journal(
@@ -1100,31 +1374,16 @@ class ApiServer:
         phone = request.match_info["phone"]
         try:
             whatsapp = self.channel_manager.get_channel("whatsapp") if self.channel_manager else None
-            browser_status = self._get_whatsapp_browser_status()
-            if browser_status.get("mode") == "cdp" and whatsapp and hasattr(whatsapp, "check_browser_status"):
-                browser_status = await whatsapp.check_browser_status()
-                if not browser_status.get("reusable"):
-                    return web.json_response(
-                        {
-                            "error": browser_status.get("detail") or "WhatsApp Web 历史同步不可用。",
-                            "code": browser_status.get("status") or "scrape_not_ready",
-                            "whatsapp_browser_reusable": False,
-                            "whatsapp_browser_severity": browser_status.get("severity", "warning"),
-                        },
-                        status=409,
-                    )
             chat_id = self._resolve_chat_id(phone)
             if whatsapp and hasattr(whatsapp, "sync_direct_history"):
                 result = await whatsapp.sync_direct_history([phone])
-                status = str(result.get("status") or "not_ready")
+                status = str(result.get("status") or "login_required")
                 if status != "history_scraped":
-                    response_status = 504 if status == "sync_timeout" else 409
+                    response_status = 503 if status in {"bridge_unreachable", "window_launch_failed"} else 409
                     return web.json_response(
                         {
                             "error": result.get("detail") or "WhatsApp 历史同步失败。",
                             "code": status,
-                            "whatsapp_browser_reusable": False,
-                            "whatsapp_browser_severity": result.get("severity", "warning"),
                         },
                         status=response_status,
                     )
@@ -1160,7 +1419,7 @@ class ApiServer:
         try:
             sessions = self.session_manager.list_sessions()
             targets = self._load_reply_targets()
-            browser_status = self._get_whatsapp_browser_status()
+            bridge_status = self._get_whatsapp_bridge_status()
             auth_status = self._get_whatsapp_auth_status()
             return web.json_response({
                 "status": "running",
@@ -1169,10 +1428,8 @@ class ApiServer:
                 "group_targets": len(targets.get("group_reply_targets", [])),
                 "ws_clients": len(self._ws_clients),
                 "channels": list(self.channel_manager.enabled_channels) if self.channel_manager else [],
-                "whatsapp_browser_mode": browser_status.get("mode"),
-                "whatsapp_browser_reusable": browser_status.get("reusable"),
-                "whatsapp_browser_message": browser_status.get("message"),
-                "whatsapp_browser_severity": browser_status.get("severity", "warning"),
+                "whatsapp_bridge_error": bridge_status.get("error", False),
+                "whatsapp_bridge_message": bridge_status.get("message", ""),
                 "whatsapp_auth_required": auth_status.get("required"),
                 "whatsapp_auth_qr": auth_status.get("qr"),
                 "whatsapp_auth_message": auth_status.get("message"),
@@ -1181,46 +1438,28 @@ class ApiServer:
             logger.exception("Error getting status")
             return web.json_response({"error": "Internal error"}, status=500)
 
-    async def _handle_bridge_check(self, _request: web.Request) -> web.Response:
-        """POST /api/bridge/check — run a one-shot WhatsApp Web scrape readiness check."""
-        try:
-            whatsapp = self.channel_manager.get_channel("whatsapp") if self.channel_manager else None
-            if whatsapp and hasattr(whatsapp, "check_browser_status"):
-                status = await whatsapp.check_browser_status()
-            else:
-                status = self._get_whatsapp_browser_status()
-            return web.json_response({
-                "status": status.get("status") or "checked",
-                "reusable": status.get("reusable"),
-                "message": status.get("detail") or status.get("message"),
-                "severity": status.get("severity", "warning"),
-            })
-        except Exception:
-            logger.exception("Error checking bridge status")
-            return web.json_response({"error": "Internal error"}, status=500)
-
     async def _handle_bridge_restart(self, _request: web.Request) -> web.Response:
         """POST /api/bridge/restart — kill, rebuild, and restart the bridge process."""
         try:
             # Notify frontend immediately
             await self._broadcast_ws({
-                "type": "whatsapp_browser_status",
-                "mode": "cdp",
-                "reusable": False,
+                "type": "whatsapp_bridge_status",
+                "bridgeError": True,
                 "message": "正在重启 Bridge…",
-                "severity": "warning",
             })
 
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, self._restart_bridge_sync)
 
             if result["status"] == "ok":
-                # Bridge is back — refresh the one-shot scrape readiness cache
                 whatsapp = self.channel_manager.get_channel("whatsapp") if self.channel_manager else None
-                if whatsapp and hasattr(whatsapp, "check_browser_status"):
-                    # Give WS reconnect a moment
-                    await asyncio.sleep(2)
-                    await whatsapp.check_browser_status()
+                if whatsapp and hasattr(whatsapp, "_set_bridge_status"):
+                    whatsapp._set_bridge_status(False, "")
+                await self._broadcast_ws({
+                    "type": "whatsapp_bridge_status",
+                    "bridgeError": False,
+                    "message": "",
+                })
 
             return web.json_response(result)
         except Exception:

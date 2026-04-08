@@ -4,7 +4,8 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { DraftComposer, type ScrapedHistoryMessage } from './draft.js';
+import { DraftComposer } from './draft.js';
+import { HistoryParser, type ScrapedHistoryMessage } from './history.js';
 import { WhatsAppClient, type ChatTarget, type HistoryBatch } from './whatsapp.js';
 
 interface SendCommand {
@@ -22,12 +23,14 @@ interface PrepareDraftCommand {
 
 interface ScrapeDirectHistoryCommand {
   type: 'scrape_direct_history';
-  targets: ChatTarget[];
+  target: ChatTarget;
   requestId?: string;
 }
 
-interface CdpStatusCommand {
-  type: 'cdp_status';
+interface ScrapeReplyTargetsHistoryCommand {
+  type: 'scrape_reply_targets_history';
+  targets: ChatTarget[];
+  requestId?: string;
 }
 
 interface BridgeMessage {
@@ -35,13 +38,14 @@ interface BridgeMessage {
   [key: string]: unknown;
 }
 
-type BridgeCommand = SendCommand | PrepareDraftCommand | ScrapeDirectHistoryCommand | CdpStatusCommand;
+type BridgeCommand = SendCommand | PrepareDraftCommand | ScrapeDirectHistoryCommand | ScrapeReplyTargetsHistoryCommand;
 
 export class BridgeServer {
   private wss: WebSocketServer | null = null;
   private wa: WhatsAppClient | null = null;
   private clients: Set<WebSocket> = new Set();
-  private composer: DraftComposer | null = null;
+  private draftComposer: DraftComposer | null = null;
+  private historyParser: HistoryParser | null = null;
 
   constructor(
     private port: number,
@@ -68,7 +72,14 @@ export class BridgeServer {
       onQR: (qr) => this.broadcast({ type: 'qr', qr }),
       onStatus: (status) => this.broadcast({ type: 'status', status }),
     });
-    this.composer = new DraftComposer(
+    this.draftComposer = new DraftComposer(
+      this.webProfileDir,
+      undefined,
+      this.webBrowserMode,
+      this.webCdpUrl,
+      this.webCdpChromePath,
+    );
+    this.historyParser = new HistoryParser(
       this.webProfileDir,
       undefined,
       this.webBrowserMode,
@@ -137,7 +148,7 @@ export class BridgeServer {
     }
 
     if (cmd.type === 'prepare_draft') {
-      if (!this.wa || !this.composer) {
+      if (!this.wa || !this.draftComposer) {
         return {
           type: 'ack',
           action: cmd.type,
@@ -159,7 +170,7 @@ export class BridgeServer {
       }
 
       try {
-        const result = await this.composer.prepareDraft(target, cmd.text);
+        const result = await this.draftComposer.prepareDraft(target, cmd.text);
         return { type: 'ack', action: cmd.type, to: cmd.to, ...result };
       } catch (error) {
         return {
@@ -173,12 +184,81 @@ export class BridgeServer {
     }
 
     if (cmd.type === 'scrape_direct_history') {
-      if (!this.composer) {
+      if (!this.historyParser) {
         return {
           type: 'ack',
           action: cmd.type,
           to: '',
           status: 'not_ready',
+          detail: 'Bridge is not ready yet.',
+        };
+      }
+
+      const target = this.normalizeDraftTarget(cmd.target, '');
+      if (!target) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          status: 'chat_not_found',
+          detail: 'No valid direct-message targets were provided.',
+        };
+      }
+
+      try {
+        const result = await this.historyParser.scrapeHistory(target);
+        if (result.status !== 'history_scraped') {
+          return {
+            type: 'ack',
+            action: cmd.type,
+            to: target.chatId,
+            ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+            status: result.status,
+            detail: result.detail,
+          };
+        }
+
+        const messages = this.normalizeScrapedHistory(target, result.messages || []);
+        if (messages.length > 0) {
+          this.broadcast({
+            type: 'history',
+            source: 'web_scrape',
+            ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+            messages,
+            target: target.chatId,
+          });
+        }
+
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: target.chatId,
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'history_scraped',
+          scrapedTargets: 1,
+          scrapedMessages: messages.length,
+          missedTargets: 0,
+          importPhones: messages.length > 0 && target.phone ? [target.phone] : [],
+        };
+      } catch (error) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: target.chatId,
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'window_launch_failed',
+          detail: String(error),
+        };
+      }
+    }
+
+    if (cmd.type === 'scrape_reply_targets_history') {
+      if (!this.historyParser) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          status: 'bridge_unreachable',
           detail: 'Bridge is not ready yet.',
         };
       }
@@ -196,85 +276,67 @@ export class BridgeServer {
         };
       }
 
-      let scrapedTargets = 0;
-      let scrapedMessages = 0;
-      let missedTargets = 0;
+      try {
+        const result = await this.historyParser.scrapeReplyTargets(targets);
+        if (result.status !== 'history_scraped') {
+          return {
+            type: 'ack',
+            action: cmd.type,
+            to: '',
+            ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+            status: result.status,
+            detail: result.detail,
+          };
+        }
 
-      for (const target of targets) {
-        try {
-          const result = await this.composer.scrapeHistory(target);
-          if (result.status === 'not_ready') {
-            return {
-              type: 'ack',
-              action: cmd.type,
-              to: target.chatId,
-              ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
-              status: result.status,
-              detail: result.detail,
-            };
-          }
-          if (result.status === 'chat_not_found') {
+        let scrapedTargets = 0;
+        let scrapedMessages = 0;
+        let missedTargets = 0;
+        const importPhones = new Set<string>();
+
+        for (const item of result.results) {
+          if (item.status === 'chat_not_found') {
             missedTargets += 1;
             continue;
           }
-
-          const messages = this.normalizeScrapedHistory(target, result.messages || []);
+          const messages = this.normalizeScrapedHistory(item.target, item.messages || []);
           scrapedTargets += 1;
           scrapedMessages += messages.length;
           if (messages.length > 0) {
+            if (item.target.phone) {
+              importPhones.add(item.target.phone);
+            }
             this.broadcast({
               type: 'history',
               source: 'web_scrape',
               ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
               messages,
-              target: target.chatId,
+              target: item.target.chatId,
             });
           }
-        } catch (error) {
-          return {
-            type: 'ack',
-            action: cmd.type,
-            to: target.chatId,
-            ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
-            status: 'not_ready',
-            detail: String(error),
-          };
         }
-      }
 
-      return {
-        type: 'ack',
-        action: cmd.type,
-        to: '',
-        ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
-        status: 'history_scraped',
-        scrapedTargets,
-        scrapedMessages,
-        missedTargets,
-      };
-    }
-
-    if (cmd.type === 'cdp_status') {
-      if (!this.composer) {
         return {
           type: 'ack',
           action: cmd.type,
           to: '',
-          status: 'bridge_unreachable',
-          reusable: false,
-          detail: 'WhatsApp bridge composer is not ready yet.',
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'history_scraped',
+          scrapedTargets,
+          scrapedMessages,
+          missedTargets,
+          importPhones: [...importPhones],
+        };
+      } catch (error) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'window_launch_failed',
+          detail: String(error),
         };
       }
-
-      const result = await this.composer.getBrowserStatus();
-      return {
-        type: 'ack',
-        action: cmd.type,
-        to: '',
-        status: result.status,
-        reusable: result.reusable,
-        detail: result.detail,
-      };
     }
 
     return {
@@ -361,9 +423,14 @@ export class BridgeServer {
       this.wa = null;
     }
 
-    if (this.composer) {
-      await this.composer.stop();
-      this.composer = null;
+    if (this.draftComposer) {
+      await this.draftComposer.stop();
+      this.draftComposer = null;
+    }
+
+    if (this.historyParser) {
+      await this.historyParser.stop();
+      this.historyParser = null;
     }
   }
 }

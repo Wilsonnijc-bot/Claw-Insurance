@@ -25,6 +25,12 @@ def is_whatsapp_session_key(key: str) -> bool:
     return str(key or "").startswith("whatsapp:")
 
 
+def is_direct_whatsapp_session_key(key: str) -> bool:
+    """Return True for direct-chat WhatsApp session keys."""
+    text = str(key or "").strip()
+    return text.startswith("whatsapp:") and text.count(":") == 1
+
+
 def storage_role_for_session(key: str, role: str) -> str:
     """Map model-style roles to persisted WhatsApp roles when needed."""
     text = str(role or "")
@@ -437,8 +443,8 @@ class SessionManager:
             identity,
         )
         client_name = self._first_nonempty(
-            meta.get("client_name"),
             client_label,
+            meta.get("client_name"),
             client_push_name,
         )
 
@@ -482,6 +488,17 @@ class SessionManager:
         callers never need to construct raw session key strings themselves.
         """
         return self.get_or_create(client_key.session_key)
+
+    def read_persisted(self, key: str) -> Session:
+        """Read the canonical on-disk session without consulting the cache."""
+        session = self._load(key)
+        if session is not None:
+            return session
+        return Session(key=key)
+
+    def read_persisted_for_client(self, client_key: ClientKey) -> Session:
+        """Read the canonical on-disk session for a WhatsApp client."""
+        return self.read_persisted(client_key.session_key)
 
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
@@ -546,6 +563,97 @@ class SessionManager:
 
         self._write_readable_session_bundle(session)
         self._cache[session.key] = session
+
+    @staticmethod
+    def _visible_message_payload(message: dict[str, Any]) -> dict[str, str] | None:
+        """Return a UI-visible message payload for persisted-history notifications."""
+        role = str(message.get("role", "") or "")
+        if role in {"tool", "system"}:
+            return None
+        if message.get("deleted_by_sender"):
+            return None
+
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content_text = " ".join(
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ).strip()
+        else:
+            content_text = str(content or "").strip()
+        if not content_text:
+            return None
+
+        sender = "client" if role == "client" else ("ai" if message.get("is_ai_draft") else "agent")
+        return {
+            "chat_id": str(message.get("chat_id") or ""),
+            "content": content_text,
+            "sender": sender,
+            "timestamp": str(message.get("timestamp") or ""),
+        }
+
+    def _build_persisted_history_event(
+        self,
+        session: Session,
+        *,
+        change_type: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> "PersistedHistoryEvent | None":
+        """Build a frontend-facing history update after JSONL persistence."""
+        if not is_direct_whatsapp_session_key(session.key):
+            return None
+
+        try:
+            client = ClientKey.from_session_key(session.key)
+        except ValueError:
+            return None
+
+        visible = None
+        for message in reversed(session.messages):
+            visible = self._visible_message_payload(message)
+            if visible is not None:
+                break
+
+        from nanobot.bus.events import PersistedHistoryEvent
+
+        return PersistedHistoryEvent(
+            channel="whatsapp",
+            session_key=session.key,
+            phone=client.phone,
+            change_type=change_type,
+            chat_id="" if visible is None else visible["chat_id"],
+            content="" if visible is None else visible["content"],
+            sender="client" if visible is None else visible["sender"],
+            timestamp=session.updated_at.isoformat() if visible is None or not visible["timestamp"] else visible["timestamp"],
+            metadata=dict(metadata or {}),
+        )
+
+    def save_history(
+        self,
+        session: Session,
+        *,
+        bus: Any | None = None,
+        change_type: str = "updated",
+        metadata: dict[str, Any] | None = None,
+        notify_observers: bool = False,
+    ) -> None:
+        """Save a session and optionally publish one persisted-history update."""
+        self.save(session)
+        if not notify_observers or bus is None:
+            return
+
+        event = self._build_persisted_history_event(
+            session,
+            change_type=change_type,
+            metadata=metadata,
+        )
+        if event is None:
+            return
+
+        publish = getattr(bus, "publish_persisted_history", None)
+        if callable(publish):
+            publish(event)
 
     def _write_readable_session_bundle(self, session: Session) -> None:
         """Write the canonical session bundle metadata without duplicating history."""
@@ -628,6 +736,43 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+
+    def delete_session(self, key: str) -> bool:
+        """Delete a session bundle from disk and evict it from cache."""
+        bundle_dir = self.sessions_dir / readable_session_bundle_name(key)
+        deleted = False
+
+        session_file = bundle_dir / "session.jsonl"
+        meta_file = bundle_dir / "meta.json"
+
+        for path in (session_file, meta_file):
+            if not path.exists() and not path.is_symlink():
+                continue
+            try:
+                path.unlink()
+                deleted = True
+            except OSError:
+                logger.exception("Failed to remove session artifact {}", path)
+
+        if bundle_dir.exists():
+            for child in list(bundle_dir.iterdir()):
+                try:
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink()
+                    deleted = True
+                except OSError:
+                    logger.exception("Failed to remove bundle child {}", child)
+            try:
+                bundle_dir.rmdir()
+            except OSError:
+                logger.exception("Failed to remove session bundle dir {}", bundle_dir)
+
+        self.invalidate(key)
+        self._cleanup_legacy_readable_bundle(key)
+        self._remove_legacy_readable_root_if_empty()
+        return deleted
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """

@@ -128,3 +128,24 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_stop_dev_command_reports_clean_shutdown(monkeypatch):
+    monkeypatch.setattr(
+        "nanobot.cli.commands._stop_local_dev_runtime",
+        lambda wait_seconds=1.0: (
+            {
+                100: "Python -m nanobot ui",
+                101: "npm run dev",
+                200: "Python -m nanobot launcher --api-port 3456",
+            },
+            {100, 101, 200},
+            set(),
+            set(),
+        ),
+    )
+
+    result = runner.invoke(app, ["stop-dev"])
+
+    assert result.exit_code == 0
+    assert "Stopped 3 Nanobot local dev process(es)" in result.stdout

@@ -1,13 +1,16 @@
 import os
+import signal
 from pathlib import Path
+
+import pytest
 
 import nanobot.cli.commands as commands
 from nanobot.cli.commands import (
     _bridge_needs_refresh,
-    _build_whatsapp_cdp_launch_command,
     _build_privacy_gateway_env,
     _build_whatsapp_bridge_env,
-    _cdp_probe_url,
+    _collect_nanobot_dev_runtime_pids,
+    _stop_local_dev_runtime,
 )
 from nanobot.config.schema import Config
 
@@ -59,31 +62,21 @@ def test_whatsapp_web_gateway_entry_routes_to_gateway(monkeypatch) -> None:
     ]
 
 
-def test_cdp_probe_url_normalizes_base_endpoint() -> None:
-    assert _cdp_probe_url("http://127.0.0.1:9333") == "http://127.0.0.1:9333/json/version"
+def test_channels_whatsapp_web_reports_parse_managed_cdp(monkeypatch) -> None:
+    printed: list[str] = []
 
+    def fake_print(message: str, *args, **kwargs) -> None:
+        printed.append(str(message))
 
-def test_build_whatsapp_cdp_launch_command_uses_configured_values() -> None:
-    config = Config.model_validate(
-        {
-            "channels": {
-                "whatsapp": {
-                    "webBrowserMode": "cdp",
-                    "webCdpUrl": "http://127.0.0.1:9333",
-                    "webCdpChromePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                    "webProfileDir": "~/wa-profile",
-                }
-            }
-        }
-    )
+    monkeypatch.setattr(commands.console, "print", fake_print)
 
-    command = _build_whatsapp_cdp_launch_command(config)
+    with pytest.raises(commands.typer.Exit) as exc:
+        commands.channels_whatsapp_web()
 
-    assert command[0] == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    assert "--remote-debugging-port=9333" in command
-    assert "--remote-debugging-address=127.0.0.1" in command
-    assert "--user-data-dir=~/wa-profile" in command
-    assert command[-1] == "https://web.whatsapp.com/"
+    assert exc.value.exit_code == 1
+    assert printed == [
+        "[red]Standalone WhatsApp Web CDP launch is disabled. CDP is managed only during WhatsApp history parsing.[/red]"
+    ]
 
 
 def test_bridge_needs_refresh_when_source_is_newer(tmp_path: Path) -> None:
@@ -134,3 +127,80 @@ def test_build_privacy_gateway_env_uses_configured_values() -> None:
     assert env["NANOBOT_PRIVACY_SAVE_REDACTED_DEBUG"] == "false"
     assert env["NANOBOT_PRIVACY_TEXT_ONLY_SCOPE"] == "true"
     assert env["NANOBOT_PRIVACY_ENABLE_NER_ASSIST"] == "true"
+
+
+def test_collect_nanobot_dev_runtime_pids_captures_current_ui_flow(monkeypatch) -> None:
+    process_table = {
+        100: (50, "/Library/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python -m nanobot ui"),
+        101: (100, "npm run dev"),
+        102: (101, "node /Users/nijiachen/Nanobot-Whatsapp/Insurance frontend/node_modules/.bin/vite"),
+        103: (102, "/Users/nijiachen/Nanobot-Whatsapp/Insurance frontend/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.21.5 --ping"),
+        200: (60, "/Library/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python -m nanobot launcher --api-port 3456"),
+        300: (70, "npm start"),
+        301: (300, "node dist/index.js"),
+        999: (1, "/bin/zsh -lc sleep 999"),
+    }
+
+    monkeypatch.setattr(commands, "_read_process_table", lambda: process_table)
+    monkeypatch.setattr(commands, "_list_listening_pids", lambda ports: {102, 200, 301})
+
+    targets = _collect_nanobot_dev_runtime_pids()
+
+    assert targets == {
+        100: process_table[100][1],
+        101: process_table[101][1],
+        102: process_table[102][1],
+        103: process_table[103][1],
+        200: process_table[200][1],
+        300: process_table[300][1],
+        301: process_table[301][1],
+    }
+
+
+def test_stop_local_dev_runtime_is_safe_when_nothing_matches(monkeypatch) -> None:
+    monkeypatch.setattr(commands, "_collect_nanobot_dev_runtime_pids", lambda: {})
+
+    matched, terminated, killed, remaining = _stop_local_dev_runtime(wait_seconds=0)
+
+    assert matched == {}
+    assert terminated == set()
+    assert killed == set()
+    assert remaining == set()
+
+
+def test_stop_local_dev_runtime_escalates_to_sigkill_for_survivors(monkeypatch) -> None:
+    monkeypatch.setattr(
+        commands,
+        "_collect_nanobot_dev_runtime_pids",
+        lambda: {
+            100: "Python -m nanobot ui",
+            101: "npm run dev",
+        },
+    )
+
+    calls: list[tuple[tuple[int, ...], int]] = []
+
+    def fake_signal_pids(pids: set[int] | list[int], sig: int) -> set[int]:
+        ordered = tuple(sorted(set(pids)))
+        calls.append((ordered, sig))
+        return set(ordered)
+
+    live_checks = iter([{101}, set()])
+
+    monkeypatch.setattr(commands, "_signal_pids", fake_signal_pids)
+    monkeypatch.setattr(commands, "_live_pids", lambda pids: next(live_checks))
+    monkeypatch.setattr(commands.time, "sleep", lambda _seconds: None)
+
+    matched, terminated, killed, remaining = _stop_local_dev_runtime(wait_seconds=0)
+
+    assert matched == {
+        100: "Python -m nanobot ui",
+        101: "npm run dev",
+    }
+    assert terminated == {100, 101}
+    assert killed == {101}
+    assert remaining == set()
+    assert calls == [
+        ((100, 101), signal.SIGTERM),
+        ((101,), signal.SIGKILL),
+    ]

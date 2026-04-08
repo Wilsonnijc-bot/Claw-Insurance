@@ -43,6 +43,7 @@ class LauncherServer:
         self._heartbeat: Any = None
         self._session_manager: Any = None
         self._gateway_tasks: list[asyncio.Task] = []
+        self._startup_parse_task: asyncio.Task | None = None
 
         # Pre-gateway WS clients (before ApiServer takes over)
         self._ws_clients: set[web.WebSocketResponse] = set()
@@ -67,6 +68,7 @@ class LauncherServer:
         # All other /api/* routes — proxy to real ApiServer or 503
         self.app.router.add_get("/api/clients", self._proxy)
         self.app.router.add_get("/api/clients/{phone}", self._proxy)
+        self.app.router.add_delete("/api/clients/{phone}", self._proxy)
         self.app.router.add_get("/api/messages/{phone}", self._proxy)
         self.app.router.add_post("/api/messages/{phone}", self._proxy)
         self.app.router.add_post("/api/ai-draft/{phone}", self._proxy)
@@ -76,7 +78,6 @@ class LauncherServer:
         self.app.router.add_post("/api/reply-targets", self._proxy)
         self.app.router.add_post("/api/broadcast", self._proxy)
         self.app.router.add_post("/api/sync/{phone}", self._proxy)
-        self.app.router.add_post("/api/bridge/check", self._proxy)
         self.app.router.add_post("/api/bridge/restart", self._proxy)
         self.app.router.add_get("/api/journal", self._proxy)
         self.app.router.add_post("/api/journal", self._proxy)
@@ -145,6 +146,18 @@ class LauncherServer:
                     await self._api_server._inbound_task
                 except asyncio.CancelledError:
                     pass
+            if getattr(self._api_server, "_persisted_history_task", None):
+                self._api_server._persisted_history_task.cancel()
+                try:
+                    await self._api_server._persisted_history_task
+                except asyncio.CancelledError:
+                    pass
+        if self._startup_parse_task:
+            self._startup_parse_task.cancel()
+            try:
+                await self._startup_parse_task
+            except asyncio.CancelledError:
+                pass
         for task in self._gateway_tasks:
             task.cancel()
             try:
@@ -311,6 +324,7 @@ class LauncherServer:
         return {
             ("GET", "/api/clients"): s._handle_get_clients,
             ("GET", "/api/clients/{phone}"): s._handle_get_client,
+            ("DELETE", "/api/clients/{phone}"): s._handle_delete_client,
             ("GET", "/api/messages/{phone}"): s._handle_get_messages,
             ("POST", "/api/messages/{phone}"): s._handle_send_message,
             ("POST", "/api/ai-draft/{phone}"): s._handle_ai_draft,
@@ -320,6 +334,7 @@ class LauncherServer:
             ("POST", "/api/reply-targets"): s._handle_add_reply_target,
             ("POST", "/api/broadcast"): s._handle_broadcast,
             ("POST", "/api/sync/{phone}"): s._handle_sync,
+            ("POST", "/api/bridge/restart"): s._handle_bridge_restart,
             ("GET", "/api/journal"): s._handle_get_journal,
             ("POST", "/api/journal"): s._handle_add_journal_entry,
             ("DELETE", "/api/journal"): s._handle_clear_journal,
@@ -351,8 +366,8 @@ class LauncherServer:
 
             await self._broadcast_ws({"type": "gateway_status", "status": "starting_bridge"})
 
-            # 1. Start WhatsApp bridge (includes CDP browser)
-            logger.info("Starting WhatsApp bridge + CDP browser...")
+            # 1. Start WhatsApp bridge
+            logger.info("Starting WhatsApp bridge...")
             self._bridge_proc = _start_whatsapp_bridge(config)
             self._privacy_proc = _maybe_enable_privacy_gateway(config)
 
@@ -494,9 +509,12 @@ class LauncherServer:
             self._api_server._inbound_task = asyncio.create_task(
                 self._api_server._mirror_inbound()
             )
-            # Start background monitors (browser status + bridge process health)
+            self._api_server._persisted_history_task = asyncio.create_task(
+                self._api_server._mirror_persisted_history()
+            )
+            # Start background monitors (auth status + bridge process health)
             self._api_server._status_task = asyncio.create_task(
-                self._api_server._monitor_whatsapp_browser_status()
+                self._api_server._monitor_whatsapp_auth_status()
             )
             self._api_server._bridge_monitor_task = asyncio.create_task(
                 self._api_server._monitor_bridge_process()
@@ -516,6 +534,7 @@ class LauncherServer:
             logger.info("Gateway started successfully — all API endpoints now available")
 
             await self._broadcast_ws({"type": "gateway_status", "status": "ready"})
+            self._startup_parse_task = asyncio.create_task(self._run_login_history_parse())
 
         except Exception as e:
             logger.exception("Failed to start gateway")
@@ -540,3 +559,30 @@ class LauncherServer:
                 closed.append(ws)
         for ws in closed:
             self._ws_clients.discard(ws)
+
+    async def _run_login_history_parse(self) -> None:
+        """Kick off one bulk WhatsApp history parse after login without blocking the UI."""
+        try:
+            if not self._channels:
+                return
+            whatsapp = self._channels.get_channel("whatsapp")
+            if whatsapp is None or not hasattr(whatsapp, "parse_reply_targets_once"):
+                return
+            result = await whatsapp.parse_reply_targets_once()
+            if not self._api_server or not hasattr(self._api_server, "_append_journal"):
+                return
+            await self._api_server._append_journal(
+                action="LOGIN_HISTORY_PARSE",
+                description="已完成登录后的 WhatsApp 批量历史同步",
+                details={
+                    "requestedTargets": result.get("requested_targets", 0),
+                    "scrapedTargets": result.get("scraped_targets", 0),
+                    "missedTargets": result.get("missed_targets", 0),
+                    "matchedEntries": result.get("matched_entries", 0),
+                    "importedEntries": result.get("imported_entries", 0),
+                    "status": result.get("status"),
+                    "detail": result.get("detail", ""),
+                },
+            )
+        except Exception:
+            logger.exception("Login-time WhatsApp bulk parse failed")

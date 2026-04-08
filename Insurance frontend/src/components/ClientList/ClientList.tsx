@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Search, Users } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Search, Trash2, Users } from 'lucide-react';
 import { ClientCard } from './ClientCard';
 import { PrivacyBadge } from '../common/PrivacyBadge';
 import type { Client } from '../../types';
@@ -9,6 +9,7 @@ interface ClientListProps {
   selectedClientId: string | null;
   onSelectClient: (clientId: string) => void;
   onToggleAutoDraft: (clientId: string) => void;
+  onRequestDeleteClient: (clientId: string) => void;
 }
 
 export const ClientList: React.FC<ClientListProps> = ({
@@ -16,12 +17,42 @@ export const ClientList: React.FC<ClientListProps> = ({
   selectedClientId,
   onSelectClient,
   onToggleAutoDraft,
+  onRequestDeleteClient,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
+  const [contextMenu, setContextMenu] = useState<{ clientId: string; x: number; y: number } | null>(null);
 
   const filteredClients = clients.filter((client) =>
     client.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
+
+  useEffect(() => {
+    if (!contextMenu) return;
+
+    const handleClose = () => setContextMenu(null);
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setContextMenu(null);
+      }
+    };
+
+    window.addEventListener('click', handleClose);
+    window.addEventListener('scroll', handleClose, true);
+    window.addEventListener('resize', handleClose);
+    window.addEventListener('keydown', handleEscape);
+
+    return () => {
+      window.removeEventListener('click', handleClose);
+      window.removeEventListener('scroll', handleClose, true);
+      window.removeEventListener('resize', handleClose);
+      window.removeEventListener('keydown', handleEscape);
+    };
+  }, [contextMenu]);
+
+  const menuPosition = contextMenu ? {
+    left: Math.min(contextMenu.x, Math.max(16, window.innerWidth - 180)),
+    top: Math.min(contextMenu.y, Math.max(16, window.innerHeight - 72)),
+  } : null;
 
   return (
     <div className="w-[320px] flex flex-col h-full bg-light-gray border-r border-border-light">
@@ -64,6 +95,11 @@ export const ClientList: React.FC<ClientListProps> = ({
               isSelected={selectedClientId === client.id}
               onClick={() => onSelectClient(client.id)}
               onToggleAutoDraft={() => onToggleAutoDraft(client.id)}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setContextMenu({ clientId: client.id, x: event.clientX, y: event.clientY });
+              }}
             />
           ))
         )}
@@ -79,6 +115,25 @@ export const ClientList: React.FC<ClientListProps> = ({
           </span>
         </div>
       </div>
+
+      {contextMenu && menuPosition && (
+        <div
+          className="fixed z-50 min-w-[160px] rounded-xl border border-border-light bg-white p-1.5 shadow-xl"
+          style={menuPosition}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            onClick={() => {
+              onRequestDeleteClient(contextMenu.clientId);
+              setContextMenu(null);
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-safety-red transition-colors hover:bg-safety-red/[0.06]"
+          >
+            <Trash2 className="h-4 w-4" strokeWidth={1.5} />
+            删除聊天
+          </button>
+        </div>
+      )}
     </div>
   );
 };

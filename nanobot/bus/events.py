@@ -45,6 +45,21 @@ class HistoryImportResult:
 
 
 @dataclass
+class PersistedHistoryEvent:
+    """History mutation that has already been committed to session.jsonl."""
+
+    channel: str
+    session_key: str
+    phone: str
+    change_type: str = "updated"
+    chat_id: str = ""
+    content: str = ""
+    sender: str = "client"
+    timestamp: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class OutboundMessage:
     """Message to send to a chat channel."""
 

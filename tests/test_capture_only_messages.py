@@ -94,10 +94,7 @@ async def test_capture_only_self_command_updates_whatsapp_routing_files(tmp_path
     response = await loop._process_message(msg)
     assert response is None
     loop.provider.chat.assert_not_called()
-    sync_cmd = await asyncio.wait_for(loop.bus.consume_outbound(), timeout=1)
-    assert sync_cmd.channel == "whatsapp"
-    assert sync_cmd.metadata["_internal_command"] == "sync_direct_history"
-    assert sync_cmd.metadata["_target_phones"] == ["85212345678"]
+    assert loop.bus.outbound_size == 0
 
     contacts = load_contacts(contacts_file)
     rows = load_group_members(groups_file)
@@ -382,7 +379,7 @@ async def test_whatsapp_history_batch_imports_both_sides_without_llm_and_updates
 
 
 @pytest.mark.asyncio
-async def test_self_chat_command_replays_cached_history_for_new_reply_targets(tmp_path: Path) -> None:
+async def test_manual_history_replay_can_import_cached_messages_for_new_reply_targets(tmp_path: Path) -> None:
     targets_file = str(tmp_path / "data" / "whatsapp_reply_targets.json")
     contacts_file = str(tmp_path / "contacts.json")
     groups_file = str(tmp_path / "groups.csv")
@@ -451,11 +448,7 @@ async def test_self_chat_command_replays_cached_history_for_new_reply_targets(tm
     )
     assert response is None
 
-    sync_cmd = await asyncio.wait_for(loop.bus.consume_outbound(), timeout=1)
-    assert sync_cmd.metadata["_internal_command"] == "sync_direct_history"
-    assert sync_cmd.metadata["_target_phones"] == [normalized_phone]
-
-    await channel.send(sync_cmd)
+    await channel._replay_cached_history([normalized_phone])
     batch = await asyncio.wait_for(loop.bus.consume_history(), timeout=1)
     loop._import_history_batch(batch)
 

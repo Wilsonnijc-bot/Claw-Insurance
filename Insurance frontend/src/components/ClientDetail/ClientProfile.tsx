@@ -6,10 +6,8 @@ import { VoiceRecorder } from './VoiceRecorder';
 // WhatsApp Sync Button Component
 const WhatsAppSyncButton: React.FC<{
   clientId: string;
-  browserReusable: boolean | null;
-  browserMessage?: string | null;
   onSync: (clientId: string) => Promise<void>;
-}> = ({ clientId, browserReusable, browserMessage, onSync }) => {
+}> = ({ clientId, onSync }) => {
   const [syncing, setSyncing] = useState(false);
   const [synced, setSynced] = useState(false);
   const [error, setError] = useState('');
@@ -47,14 +45,12 @@ const WhatsAppSyncButton: React.FC<{
       <button
         onClick={handleSync}
         disabled={syncing}
-        title={browserReusable === false ? (browserMessage || '历史同步前会自动检查 WhatsApp Web 状态') : '同步 WhatsApp 聊天记录'}
+        title="同步 WhatsApp 聊天记录"
         className={`w-full flex items-center justify-center gap-2 px-3 py-2.5 text-xs font-semibold rounded-lg border transition-all btn-press ${
           synced
             ? 'bg-success/8 text-success border-success/20'
             : syncing
             ? 'bg-surface-warm text-medium-gray border-border-subtle cursor-wait'
-            : browserReusable === false
-            ? 'bg-warning/10 text-[#946200] border-warning/25 hover:bg-warning/15'
             : 'bg-white text-deep-slate border-border-subtle hover:border-deep-trust/30 hover:bg-surface-warm hover:shadow-sm'
         }`}
       >
@@ -88,11 +84,6 @@ const WhatsAppSyncButton: React.FC<{
           {error}
         </p>
       )}
-      {!error && browserReusable === false && browserMessage && (
-        <p className="mt-2 text-[11px] text-[#946200]">
-          {browserMessage} 登录后可再次点击同步重试。
-        </p>
-      )}
     </div>
   );
 };
@@ -103,8 +94,6 @@ interface ClientProfileProps {
   recordingState: 'idle' | 'recording' | 'processing';
   onStartRecording: () => void;
   onStopRecording: () => void;
-  whatsappBrowserReusable?: boolean | null;
-  whatsappBrowserMessage?: string | null;
   onSyncWhatsApp: (clientId: string) => Promise<void>;
 }
 
@@ -114,8 +103,6 @@ export const ClientProfile: React.FC<ClientProfileProps> = ({
   recordingState,
   onStartRecording,
   onStopRecording,
-  whatsappBrowserReusable,
-  whatsappBrowserMessage,
   onSyncWhatsApp,
 }) => {
   if (!client) {
@@ -247,8 +234,6 @@ export const ClientProfile: React.FC<ClientProfileProps> = ({
         {/* WhatsApp Sync */}
         <WhatsAppSyncButton
           clientId={client.id}
-          browserReusable={whatsappBrowserReusable ?? null}
-          browserMessage={whatsappBrowserMessage}
           onSync={onSyncWhatsApp}
         />
       </div>

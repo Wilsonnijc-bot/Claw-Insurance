@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useEffect } from 'react';
 import { 
-  MessageSquare, Radio, Shield, LogOut, FileText, 
+  AlertTriangle, MessageSquare, Radio, Shield, LogOut, FileText, 
   ChevronLeft, ChevronRight, Menu, X, Wifi, WifiOff, UserPlus
 } from 'lucide-react';
 import { ClientList } from './components/ClientList/ClientList';
@@ -39,12 +39,14 @@ function App() {
   const [editingDraftContent, setEditingDraftContent] = useState<string | null>(null);
   const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
   const [initialConversationLoading, setInitialConversationLoading] = useState(false);
+  const [deleteCandidateId, setDeleteCandidateId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState('');
+  const [deletingClient, setDeletingClient] = useState(false);
 
   // Nanobot backend hook — only activates after login
   const nanobot = useNanobot(isAuthenticated);
 
   const clients = nanobot.clients;
-  const messages = nanobot.messages;
 
   // Hooks
   const { recordingState, startRecording, stopRecording } = useRecording();
@@ -143,11 +145,6 @@ function App() {
     [clients, selectedClientId]
   );
 
-  const currentMessages = useMemo(
-    () => (selectedClientId ? messages[selectedClientId] || [] : []),
-    [messages, selectedClientId]
-  );
-
   const currentVoiceMemos = useMemo(
     () => [],
     []
@@ -177,6 +174,9 @@ function App() {
     setEditingDraftContent(null);
     setEditingDraftId(null);
     setInitialConversationLoading(false);
+    setDeleteCandidateId(null);
+    setDeleteError('');
+    setDeletingClient(false);
   }, [addLog, currentUser]);
 
   // Handlers
@@ -199,6 +199,14 @@ function App() {
     }
     nanobot.toggleAutoDraft(clientId, newState);
   }, [clients, nanobot]);
+
+  const pickNextClientId = useCallback((clientId: string): string | null => {
+    const currentIndex = clients.findIndex((client) => client.id === clientId);
+    if (currentIndex === -1) {
+      return null;
+    }
+    return clients[currentIndex + 1]?.id ?? clients[currentIndex - 1]?.id ?? null;
+  }, [clients]);
 
   const handleSyncWhatsApp = useCallback(async (clientId: string) => {
     if (!nanobot.backendConnected) {
@@ -309,10 +317,57 @@ function App() {
     clearLogs();
   }, [clearLogs]);
 
+  const handleOpenDeleteDialog = useCallback((clientId: string) => {
+    setDeleteError('');
+    setDeleteCandidateId(clientId);
+  }, []);
+
+  const handleCloseDeleteDialog = useCallback(() => {
+    if (deletingClient) {
+      return;
+    }
+    setDeleteCandidateId(null);
+    setDeleteError('');
+  }, [deletingClient]);
+
+  const handleConfirmDelete = useCallback(async () => {
+    if (!deleteCandidateId || deletingClient || !nanobot.backendConnected) {
+      return;
+    }
+
+    const targetId = deleteCandidateId;
+    const nextClientId = selectedClientId === targetId ? pickNextClientId(targetId) : null;
+
+    setDeletingClient(true);
+    setDeleteError('');
+
+    try {
+      await nanobot.deleteClient(targetId);
+      setDeleteCandidateId(null);
+
+      if (selectedClientId === targetId) {
+        setEditingDraftContent(null);
+        setEditingDraftId(null);
+        setSelectedClientId(nextClientId);
+        if (nextClientId) {
+          void nanobot.loadMessages(nextClientId);
+        }
+      }
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : '删除失败');
+    } finally {
+      setDeletingClient(false);
+    }
+  }, [deleteCandidateId, deletingClient, nanobot, pickNextClientId, selectedClientId]);
+
   // Render Login Page if not authenticated
   if (!isAuthenticated) {
     return <LoginPage onLogin={handleLogin} error={loginError} />;
   }
+
+  const deleteTargetClient = deleteCandidateId
+    ? clients.find((client) => client.id === deleteCandidateId) || null
+    : null;
 
   return (
     <div className="relative h-screen w-screen flex flex-col bg-light-gray font-sans antialiased overflow-hidden">
@@ -407,13 +462,10 @@ function App() {
         </div>
       </header>
 
-      {nanobot.whatsappBrowserMode === 'cdp'
-        && nanobot.whatsappBrowserReusable === false
-        && nanobot.whatsappBrowserSeverity === 'error'
-        && !showBootstrapOverlay && (
+      {nanobot.whatsappBridgeError && !showBootstrapOverlay && (
         <FloatingStatusNotice
           title="Bridge 异常"
-          message={nanobot.whatsappBrowserMessage || 'Bridge 未就绪，历史同步暂时不可用。'}
+          message={nanobot.whatsappBridgeMessage || 'Bridge 未就绪，历史同步暂时不可用。'}
           severity="error"
           action={{ label: '重启 Bridge', onClick: nanobot.restartBridge }}
         />
@@ -447,6 +499,7 @@ function App() {
             selectedClientId={selectedClientId}
             onSelectClient={handleSelectClient}
             onToggleAutoDraft={handleToggleAutoDraft}
+            onRequestDeleteClient={handleOpenDeleteDialog}
           />
         </div>
 
@@ -521,9 +574,10 @@ function App() {
           {/* Message Thread */}
           {selectedClient ? (
             <MessageThread
-              messages={currentMessages}
+              clientId={selectedClient.id}
               clientName={selectedClient.name}
               isAILoading={!!aiLoading?.isGenerating || isClientLoading}
+              reloadToken={nanobot.messageReloadToken}
             />
           ) : (
             <div className="flex-1 flex items-center justify-center">
@@ -562,8 +616,6 @@ function App() {
             recordingState={recordingState}
             onStartRecording={handleStartRecording}
             onStopRecording={handleStopRecording}
-            whatsappBrowserReusable={nanobot.whatsappBrowserReusable}
-            whatsappBrowserMessage={nanobot.whatsappBrowserMessage}
             onSyncWhatsApp={handleSyncWhatsApp}
           />
         </div>
@@ -602,6 +654,47 @@ function App() {
         onClear={handleClearLogs}
         clients={clients.map(c => ({ id: c.id, name: c.name }))}
       />
+
+      {deleteTargetClient && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-deep-slate/30 px-4 backdrop-blur-[2px]">
+          <div className="w-full max-w-md rounded-2xl border border-border-light bg-white p-6 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-2xl bg-safety-red/[0.08] text-safety-red">
+                <AlertTriangle className="h-5 w-5" strokeWidth={1.75} />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-lg font-bold text-deep-slate tracking-tight">删除聊天记录</h3>
+                <p className="mt-1 text-sm text-medium-gray leading-6">
+                  这会永久删除 {deleteTargetClient.name.charAt(0)}** 的会话文件，并把该客户从当前回复目标列表中移除。
+                </p>
+              </div>
+            </div>
+
+            {deleteError && (
+              <p className="mt-4 rounded-xl border border-safety-red/15 bg-safety-red/[0.05] px-3 py-2 text-sm text-safety-red">
+                {deleteError}
+              </p>
+            )}
+
+            <div className="mt-6 flex items-center justify-end gap-3">
+              <button
+                onClick={handleCloseDeleteDialog}
+                disabled={deletingClient}
+                className="rounded-xl border border-border-light px-4 py-2 text-sm font-medium text-medium-gray transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleConfirmDelete}
+                disabled={deletingClient}
+                className="rounded-xl bg-safety-red px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-safety-red/90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {deletingClient ? '删除中...' : '确认删除'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -26,6 +26,9 @@ class _FakeWebSocket:
     async def send(self, payload: str) -> None:
         self.sent.append(payload)
 
+    async def close(self) -> None:
+        return None
+
 
 def _make_channel(config: WhatsAppConfig | None = None) -> WhatsAppChannel:
     return WhatsAppChannel(
@@ -116,7 +119,7 @@ async def test_whatsapp_send_restores_only_sender_name_placeholder() -> None:
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_draft_mode_emits_prepare_draft_command_with_reply_target(tmp_path: Path) -> None:
+async def test_whatsapp_launch_draft_mode_emits_prepare_draft_command_with_reply_target(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
     observe_direct_identification(
@@ -130,6 +133,7 @@ async def test_whatsapp_draft_mode_emits_prepare_draft_command_with_reply_target
         WhatsAppConfig(
             enabled=True,
             delivery_mode="draft",
+            web_browser_mode="launch",
             allow_from=["+1234567890"],
             contacts_file="",
             group_members_file="",
@@ -185,13 +189,45 @@ async def test_whatsapp_draft_mode_skips_progress_updates() -> None:
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_draft_mode_emits_prepare_draft_command_for_phone_only_target(tmp_path: Path) -> None:
+async def test_whatsapp_cdp_draft_mode_skips_prepare_draft_command(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
     channel = _make_channel(
         WhatsAppConfig(
             enabled=True,
             delivery_mode="draft",
+            web_browser_mode="cdp",
+            allow_from=["+1234567890"],
+            contacts_file="",
+            group_members_file="",
+            reply_targets_file=str(targets_file),
+        )
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+    channel._connected = True
+
+    await channel.send(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id="alice@lid",
+            content="draft me",
+            metadata={"sender": "alice@lid", "sender_phone": "+1234567890"},
+        )
+    )
+
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_launch_draft_mode_emits_prepare_draft_command_for_phone_only_target(tmp_path: Path) -> None:
+    targets_file = tmp_path / "reply_targets.json"
+    rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
+    channel = _make_channel(
+        WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            web_browser_mode="launch",
             allow_from=["+1234567890"],
             contacts_file="",
             group_members_file="",
@@ -226,7 +262,7 @@ async def test_whatsapp_draft_mode_emits_prepare_draft_command_for_phone_only_ta
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_draft_mode_uses_contact_label_as_search_fallback(tmp_path: Path) -> None:
+async def test_whatsapp_launch_draft_mode_uses_contact_label_as_search_fallback(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     contacts_file = tmp_path / "contacts.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
@@ -235,6 +271,7 @@ async def test_whatsapp_draft_mode_uses_contact_label_as_search_fallback(tmp_pat
         WhatsAppConfig(
             enabled=True,
             delivery_mode="draft",
+            web_browser_mode="launch",
             allow_from=["+1234567890"],
             contacts_file=str(contacts_file),
             group_members_file="",
@@ -258,7 +295,7 @@ async def test_whatsapp_draft_mode_uses_contact_label_as_search_fallback(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_draft_mode_ignores_reply_target_label_in_cdp_search_terms(tmp_path: Path) -> None:
+async def test_whatsapp_launch_draft_mode_ignores_reply_target_label_in_search_terms(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
     observe_direct_identification(
@@ -275,6 +312,7 @@ async def test_whatsapp_draft_mode_ignores_reply_target_label_in_cdp_search_term
         WhatsAppConfig(
             enabled=True,
             delivery_mode="draft",
+            web_browser_mode="launch",
             allow_from=["+1234567890"],
             contacts_file="",
             group_members_file="",
@@ -298,7 +336,7 @@ async def test_whatsapp_draft_mode_ignores_reply_target_label_in_cdp_search_term
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_sync_direct_history_requests_web_scrape_for_all_enabled_targets(tmp_path: Path) -> None:
+async def test_whatsapp_parse_reply_targets_once_requests_bulk_sidebar_parse(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     contacts_file = tmp_path / "contacts.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
@@ -325,28 +363,125 @@ async def test_whatsapp_sync_direct_history_requests_web_scrape_for_all_enabled_
     channel._connected = True
     channel._replay_cached_history = AsyncMock()
 
-    await channel.send(
-        OutboundMessage(
+    task = asyncio.create_task(channel.parse_reply_targets_once(timeout_s=1.0))
+    await asyncio.sleep(0)
+
+    sent = json.loads(ws.sent[0])
+    request_id = sent["requestId"]
+    assert sent == {
+        "type": "scrape_reply_targets_history",
+        "requestId": request_id,
+        "targets": [
+            {
+                "chatId": "123@s.whatsapp.net",
+                "phone": "1234567890",
+                "searchTerms": ["1234567890", "123", "Alice Chan", "Alice Wong"],
+            },
+        ],
+    }
+
+    await channel._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "ack",
+                "action": "scrape_reply_targets_history",
+                "requestId": request_id,
+                "status": "history_scraped",
+                "scrapedTargets": 1,
+                "scrapedMessages": 1,
+                "missedTargets": 0,
+                "importPhones": ["1234567890"],
+            }
+        )
+    )
+    await channel.bus.publish_history_result(
+        HistoryImportResult(
             channel="whatsapp",
-            chat_id="",
-            content="",
-            metadata={"_internal_command": "sync_direct_history"},
+            matched_entries=1,
+            imported_entries=1,
+            phones=["1234567890"],
+            metadata={"request_id": request_id},
         )
     )
 
-    channel._replay_cached_history.assert_awaited_once()
-    assert [json.loads(item) for item in ws.sent] == [
-        {
-            "type": "scrape_direct_history",
-            "targets": [
+    result = await asyncio.wait_for(task, timeout=1)
+    channel._replay_cached_history.assert_awaited_once_with(["1234567890"])
+    assert result["status"] == "history_scraped"
+    assert result["requested_targets"] == 1
+    assert result["scraped_targets"] == 1
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_parse_reply_targets_once_coalesces_duplicate_inflight_bulk_requests(tmp_path: Path) -> None:
+    targets_file = tmp_path / "reply_targets.json"
+    rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
+    observe_direct_identification(
+        targets_file,
+        phone="+1234567890",
+        chat_id="123@s.whatsapp.net",
+        sender_id="123@s.whatsapp.net",
+        push_name="Alice Chan",
+    )
+    channel = _make_channel(
+        WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            allow_from=["+1234567890"],
+            contacts_file="",
+            group_members_file="",
+            reply_targets_file=str(targets_file),
+        )
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+    channel._connected = True
+    channel._running = True
+    channel._replay_cached_history = AsyncMock()
+    worker = asyncio.create_task(channel._history_parse_worker())
+
+    try:
+        task_one = asyncio.create_task(channel.parse_reply_targets_once(timeout_s=1.0))
+        await asyncio.sleep(0)
+        task_two = asyncio.create_task(channel.parse_reply_targets_once(timeout_s=1.0))
+        await asyncio.sleep(0)
+
+        assert len(ws.sent) == 1
+        sent = json.loads(ws.sent[0])
+        request_id = sent["requestId"]
+        assert sent["type"] == "scrape_reply_targets_history"
+
+        await channel._handle_bridge_message(
+            json.dumps(
                 {
-                    "chatId": "123@s.whatsapp.net",
-                    "phone": "1234567890",
-                    "searchTerms": ["1234567890", "123", "Alice Chan", "Alice Wong"],
-                },
-            ],
-        }
-    ]
+                    "type": "ack",
+                    "action": "scrape_reply_targets_history",
+                    "requestId": request_id,
+                    "status": "history_scraped",
+                    "scrapedTargets": 1,
+                    "scrapedMessages": 1,
+                    "missedTargets": 0,
+                    "importPhones": ["1234567890"],
+                }
+            )
+        )
+        await channel.bus.publish_history_result(
+            HistoryImportResult(
+                channel="whatsapp",
+                matched_entries=1,
+                imported_entries=1,
+                phones=["1234567890"],
+                metadata={"request_id": request_id},
+            )
+        )
+
+        first, second = await asyncio.gather(task_one, task_two)
+        assert first["status"] == "history_scraped"
+        assert second["status"] == "history_scraped"
+        assert first["request_id"] == second["request_id"]
+    finally:
+        channel._running = False
+        channel._parse_queue_event.set()
+        await worker
 
 
 @pytest.mark.asyncio
@@ -378,27 +513,111 @@ async def test_whatsapp_sync_direct_history_ignores_reply_target_label_in_search
     channel._connected = True
     channel._replay_cached_history = AsyncMock()
 
-    await channel.send(
-        OutboundMessage(
-            channel="whatsapp",
-            chat_id="",
-            content="",
-            metadata={"_internal_command": "sync_direct_history"},
+    task = asyncio.create_task(channel.sync_direct_history(["1234567890"], timeout_s=1.0))
+    await asyncio.sleep(0)
+
+    sent = json.loads(ws.sent[0])
+    request_id = sent["requestId"]
+    assert sent == {
+        "type": "scrape_direct_history",
+        "requestId": request_id,
+        "target": {
+            "chatId": "123@s.whatsapp.net",
+            "phone": "1234567890",
+            "searchTerms": ["1234567890", "123", "Alice Chan"],
+        },
+    }
+
+    await channel._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "ack",
+                "action": "scrape_direct_history",
+                "requestId": request_id,
+                "status": "history_scraped",
+                "scrapedTargets": 1,
+                "scrapedMessages": 0,
+                "missedTargets": 0,
+                "importPhones": [],
+            }
         )
     )
 
-    assert [json.loads(item) for item in ws.sent] == [
-        {
-            "type": "scrape_direct_history",
-            "targets": [
+    result = await asyncio.wait_for(task, timeout=1)
+    assert result["status"] == "history_scraped"
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_sync_direct_history_coalesces_duplicate_manual_requests(tmp_path: Path) -> None:
+    targets_file = tmp_path / "reply_targets.json"
+    rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
+    observe_direct_identification(
+        targets_file,
+        phone="+1234567890",
+        chat_id="123@s.whatsapp.net",
+        sender_id="123@s.whatsapp.net",
+        push_name="Alice Chan",
+    )
+    channel = _make_channel(
+        WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            allow_from=["+1234567890"],
+            contacts_file="",
+            group_members_file="",
+            reply_targets_file=str(targets_file),
+        )
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+    channel._connected = True
+    channel._running = True
+    channel._replay_cached_history = AsyncMock()
+    worker = asyncio.create_task(channel._history_parse_worker())
+
+    try:
+        task_one = asyncio.create_task(channel.sync_direct_history(["1234567890"], timeout_s=1.0))
+        await asyncio.sleep(0)
+        task_two = asyncio.create_task(channel.sync_direct_history(["1234567890"], timeout_s=1.0))
+        await asyncio.sleep(0)
+
+        assert len(ws.sent) == 1
+        sent = json.loads(ws.sent[0])
+        request_id = sent["requestId"]
+        assert sent["type"] == "scrape_direct_history"
+
+        await channel._handle_bridge_message(
+            json.dumps(
                 {
-                    "chatId": "123@s.whatsapp.net",
-                    "phone": "1234567890",
-                    "searchTerms": ["1234567890", "123", "Alice Chan"],
-                },
-            ],
-        }
-    ]
+                    "type": "ack",
+                    "action": "scrape_direct_history",
+                    "requestId": request_id,
+                    "status": "history_scraped",
+                    "scrapedTargets": 1,
+                    "scrapedMessages": 1,
+                    "missedTargets": 0,
+                    "importPhones": ["1234567890"],
+                }
+            )
+        )
+        await channel.bus.publish_history_result(
+            HistoryImportResult(
+                channel="whatsapp",
+                matched_entries=1,
+                imported_entries=1,
+                phones=["1234567890"],
+                metadata={"request_id": request_id},
+            )
+        )
+
+        first, second = await asyncio.gather(task_one, task_two)
+        assert first["status"] == "history_scraped"
+        assert second["status"] == "history_scraped"
+        assert first["request_id"] == second["request_id"]
+    finally:
+        channel._running = False
+        channel._parse_queue_event.set()
+        await worker
 
 
 @pytest.mark.asyncio
@@ -432,6 +651,8 @@ async def test_whatsapp_sync_direct_history_waits_for_import_confirmation(tmp_pa
 
     sent = json.loads(ws.sent[0])
     request_id = sent["requestId"]
+    assert sent["type"] == "scrape_direct_history"
+    assert sent["target"]["chatId"] == "123@s.whatsapp.net"
     await channel._handle_bridge_message(
         json.dumps(
             {
@@ -442,6 +663,7 @@ async def test_whatsapp_sync_direct_history_waits_for_import_confirmation(tmp_pa
                 "scrapedTargets": 1,
                 "scrapedMessages": 2,
                 "missedTargets": 0,
+                "importPhones": ["1234567890"],
             }
         )
     )
@@ -460,9 +682,8 @@ async def test_whatsapp_sync_direct_history_waits_for_import_confirmation(tmp_pa
     assert result["matched_entries"] == 2
     assert result["imported_entries"] == 1
 
-
 @pytest.mark.asyncio
-async def test_whatsapp_sync_direct_history_scopes_web_scrape_to_requested_phones(tmp_path: Path) -> None:
+async def test_whatsapp_sync_direct_history_scopes_web_scrape_to_requested_phone(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890", "+1987654321"], groups=None)
     observe_direct_identification(
@@ -494,47 +715,54 @@ async def test_whatsapp_sync_direct_history_scopes_web_scrape_to_requested_phone
     channel._connected = True
     channel._replay_cached_history = AsyncMock()
 
-    await channel.send(
-        OutboundMessage(
-            channel="whatsapp",
-            chat_id="",
-            content="",
-            metadata={
-                "_internal_command": "sync_direct_history",
-                "_target_phones": ["1234567890"],
-            },
+    task = asyncio.create_task(channel.sync_direct_history(["1234567890"], timeout_s=1.0))
+    await asyncio.sleep(0)
+
+    sent = json.loads(ws.sent[0])
+    request_id = sent["requestId"]
+    assert sent == {
+        "type": "scrape_direct_history",
+        "requestId": request_id,
+        "target": {
+            "chatId": "123@s.whatsapp.net",
+            "phone": "1234567890",
+            "searchTerms": ["1234567890", "123", "Alice Chan"],
+        },
+    }
+
+    await channel._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "ack",
+                "action": "scrape_direct_history",
+                "requestId": request_id,
+                "status": "history_scraped",
+                "scrapedTargets": 1,
+                "scrapedMessages": 0,
+                "missedTargets": 0,
+                "importPhones": [],
+            }
         )
     )
 
+    result = await asyncio.wait_for(task, timeout=1)
     channel._replay_cached_history.assert_awaited_once_with(["1234567890"])
-    assert [json.loads(item) for item in ws.sent] == [
-        {
-            "type": "scrape_direct_history",
-            "targets": [
-                {
-                    "chatId": "123@s.whatsapp.net",
-                    "phone": "1234567890",
-                    "searchTerms": ["1234567890", "123", "Alice Chan"],
-                },
-            ],
-        }
-    ]
+    assert result["status"] == "history_scraped"
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_status_connected_queues_direct_history_sync() -> None:
+async def test_whatsapp_status_connected_does_not_queue_direct_history_sync() -> None:
     bus = MessageBus()
     channel = WhatsAppChannel(
         WhatsAppConfig(enabled=True, allow_from=["+1234567890"], contacts_file="", group_members_file=""),
         bus,
     )
 
+    channel._set_bridge_status(True, "Bridge down")
     await channel._handle_bridge_message(json.dumps({"type": "status", "status": "connected"}))
 
-    msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
-    assert msg.channel == "whatsapp"
-    assert msg.metadata["_internal_command"] == "sync_direct_history"
-    assert "_target_phones" not in msg.metadata
+    assert bus.outbound_size == 0
+    assert channel.get_bridge_status() == {"error": False, "message": ""}
 
 
 @pytest.mark.asyncio

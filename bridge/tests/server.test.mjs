@@ -12,7 +12,7 @@ test('prepare_draft prefers explicit target over remembered chat target', async 
       return { chatId: 'fallback@lid', phone: '99999999', searchTerms: ['Fallback'] };
     },
   };
-  server.composer = {
+  server.draftComposer = {
     async prepareDraft(target, text) {
       receivedTarget = { target, text };
       return { status: 'draft_prepared' };
@@ -50,7 +50,7 @@ test('prepare_draft falls back to remembered chat target when explicit target is
       return { chatId: 'alice@lid', phone: '1234567890', searchTerms: ['Alice'] };
     },
   };
-  server.composer = {
+  server.draftComposer = {
     async prepareDraft(target, text) {
       receivedTarget = { target, text };
       return { status: 'draft_prepared' };
@@ -78,7 +78,7 @@ test('prepare_draft returns chat_not_found when neither explicit nor remembered 
       return null;
     },
   };
-  server.composer = {
+  server.draftComposer = {
     async prepareDraft() {
       throw new Error('should not run');
     },
@@ -93,24 +93,31 @@ test('prepare_draft returns chat_not_found when neither explicit nor remembered 
   assert.equal(ack.status, 'chat_not_found');
 });
 
-test('scrape_direct_history broadcasts web scrape history for each scraped target', async () => {
+test('scrape_reply_targets_history broadcasts web scrape history for each scraped target', async () => {
   const server = new BridgeServer(3001, '/tmp/auth', '/tmp/profile');
   const broadcasts = [];
   server.broadcast = (msg) => broadcasts.push(msg);
-  server.composer = {
-    async scrapeHistory(target) {
-      if (target.chatId === 'missing') {
-        return { status: 'chat_not_found' };
-      }
+  server.historyParser = {
+    async scrapeReplyTargets(targets) {
       return {
         status: 'history_scraped',
-        messages: [
+        results: [
           {
-            id: `hist-${target.chatId}`,
-            content: 'Hello from web',
-            timestamp: '2026-03-09T10:11:37.000Z',
-            fromMe: false,
-            pushName: 'Alice',
+            target: targets[0],
+            status: 'history_scraped',
+            messages: [
+              {
+                id: `hist-${targets[0].chatId}`,
+                content: 'Hello from web',
+                timestamp: '2026-03-09T10:11:37.000Z',
+                fromMe: false,
+                pushName: 'Alice',
+              },
+            ],
+          },
+          {
+            target: targets[1],
+            status: 'chat_not_found',
           },
         ],
       };
@@ -118,7 +125,7 @@ test('scrape_direct_history broadcasts web scrape history for each scraped targe
   };
 
   const ack = await server.handleCommand({
-    type: 'scrape_direct_history',
+    type: 'scrape_reply_targets_history',
     targets: [
       {
         chatId: '123@s.whatsapp.net',
@@ -137,6 +144,7 @@ test('scrape_direct_history broadcasts web scrape history for each scraped targe
   assert.equal(ack.scrapedTargets, 1);
   assert.equal(ack.scrapedMessages, 1);
   assert.equal(ack.missedTargets, 1);
+  assert.deepEqual(ack.importPhones, ['1234567890']);
   assert.deepEqual(broadcasts, [
     {
       type: 'history',
@@ -158,25 +166,46 @@ test('scrape_direct_history broadcasts web scrape history for each scraped targe
   ]);
 });
 
-test('scrape_direct_history returns not_ready when browser scrape cannot start', async () => {
+test('scrape_direct_history returns login_required when browser scrape cannot start', async () => {
   const server = new BridgeServer(3001, '/tmp/auth', '/tmp/profile');
-  server.composer = {
+  server.historyParser = {
     async scrapeHistory() {
-      return { status: 'not_ready', detail: 'Log in first' };
+      return { status: 'login_required', detail: 'Log in first' };
     },
   };
 
   const ack = await server.handleCommand({
     type: 'scrape_direct_history',
-    targets: [
-      {
-        chatId: '123@s.whatsapp.net',
-        phone: '1234567890',
-        searchTerms: ['Alice'],
-      },
-    ],
+    target: {
+      chatId: '123@s.whatsapp.net',
+      phone: '1234567890',
+      searchTerms: ['Alice'],
+    },
   });
 
-  assert.equal(ack.status, 'not_ready');
+  assert.equal(ack.status, 'login_required');
   assert.equal(ack.detail, 'Log in first');
+});
+
+test('scrape_direct_history forwards simplified parse failures', async () => {
+  const server = new BridgeServer(3001, '/tmp/auth', '/tmp/profile');
+  server.historyParser = {
+    async scrapeHistory() {
+      return { status: 'window_launch_failed', detail: 'Could not open a fresh WhatsApp Web window' };
+    },
+  };
+
+  const ack = await server.handleCommand({
+    type: 'scrape_direct_history',
+    requestId: 'req-1',
+    target: {
+      chatId: '123@s.whatsapp.net',
+      phone: '1234567890',
+      searchTerms: ['Alice'],
+    },
+  });
+
+  assert.equal(ack.status, 'window_launch_failed');
+  assert.equal(ack.detail, 'Could not open a fresh WhatsApp Web window');
+  assert.equal(ack.requestId, 'req-1');
 });

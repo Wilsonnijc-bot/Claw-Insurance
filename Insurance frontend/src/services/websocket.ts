@@ -18,8 +18,9 @@ export type WSEventType =
   | 'auto_draft'
   | 'auto_draft_changed'
   | 'reply_target_added'
+  | 'client_deleted'
   | 'gateway_status'
-  | 'whatsapp_browser_status'
+  | 'whatsapp_bridge_status'
   | 'whatsapp_auth_status'
   | 'pong';
 
@@ -33,10 +34,8 @@ export interface WSEvent {
   timestamp?: string;
   status?: string;
   enabled?: boolean;
-  reusable?: boolean | null;
   message?: string | null;
-  mode?: string | null;
-  severity?: string | null;
+  bridgeError?: boolean | null;
   qr?: string | null;
   required?: boolean | null;
   gateway_ready?: boolean;

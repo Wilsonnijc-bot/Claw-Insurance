@@ -8,14 +8,13 @@
  * - Auto-draft toggling
  * - Broadcast
  * - WhatsApp sync
- *
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   fetchClients,
-  fetchMessages,
   sendMessage as apiSend,
+  deleteClient as apiDeleteClient,
   requestAIDraft as apiAIDraft,
   sendAIDraft as apiSendDraft,
   toggleAutoDraft as apiToggleAutoDraft,
@@ -23,15 +22,11 @@ import {
   triggerSync as apiSync,
   fetchStatus,
   addReplyTarget as apiAddReplyTarget,
-  checkBridge as apiCheckBridge,
   restartBridge as apiRestartBridge,
   type ApiClient,
-  type ApiMessage,
 } from '../services/api';
 import { nanobotWS, type WSEvent } from '../services/websocket';
-import type { Client, Message } from '../types';
-
-// ─── Map API types to frontend types ─────────────────────────────────
+import type { Client } from '../types';
 
 function apiClientToClient(ac: ApiClient): Client {
   return {
@@ -57,28 +52,6 @@ function apiClientToClient(ac: ApiClient): Client {
     clientPhone: ac.clientPhone,
     clientChatId: ac.clientChatId,
   };
-}
-
-function apiMessageToMessage(am: ApiMessage, clientId: string): Message {
-  return {
-    id: am.id || `${am.timestamp}_${Math.random()}`,
-    clientId,
-    sender: am.sender,
-    content: am.content,
-    timestamp: formatTimestamp(am.timestamp),
-    isAIDraft: am.isAIDraft,
-  };
-}
-
-function formatTimestamp(ts: string): string {
-  if (!ts) return '';
-  try {
-    const d = new Date(ts);
-    if (isNaN(d.getTime())) return ts.slice(0, 5);
-    return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-  } catch {
-    return ts.slice(0, 5);
-  }
 }
 
 function gatewayProgressState(status: string, gatewayStarting = false): {
@@ -108,11 +81,8 @@ function gatewayProgressState(status: string, gatewayStarting = false): {
   }
 }
 
-// ─── Hook ────────────────────────────────────────────────────────────
-
 export interface UseNanobotReturn {
   clients: Client[];
-  messages: Record<string, Message[]>;
   backendConnected: boolean;
   loading: boolean;
   error: string | null;
@@ -120,44 +90,33 @@ export interface UseNanobotReturn {
   gatewayPhase: string | null;
   gatewayProgress: number;
   gatewayMessage: string | null;
-  whatsappBrowserMode: string | null;
-  whatsappBrowserReusable: boolean | null;
-  whatsappBrowserMessage: string | null;
-  whatsappBrowserSeverity: 'warning' | 'error' | null;
+  whatsappBridgeError: boolean;
+  whatsappBridgeMessage: string | null;
   whatsappAuthRequired: boolean;
   whatsappAuthQr: string | null;
   whatsappAuthMessage: string | null;
   selectedClientPhone: string | null;
-  /** Phone number of the client whose auto-draft just arrived */
   autoDraftPhone: string | null;
-  /** Auto-draft content ready to go into the composer */
   autoDraftContent: string | null;
-  /** Call after the draft content has been consumed by the composer */
   clearAutoDraft: () => void;
-  /** Phone for which AI is currently generating (null when idle) */
   aiGeneratingPhone: string | null;
-  /** Status of the current AI generation: 'started' | 'completed' | 'error' | null */
   aiGeneratingStatus: string | null;
+  messageReloadToken: number;
   refreshClients: () => Promise<void>;
   loadMessages: (phone: string) => Promise<void>;
   sendMessage: (phone: string, content: string) => Promise<void>;
+  deleteClient: (phone: string) => Promise<void>;
   requestAIDraft: (phone: string) => Promise<string | null>;
   sendAIDraft: (phone: string, content: string) => Promise<void>;
   toggleAutoDraft: (phone: string, enabled: boolean) => Promise<void>;
   broadcast: (phones: string[], content: string) => Promise<void>;
   syncWhatsApp: (phone: string) => Promise<void>;
   addReplyTarget: (phone: string, label?: string, autoDraft?: boolean) => Promise<boolean>;
-  checkBridge: () => Promise<void>;
   restartBridge: () => Promise<void>;
 }
 
-/**
- * @param enabled — When false the hook skips all network activity (API + WS).
- *                  Pass `isAuthenticated` so the gateway connects only after login.
- */
 export function useNanobot(enabled = true): UseNanobotReturn {
   const [clients, setClients] = useState<Client[]>([]);
-  const [messages, setMessages] = useState<Record<string, Message[]>>({});
   const [backendConnected, setBackendConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -165,10 +124,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const [gatewayPhase, setGatewayPhase] = useState<string | null>(null);
   const [gatewayProgress, setGatewayProgress] = useState(0);
   const [gatewayMessage, setGatewayMessage] = useState<string | null>(null);
-  const [whatsappBrowserMode, setWhatsappBrowserMode] = useState<string | null>(null);
-  const [whatsappBrowserReusable, setWhatsappBrowserReusable] = useState<boolean | null>(null);
-  const [whatsappBrowserMessage, setWhatsappBrowserMessage] = useState<string | null>(null);
-  const [whatsappBrowserSeverity, setWhatsappBrowserSeverity] = useState<'warning' | 'error' | null>(null);
+  const [whatsappBridgeError, setWhatsappBridgeError] = useState(false);
+  const [whatsappBridgeMessage, setWhatsappBridgeMessage] = useState<string | null>(null);
   const [whatsappAuthRequired, setWhatsappAuthRequired] = useState(false);
   const [whatsappAuthQr, setWhatsappAuthQr] = useState<string | null>(null);
   const [whatsappAuthMessage, setWhatsappAuthMessage] = useState<string | null>(null);
@@ -177,15 +134,81 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const [autoDraftContent, setAutoDraftContent] = useState<string | null>(null);
   const [aiGeneratingPhone, setAiGeneratingPhone] = useState<string | null>(null);
   const [aiGeneratingStatus, setAiGeneratingStatus] = useState<string | null>(null);
+  const [messageReloadToken, setMessageReloadToken] = useState(0);
   const wsUnsubscribes = useRef<(() => void)[]>([]);
+  const selectedClientPhoneRef = useRef<string | null>(null);
+  const clientListRequestIdRef = useRef(0);
 
-  // ─── Initial fetch + WebSocket connect ────────────────────────────
+  const applyGatewayStatus = useCallback((status: {
+    status: string;
+    gateway_ready?: boolean;
+    gateway_starting?: boolean;
+    gateway_error?: string | null;
+    whatsapp_bridge_error?: boolean | null;
+    whatsapp_bridge_message?: string | null;
+    whatsapp_auth_required?: boolean | null;
+    whatsapp_auth_qr?: string | null;
+    whatsapp_auth_message?: string | null;
+  }) => {
+    const running = status.status === 'running' || status.gateway_ready === true;
+    const progress = gatewayProgressState(running ? 'running' : status.status, status.gateway_starting);
+    setBackendConnected(running);
+    setGatewayReady(running);
+    setGatewayPhase(progress.phase);
+    setGatewayProgress(progress.progress);
+    setGatewayMessage(status.gateway_error || progress.message);
+    setWhatsappBridgeError(Boolean(status.whatsapp_bridge_error));
+    setWhatsappBridgeMessage(status.whatsapp_bridge_message ?? null);
+    setWhatsappAuthRequired(Boolean(status.whatsapp_auth_required));
+    setWhatsappAuthQr(status.whatsapp_auth_qr ?? null);
+    setWhatsappAuthMessage(status.whatsapp_auth_message ?? null);
+  }, []);
+
+  const clearCurrentThread = useCallback((phone?: string | null) => {
+    if (phone && selectedClientPhoneRef.current !== phone) {
+      return;
+    }
+    selectedClientPhoneRef.current = null;
+    setSelectedClientPhone(null);
+    setMessageReloadToken((prev) => prev + 1);
+  }, []);
+
+  const refreshClientList = useCallback(async (): Promise<Client[] | null> => {
+    const requestId = ++clientListRequestIdRef.current;
+    const apiClients = await fetchClients();
+    if (requestId !== clientListRequestIdRef.current) {
+      return null;
+    }
+    const mappedClients = apiClients.map(apiClientToClient);
+    setClients(mappedClients);
+    setError(null);
+    return mappedClients;
+  }, []);
+
+  const loadMessages = useCallback(async (phone: string) => {
+    selectedClientPhoneRef.current = phone;
+    setSelectedClientPhone(phone);
+    setMessageReloadToken((prev) => prev + 1);
+  }, []);
+
+  const refreshClients = useCallback(async () => {
+    try {
+      const status = await fetchStatus();
+      applyGatewayStatus(status);
+      if (status.status === 'running' || status.gateway_ready === true) {
+        await refreshClientList();
+      }
+      setError(null);
+    } catch {
+      setBackendConnected(false);
+    }
+  }, [applyGatewayStatus, refreshClientList]);
 
   useEffect(() => {
-    // Skip all network activity when not enabled (before login)
     if (!enabled) {
+      clientListRequestIdRef.current += 1;
+      clearCurrentThread();
       setClients([]);
-      setMessages({});
       setBackendConnected(false);
       setLoading(false);
       setError(null);
@@ -193,46 +216,20 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setGatewayPhase(null);
       setGatewayProgress(0);
       setGatewayMessage(null);
-      setWhatsappBrowserMode(null);
-      setWhatsappBrowserReusable(null);
-      setWhatsappBrowserMessage(null);
+      setWhatsappBridgeError(false);
+      setWhatsappBridgeMessage(null);
       setWhatsappAuthRequired(false);
       setWhatsappAuthQr(null);
       setWhatsappAuthMessage(null);
+      setAutoDraftPhone(null);
+      setAutoDraftContent(null);
+      setAiGeneratingPhone(null);
+      setAiGeneratingStatus(null);
+      setMessageReloadToken(0);
       return;
     }
 
     let mounted = true;
-
-    const applyGatewayStatus = (status: {
-      status: string;
-      gateway_ready?: boolean;
-      gateway_starting?: boolean;
-      gateway_error?: string | null;
-      whatsapp_browser_mode?: string | null;
-      whatsapp_browser_reusable?: boolean | null;
-      whatsapp_browser_message?: string | null;
-      whatsapp_browser_severity?: string | null;
-      whatsapp_auth_required?: boolean | null;
-      whatsapp_auth_qr?: string | null;
-      whatsapp_auth_message?: string | null;
-    }) => {
-      const running = status.status === 'running' || status.gateway_ready === true;
-      const progress = gatewayProgressState(running ? 'running' : status.status, status.gateway_starting);
-      if (!mounted) return;
-      setBackendConnected(running);
-      setGatewayReady(running);
-      setGatewayPhase(progress.phase);
-      setGatewayProgress(progress.progress);
-      setGatewayMessage(status.gateway_error || progress.message);
-      setWhatsappBrowserMode(status.whatsapp_browser_mode ?? null);
-      setWhatsappBrowserReusable(status.whatsapp_browser_reusable ?? null);
-      setWhatsappBrowserMessage(status.whatsapp_browser_message ?? null);
-      setWhatsappBrowserSeverity((status.whatsapp_browser_severity as 'warning' | 'error' | undefined) ?? 'warning');
-      setWhatsappAuthRequired(Boolean(status.whatsapp_auth_required));
-      setWhatsappAuthQr(status.whatsapp_auth_qr ?? null);
-      setWhatsappAuthMessage(status.whatsapp_auth_message ?? null);
-    };
 
     const loadClientDirectory = async () => {
       if (!mounted) return;
@@ -240,10 +237,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setGatewayPhase(progress.phase);
       setGatewayProgress(progress.progress);
       setGatewayMessage(progress.message);
-      const apiClients = await fetchClients();
+      await refreshClientList();
       if (!mounted) return;
-      setClients(apiClients.map(apiClientToClient));
-      setError(null);
       setLoading(false);
       const ready = gatewayProgressState('ready');
       setGatewayPhase(ready.phase);
@@ -254,6 +249,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     async function init() {
       try {
         const status = await fetchStatus();
+        if (!mounted) return;
         applyGatewayStatus(status);
         if (status.status === 'running' || status.gateway_ready) {
           await loadClientDirectory();
@@ -271,36 +267,16 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     }
 
     init();
-
-    // Connect WebSocket
     nanobotWS.connect();
 
-    // Listen for real-time events
     const unsub1 = nanobotWS.on('new_message', (event: WSEvent) => {
-      if (!event.phone || !event.content) return;
-      const phone = event.phone;
-      const newMsg: Message = {
-        id: `ws_${Date.now()}_${Math.random()}`,
-        clientId: phone,
-        sender: (event.sender as 'client' | 'ai' | 'agent') || 'client',
-        content: event.content,
-        timestamp: formatTimestamp(event.timestamp || new Date().toISOString()),
-      };
-      setMessages((prev) => ({
-        ...prev,
-        [phone]: [...(prev[phone] || []), newMsg],
-      }));
-      // Update client's last message
-      setClients((prev) =>
-        prev.map((c) =>
-          c.id === phone
-            ? { ...c, lastMessage: event.content!.slice(0, 80), lastMessageTime: '刚刚' }
-            : c
-        )
-      );
+      if (!event.phone) return;
+      if (selectedClientPhoneRef.current === event.phone) {
+        setMessageReloadToken((prev) => prev + 1);
+      }
+      void refreshClients();
     });
 
-    // ai_draft from manual "AI" button → pipe to composer
     const unsub2 = nanobotWS.on('ai_draft', (event: WSEvent) => {
       if (!event.phone || !event.content) return;
       setAiGeneratingPhone(null);
@@ -309,7 +285,6 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setAutoDraftContent(event.content);
     });
 
-    // Auto-draft arrived from the backend — put directly into the composer
     const unsub3 = nanobotWS.on('auto_draft', (event: WSEvent) => {
       if (!event.phone || !event.content) return;
       setAiGeneratingPhone(null);
@@ -318,49 +293,40 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setAutoDraftContent(event.content);
     });
 
-    // Auto-draft toggle changed by another WS client / backend
     const unsub4 = nanobotWS.on('auto_draft_changed', (event: WSEvent) => {
       if (!event.phone) return;
       setClients((prev) =>
-        prev.map((c) =>
-          c.id === event.phone
-            ? { ...c, autoDraftEnabled: event.enabled ?? c.autoDraftEnabled }
-            : c
+        prev.map((client) =>
+          client.id === event.phone
+            ? { ...client, autoDraftEnabled: event.enabled ?? client.autoDraftEnabled }
+            : client
         )
       );
     });
 
-    // AI generating status from backend (for thinking indicator)
     const unsub5 = nanobotWS.on('ai_generating', (event: WSEvent) => {
       if (!event.phone) return;
-      const status = (event as any).status || 'started';
+      const status = event.status || 'started';
       if (status === 'started') {
         setAiGeneratingPhone(event.phone);
         setAiGeneratingStatus('started');
       } else {
-        // completed, error, no_response, no_message — stop generating
         setAiGeneratingPhone(null);
         setAiGeneratingStatus(null);
       }
     });
 
     const unsub6 = nanobotWS.on('pong', () => {
-      // launcher keepalive only; actual readiness comes from gateway/status events
+      return;
     });
 
     const unsub7 = nanobotWS.on('reply_target_added', () => {
-      fetchClients()
-        .then((apiClients) => {
-          setClients(apiClients.map(apiClientToClient));
-        })
-        .catch(() => undefined);
+      void refreshClientList();
     });
 
-    const unsub8 = nanobotWS.on('whatsapp_browser_status', (event: WSEvent) => {
-      setWhatsappBrowserMode((event.mode as string | null | undefined) ?? null);
-      setWhatsappBrowserReusable(event.reusable ?? null);
-      setWhatsappBrowserMessage(event.message ?? null);
-      setWhatsappBrowserSeverity((event.severity as 'warning' | 'error' | undefined) ?? 'warning');
+    const unsub8 = nanobotWS.on('whatsapp_bridge_status', (event: WSEvent) => {
+      setWhatsappBridgeError(Boolean(event.bridgeError ?? event.error));
+      setWhatsappBridgeMessage(event.message ?? null);
     });
 
     const unsub9 = nanobotWS.on('whatsapp_auth_status', (event: WSEvent) => {
@@ -372,6 +338,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       } else {
         void fetchStatus()
           .then((status) => {
+            if (!mounted) return;
             applyGatewayStatus(status);
             if (status.status === 'running' || status.gateway_ready) {
               return loadClientDirectory();
@@ -410,69 +377,64 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       }
     });
 
-    wsUnsubscribes.current = [unsub1, unsub2, unsub3, unsub4, unsub5, unsub6, unsub7, unsub8, unsub9, unsub10];
+    const unsub11 = nanobotWS.on('client_deleted', (event: WSEvent) => {
+      if (!event.phone) return;
+      setClients((prev) => prev.filter((client) => client.id !== event.phone));
+      clearCurrentThread(event.phone);
+      void refreshClients();
+    });
+
+    wsUnsubscribes.current = [
+      unsub1,
+      unsub2,
+      unsub3,
+      unsub4,
+      unsub5,
+      unsub6,
+      unsub7,
+      unsub8,
+      unsub9,
+      unsub10,
+      unsub11,
+    ];
 
     return () => {
       mounted = false;
-      wsUnsubscribes.current.forEach((u) => u());
+      wsUnsubscribes.current.forEach((unsubscribe) => unsubscribe());
       nanobotWS.disconnect();
     };
-  }, [enabled]);
-
-  // ─── Actions ──────────────────────────────────────────────────────
-
-  const refreshClients = useCallback(async () => {
-    try {
-      const status = await fetchStatus();
-      const running = status.status === 'running' || status.gateway_ready === true;
-      const progress = gatewayProgressState(running ? 'running' : status.status, status.gateway_starting);
-      setBackendConnected(running);
-      setGatewayReady(running);
-      setGatewayPhase(progress.phase);
-      setGatewayProgress(progress.progress);
-      setGatewayMessage(status.gateway_error || progress.message);
-      setWhatsappBrowserMode(status.whatsapp_browser_mode ?? null);
-      setWhatsappBrowserReusable(status.whatsapp_browser_reusable ?? null);
-      setWhatsappBrowserMessage(status.whatsapp_browser_message ?? null);
-      setWhatsappBrowserSeverity((status.whatsapp_browser_severity as 'warning' | 'error' | undefined) ?? 'warning');
-      setWhatsappAuthRequired(Boolean(status.whatsapp_auth_required));
-      setWhatsappAuthQr(status.whatsapp_auth_qr ?? null);
-      setWhatsappAuthMessage(status.whatsapp_auth_message ?? null);
-      const apiClients = await fetchClients();
-      setClients(apiClients.map(apiClientToClient));
-      setError(null);
-    } catch {
-      setBackendConnected(false);
-    }
-  }, []);
-
-  const loadMessages = useCallback(async (phone: string) => {
-    setSelectedClientPhone(phone);
-    try {
-      const apiMsgs = await fetchMessages(phone);
-      setMessages((prev) => ({
-        ...prev,
-        [phone]: apiMsgs.map((m) => apiMessageToMessage(m, phone)),
-      }));
-    } catch {
-      // Keep existing messages (could be from WS)
-    }
-  }, []);
+  }, [
+    enabled,
+    applyGatewayStatus,
+    clearCurrentThread,
+    refreshClientList,
+    refreshClients,
+  ]);
 
   const handleSendMessage = useCallback(async (phone: string, content: string) => {
-    setClients((prev) =>
-      prev.map((c) =>
-        c.id === phone ? { ...c, lastMessage: content, lastMessageTime: '刚刚' } : c
-      )
-    );
-
     try {
       await apiSend(phone, content);
+      if (selectedClientPhoneRef.current === phone) {
+        setMessageReloadToken((prev) => prev + 1);
+      }
+      await refreshClients();
     } catch (err) {
       console.error('Failed to send message:', err);
       throw err;
     }
-  }, []);
+  }, [refreshClients]);
+
+  const handleDeleteClient = useCallback(async (phone: string) => {
+    try {
+      await apiDeleteClient(phone);
+      setClients((prev) => prev.filter((client) => client.id !== phone));
+      clearCurrentThread(phone);
+      await refreshClients();
+    } catch (err) {
+      console.error('Failed to delete client:', err);
+      throw err;
+    }
+  }, [clearCurrentThread, refreshClients]);
 
   const handleRequestAIDraft = useCallback(async (phone: string): Promise<string | null> => {
     try {
@@ -487,23 +449,25 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const handleSendAIDraft = useCallback(async (phone: string, content: string) => {
     try {
       await apiSendDraft(phone, content);
+      if (selectedClientPhoneRef.current === phone) {
+        setMessageReloadToken((prev) => prev + 1);
+      }
+      await refreshClients();
     } catch (err) {
       console.error('Failed to send AI draft:', err);
       throw err;
     }
-  }, []);
+  }, [refreshClients]);
 
   const handleToggleAutoDraft = useCallback(async (phone: string, enabled: boolean) => {
-    // Optimistic update
     setClients((prev) =>
-      prev.map((c) => (c.id === phone ? { ...c, autoDraftEnabled: enabled } : c))
+      prev.map((client) => (client.id === phone ? { ...client, autoDraftEnabled: enabled } : client))
     );
     try {
       await apiToggleAutoDraft(phone, enabled);
     } catch (err) {
-      // Revert
       setClients((prev) =>
-        prev.map((c) => (c.id === phone ? { ...c, autoDraftEnabled: !enabled } : c))
+        prev.map((client) => (client.id === phone ? { ...client, autoDraftEnabled: !enabled } : client))
       );
       console.error('Failed to toggle auto-draft:', err);
     }
@@ -534,7 +498,6 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const handleAddReplyTarget = useCallback(async (phone: string, label?: string, autoDraft?: boolean): Promise<boolean> => {
     try {
       await apiAddReplyTarget(phone, label, autoDraft);
-      // Refresh the client list to pick up the new target
       await refreshClients();
       return true;
     } catch (err) {
@@ -543,19 +506,9 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     }
   }, [refreshClients]);
 
-  const handleCheckBridge = useCallback(async () => {
-    try {
-      await apiCheckBridge();
-      // Status update will arrive via WS broadcast automatically
-    } catch (err) {
-      console.error('Bridge check failed:', err);
-    }
-  }, []);
-
   const handleRestartBridge = useCallback(async () => {
     try {
       await apiRestartBridge();
-      // Status updates will arrive via WS broadcast automatically
     } catch (err) {
       console.error('Bridge restart failed:', err);
     }
@@ -563,7 +516,6 @@ export function useNanobot(enabled = true): UseNanobotReturn {
 
   return {
     clients,
-    messages,
     backendConnected,
     loading,
     error,
@@ -571,10 +523,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     gatewayPhase,
     gatewayProgress,
     gatewayMessage,
-    whatsappBrowserMode,
-    whatsappBrowserReusable,
-    whatsappBrowserMessage,
-    whatsappBrowserSeverity,
+    whatsappBridgeError,
+    whatsappBridgeMessage,
     whatsappAuthRequired,
     whatsappAuthQr,
     whatsappAuthMessage,
@@ -584,16 +534,17 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     clearAutoDraft,
     aiGeneratingPhone,
     aiGeneratingStatus,
+    messageReloadToken,
     refreshClients,
     loadMessages,
     sendMessage: handleSendMessage,
+    deleteClient: handleDeleteClient,
     requestAIDraft: handleRequestAIDraft,
     sendAIDraft: handleSendAIDraft,
     toggleAutoDraft: handleToggleAutoDraft,
     broadcast: handleBroadcast,
     syncWhatsApp: handleSync,
     addReplyTarget: handleAddReplyTarget,
-    checkBridge: handleCheckBridge,
     restartBridge: handleRestartBridge,
   };
 }

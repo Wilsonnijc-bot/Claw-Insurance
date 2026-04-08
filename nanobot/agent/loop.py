@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import weakref
@@ -506,26 +507,9 @@ class AgentLoop:
                 target_stats.get("group_reply_target_count", -1),
             )
             if instruction.individuals is not None:
-                target_phones: list[str] = []
-                seen_phones: set[str] = set()
-                for value in instruction.individuals:
-                    phone = normalize_contact_id(value)
-                    if not phone or phone in seen_phones:
-                        continue
-                    seen_phones.add(phone)
-                    target_phones.append(phone)
-                await self.bus.publish_outbound(
-                    OutboundMessage(
-                        channel="whatsapp",
-                        chat_id="",
-                        content="",
-                        metadata={
-                            "_internal_command": "sync_direct_history",
-                            "_target_phones": target_phones,
-                            "_trigger": "self_chat_command",
-                        },
-                    )
-                )
+                # Reply-target updates are passive until the next login bulk parse
+                # or an explicit manual sync from the UI.
+                pass
         except Exception:
             logger.exception("Failed to apply WhatsApp self-chat routing command")
 
@@ -1073,9 +1057,22 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
-    def _save_session(self, session: Session) -> None:
+    def _save_session(
+        self,
+        session: Session,
+        *,
+        change_type: str = "updated",
+        metadata: dict[str, Any] | None = None,
+        notify_observers: bool = False,
+    ) -> None:
         """Persist a session and refresh WhatsApp-visible history exports when relevant."""
-        self.sessions.save(session)
+        self.sessions.save_history(
+            session,
+            bus=self.bus,
+            change_type=change_type,
+            metadata=metadata,
+            notify_observers=notify_observers,
+        )
         self._refresh_whatsapp_history_exports(session)
 
     def _refresh_whatsapp_history_exports(self, session: Session) -> None:
@@ -1213,7 +1210,15 @@ class AgentLoop:
                 session.created_at = payload["earliest_ts"]
             session.messages = self._merge_history_entries(session.messages, imports)
             session.updated_at = datetime.now()
-            self._save_session(session)
+            self._save_session(
+                session,
+                change_type="history_imported",
+                metadata={
+                    "request_id": request_id,
+                    "imported_entries": len(imports),
+                },
+                notify_observers=True,
+            )
             logger.info("Imported {} WhatsApp history messages into {}", len(imports), session_key)
 
         return HistoryImportResult(
@@ -1295,6 +1300,7 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        persist_history: bool = True,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -1323,7 +1329,17 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
+        source_session = self.sessions.get_or_create(key) if persist_history else self.sessions.read_persisted(key)
+        session = source_session
+        if not persist_history:
+            session = Session(
+                key=source_session.key,
+                messages=copy.deepcopy(source_session.messages),
+                created_at=source_session.created_at,
+                updated_at=source_session.updated_at,
+                metadata=copy.deepcopy(source_session.metadata),
+                last_consolidated=source_session.last_consolidated,
+            )
 
         if bool(msg.metadata.get("capture_only")):
             if msg.metadata.get("event_type") == "message_deleted":
@@ -1334,7 +1350,15 @@ class AgentLoop:
                     deleter_id=str(msg.metadata.get("sender") or msg.sender_id or ""),
                     chat_id=msg.chat_id,
                 )
-                self._save_session(session)
+                if persist_history:
+                    self._save_session(
+                        session,
+                        change_type="deleted",
+                        metadata={
+                            "message_id": str(msg.metadata.get("deleted_message_id") or ""),
+                        },
+                        notify_observers=msg.channel == "whatsapp",
+                    )
                 logger.info(
                     "Recorded deleted WhatsApp message {} for {}:{} (matched={})",
                     msg.metadata.get("deleted_message_id"),
@@ -1360,7 +1384,15 @@ class AgentLoop:
                 reply_target_push_name=str(msg.metadata.get("reply_target_push_name") or ""),
                 from_me=bool(msg.metadata.get("is_self_chat")),
             )
-            self._save_session(session)
+            if persist_history:
+                self._save_session(
+                    session,
+                    change_type="message_saved",
+                    metadata={
+                        "message_id": str(msg.metadata.get("message_id") or ""),
+                    },
+                    notify_observers=msg.channel == "whatsapp",
+                )
             logger.info("Captured message without reply for {}:{} (capture_only)", msg.channel, msg.sender_id)
             return None
 
@@ -1408,8 +1440,9 @@ class AgentLoop:
                 self._consolidating.discard(session.key)
 
             session.clear()
-            self._save_session(session)
-            self.sessions.invalidate(session.key)
+            if persist_history:
+                self._save_session(session)
+                self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -1417,7 +1450,7 @@ class AgentLoop:
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
         unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
+        if persist_history and (unconsolidated >= self.memory_window and session.key not in self._consolidating):
             self._consolidating.add(session.key)
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
 
@@ -1484,7 +1517,8 @@ class AgentLoop:
                 turn_messages=turn_messages,
             )
             self._write_insurance_state(session, next_state)
-        self._save_session(session)
+        if persist_history:
+            self._save_session(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -1562,9 +1596,15 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        persist_history: bool = True,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(
+            msg,
+            session_key=session_key,
+            on_progress=on_progress,
+            persist_history=persist_history,
+        )
         return response.content if response else ""

@@ -7,6 +7,7 @@ interface ClientCardProps {
   isSelected: boolean;
   onClick: () => void;
   onToggleAutoDraft: () => void;
+  onContextMenu: (event: React.MouseEvent<HTMLDivElement>) => void;
 }
 
 export const ClientCard: React.FC<ClientCardProps> = ({
@@ -14,6 +15,7 @@ export const ClientCard: React.FC<ClientCardProps> = ({
   isSelected,
   onClick,
   onToggleAutoDraft,
+  onContextMenu,
 }) => {
   // Privacy mask: show first character only
   const maskedName = client.name.charAt(0) + '**';
@@ -21,6 +23,7 @@ export const ClientCard: React.FC<ClientCardProps> = ({
   return (
     <div
       onClick={onClick}
+      onContextMenu={onContextMenu}
       className={`p-4 cursor-pointer transition-all duration-200 border-b border-border-subtle last:border-b-0 group ${
         isSelected
           ? 'bg-gradient-to-r from-ai-blue to-white border-l-[3px] border-l-deep-trust shadow-sm'

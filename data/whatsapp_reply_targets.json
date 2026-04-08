@@ -1,18 +1,8 @@
 {
   "version": 1,
-  "updated_at": "2026-04-05T15:37:57.330085+00:00",
+  "updated_at": "2026-04-08T01:39:31.873999+00:00",
   "source": "frontend_add",
   "direct_reply_targets": [
-    {
-      "phone": "85268424658",
-      "enabled": true,
-      "auto_draft": true,
-      "label": "",
-      "chat_id": "85268424658@s.whatsapp.net",
-      "sender_id": "85268424658@s.whatsapp.net",
-      "push_name": "+852 5445 0338",
-      "last_seen_at": "2026-04-05T15:37:57.328384+00:00"
-    },
     {
       "phone": "8613136101623",
       "enabled": true,
@@ -21,7 +11,7 @@
       "chat_id": "8613136101623@s.whatsapp.net",
       "sender_id": "8613136101623@s.whatsapp.net",
       "push_name": "HaHa Qi",
-      "last_seen_at": "2026-04-05T15:37:57.329667+00:00"
+      "last_seen_at": "2026-04-08T01:32:20.327630+00:00"
     },
     {
       "phone": "85269984395",
@@ -31,7 +21,17 @@
       "chat_id": "85269984395@s.whatsapp.net",
       "sender_id": "85269984395@s.whatsapp.net",
       "push_name": "+852 6998 4395",
-      "last_seen_at": "2026-04-05T15:37:57.329871+00:00"
+      "last_seen_at": "2026-04-08T01:34:44.601110+00:00"
+    },
+    {
+      "phone": "85267111317",
+      "enabled": true,
+      "auto_draft": true,
+      "label": "",
+      "chat_id": "85267111317@s.whatsapp.net",
+      "sender_id": "85267111317@s.whatsapp.net",
+      "push_name": "+852 6711 1317",
+      "last_seen_at": "2026-04-08T01:37:08.351014+00:00"
     },
     {
       "phone": "8801797493497",
@@ -41,7 +41,7 @@
       "chat_id": "8801797493497@s.whatsapp.net",
       "sender_id": "8801797493497@s.whatsapp.net",
       "push_name": "+880 1797-493497",
-      "last_seen_at": "2026-04-05T15:37:57.330083+00:00"
+      "last_seen_at": "2026-04-08T01:39:31.873967+00:00"
     }
   ],
   "group_reply_targets": []

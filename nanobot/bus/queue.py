@@ -7,6 +7,7 @@ from nanobot.bus.events import (
     InboundHistoryBatch,
     InboundMessage,
     OutboundMessage,
+    PersistedHistoryEvent,
 )
 
 
@@ -25,6 +26,7 @@ class MessageBus:
         self._outbound_observers: list[asyncio.Queue[OutboundMessage]] = []
         self._inbound_observers: list[asyncio.Queue[InboundMessage]] = []
         self._history_result_observers: list[asyncio.Queue[HistoryImportResult]] = []
+        self._persisted_history_observers: list[asyncio.Queue[PersistedHistoryEvent]] = []
 
     @property
     def ui_connected(self) -> bool:
@@ -85,6 +87,27 @@ class MessageBus:
         """Remove a previously registered history result observer."""
         try:
             self._history_result_observers.remove(observer)
+        except ValueError:
+            pass
+
+    def publish_persisted_history(self, event: PersistedHistoryEvent) -> None:
+        """Publish a history update that has already been committed to JSONL."""
+        for obs in self._persisted_history_observers:
+            try:
+                obs.put_nowait(event)
+            except Exception:
+                pass
+
+    def add_persisted_history_observer(self) -> asyncio.Queue[PersistedHistoryEvent]:
+        """Register a passive observer for persisted history updates."""
+        observer: asyncio.Queue[PersistedHistoryEvent] = asyncio.Queue()
+        self._persisted_history_observers.append(observer)
+        return observer
+
+    def remove_persisted_history_observer(self, observer: asyncio.Queue[PersistedHistoryEvent]) -> None:
+        """Remove a previously registered persisted history observer."""
+        try:
+            self._persisted_history_observers.remove(observer)
         except ValueError:
             pass
 

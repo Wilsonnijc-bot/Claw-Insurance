@@ -48,16 +48,6 @@ export interface ApiClient {
   clientChatId?: string;
 }
 
-export interface ApiMessage {
-  id: string;
-  role: string;
-  sender: 'client' | 'ai' | 'agent';
-  content: string;
-  timestamp: string;
-  isAIDraft: boolean;
-  fromMe: boolean;
-}
-
 export interface GatewayStatus {
   status: string;
   sessions: number;
@@ -68,10 +58,8 @@ export interface GatewayStatus {
   gateway_ready?: boolean;
   gateway_starting?: boolean;
   gateway_error?: string | null;
-  whatsapp_browser_mode?: string | null;
-  whatsapp_browser_reusable?: boolean | null;
-  whatsapp_browser_message?: string | null;
-  whatsapp_browser_severity?: string | null;
+  whatsapp_bridge_error?: boolean | null;
+  whatsapp_bridge_message?: string | null;
   whatsapp_auth_required?: boolean | null;
   whatsapp_auth_qr?: string | null;
   whatsapp_auth_message?: string | null;
@@ -103,12 +91,22 @@ export async function fetchClient(phone: string): Promise<ApiClient> {
   return request<ApiClient>(`/clients/${phone}`);
 }
 
+/** Delete a client session and remove it from reply targets. */
+export async function deleteClient(phone: string): Promise<{ status: string; phone: string }> {
+  return request<{ status: string; phone: string }>(`/clients/${phone}`, {
+    method: 'DELETE',
+  });
+}
+
 // ─── Message endpoints ──────────────────────────────────────────────
 
-/** Get message history for a client. */
-export async function fetchMessages(phone: string): Promise<ApiMessage[]> {
-  const data = await request<{ messages: ApiMessage[] }>(`/messages/${phone}`);
-  return data.messages;
+/** Build the backend-rendered transcript document URL for a client. */
+export function getMessagesViewUrl(phone: string, reloadToken = 0): string {
+  const search = new URLSearchParams({ format: 'html' });
+  if (reloadToken > 0) {
+    search.set('v', String(reloadToken));
+  }
+  return `${API_BASE}/messages/${encodeURIComponent(phone)}?${search.toString()}`;
 }
 
 /** Send a message as the human agent. */
@@ -162,18 +160,6 @@ export async function triggerSync(phone: string): Promise<void> {
 }
 
 // ─── Bridge Health ──────────────────────────────────────────────────
-
-export interface BridgeCheckResult {
-  status: string;
-  reusable: boolean | null;
-  message: string;
-  severity?: string;
-}
-
-/** Trigger an immediate CDP health check. */
-export async function checkBridge(): Promise<BridgeCheckResult> {
-  return request<BridgeCheckResult>('/bridge/check', { method: 'POST' });
-}
 
 export interface BridgeRestartResult {
   status: string;
