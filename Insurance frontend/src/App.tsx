@@ -13,7 +13,6 @@ import { LogViewer } from './components/Logs/LogViewer';
 import { AddReplyTargetModal } from './components/MessageCenter/AddReplyTargetModal';
 import { GatewayBootstrapOverlay } from './components/common/GatewayBootstrapOverlay';
 import { FloatingStatusNotice } from './components/common/FloatingStatusNotice';
-import { fetchClient } from './services/api';
 import { useRecording } from './hooks/useRecording';
 import { useAIGeneration } from './hooks/useAIGeneration';
 import { useLogger } from './hooks/useLogger';
@@ -213,31 +212,25 @@ function App() {
       return;
     }
 
-    const client = clients.find((c) => c.id === clientId);
-    const beforeMessageCount = client?.messageCount ?? 0;
-    const beforeUpdatedAt = client?.updatedAt ?? '';
+    const result = await nanobot.syncWhatsApp(clientId);
 
-    await nanobot.syncWhatsApp(clientId);
-
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+    const finishWithTranscriptLoad = async () => {
       await nanobot.refreshClients();
-      const refreshedClient = await fetchClient(clientId).catch(() => null);
       if (selectedClientId === clientId) {
-        await nanobot.loadMessages(clientId);
+        const reloadToken = await nanobot.loadMessages(clientId);
+        await nanobot.waitForMessagesLoaded(clientId, reloadToken, 15000);
       }
-      if (
-        refreshedClient && (
-          (typeof refreshedClient.messageCount === 'number' && refreshedClient.messageCount > beforeMessageCount)
-          || (refreshedClient.updatedAt && refreshedClient.updatedAt !== beforeUpdatedAt)
-        )
-      ) {
-        return;
-      }
+    };
+
+    if (result.backendSuccess) {
+      void finishWithTranscriptLoad().catch((error) => {
+        console.warn('WhatsApp sync succeeded but transcript refresh did not finish cleanly:', error);
+      });
+      return;
     }
 
-    throw new Error('未检测到新的聊天记录，请确认打开的是正确联系人后再试');
-  }, [clients, nanobot, selectedClientId]);
+    throw new Error('未检测到正确客户会话中的同步聊天记录，请确认打开的是正确联系人后再试');
+  }, [nanobot, selectedClientId]);
 
   const handleSendMessage = useCallback(
     async (content: string) => {
@@ -578,6 +571,7 @@ function App() {
               clientName={selectedClient.name}
               isAILoading={!!aiLoading?.isGenerating || isClientLoading}
               reloadToken={nanobot.messageReloadToken}
+              onTranscriptLoaded={nanobot.markMessagesLoaded}
             />
           ) : (
             <div className="flex-1 flex items-center justify-center">

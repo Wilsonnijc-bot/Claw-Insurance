@@ -194,14 +194,14 @@ export class BridgeServer {
         };
       }
 
-      const target = this.normalizeDraftTarget(cmd.target, '');
+      const target = this.normalizeHistoryTarget(cmd.target, '');
       if (!target) {
         return {
           type: 'ack',
           action: cmd.type,
           to: '',
           status: 'chat_not_found',
-          detail: 'No valid direct-message targets were provided.',
+          detail: 'No valid direct-message target with a normalized phone was provided.',
         };
       }
 
@@ -225,6 +225,16 @@ export class BridgeServer {
             source: 'web_scrape',
             ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
             messages,
+            target: target.chatId,
+          });
+        }
+        if (cmd.requestId) {
+          this.broadcast({
+            type: 'history',
+            source: 'web_scrape',
+            requestId: cmd.requestId,
+            isLatest: true,
+            messages: [],
             target: target.chatId,
           });
         }
@@ -264,7 +274,7 @@ export class BridgeServer {
       }
 
       const targets = (Array.isArray(cmd.targets) ? cmd.targets : [])
-        .map((target) => this.normalizeDraftTarget(target, ''))
+        .map((target) => this.normalizeHistoryTarget(target, ''))
         .filter((target): target is ChatTarget => target !== null);
       if (targets.length === 0) {
         return {
@@ -272,7 +282,7 @@ export class BridgeServer {
           action: cmd.type,
           to: '',
           status: 'chat_not_found',
-          detail: 'No valid direct-message targets were provided.',
+          detail: 'No valid direct-message targets with normalized phones were provided.',
         };
       }
 
@@ -314,6 +324,15 @@ export class BridgeServer {
               target: item.target.chatId,
             });
           }
+        }
+        if (cmd.requestId) {
+          this.broadcast({
+            type: 'history',
+            source: 'web_scrape',
+            requestId: cmd.requestId,
+            isLatest: true,
+            messages: [],
+          });
         }
 
         return {
@@ -378,6 +397,14 @@ export class BridgeServer {
       ...(phone ? { phone } : {}),
       searchTerms,
     };
+  }
+
+  private normalizeHistoryTarget(target: ChatTarget | undefined, fallbackChatId: string): ChatTarget | null {
+    const normalized = this.normalizeDraftTarget(target, fallbackChatId);
+    if (!normalized?.phone) {
+      return null;
+    }
+    return normalized;
   }
 
   private broadcast(msg: BridgeMessage): void {

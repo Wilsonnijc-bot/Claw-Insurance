@@ -78,6 +78,17 @@ export interface ApiJournalEntry {
   source?: string;
 }
 
+export interface SyncResult {
+  status: string;
+  phone: string;
+  matchedEntries: number;
+  importedEntries: number;
+  verifiedEntries: number;
+  verifiedPhones: string[];
+  backendSuccess: boolean;
+  requestId?: string | null;
+}
+
 // ─── Client endpoints ───────────────────────────────────────────────
 
 /** List all WhatsApp clients (reply targets). */
@@ -155,8 +166,8 @@ export async function sendBroadcast(phones: string[], content: string): Promise<
 // ─── Sync ───────────────────────────────────────────────────────────
 
 /** Trigger WhatsApp history sync for a client. */
-export async function triggerSync(phone: string): Promise<void> {
-  await request(`/sync/${phone}`, { method: 'POST' });
+export async function triggerSync(phone: string): Promise<SyncResult> {
+  return request<SyncResult>(`/sync/${phone}`, { method: 'POST' });
 }
 
 // ─── Bridge Health ──────────────────────────────────────────────────

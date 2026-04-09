@@ -126,6 +126,7 @@ test('scrape_reply_targets_history broadcasts web scrape history for each scrape
 
   const ack = await server.handleCommand({
     type: 'scrape_reply_targets_history',
+    requestId: 'req-1',
     targets: [
       {
         chatId: '123@s.whatsapp.net',
@@ -149,6 +150,7 @@ test('scrape_reply_targets_history broadcasts web scrape history for each scrape
     {
       type: 'history',
       source: 'web_scrape',
+      requestId: 'req-1',
       target: '123@s.whatsapp.net',
       messages: [
         {
@@ -162,6 +164,113 @@ test('scrape_reply_targets_history broadcasts web scrape history for each scrape
           pushName: 'Alice',
         },
       ],
+    },
+    {
+      type: 'history',
+      source: 'web_scrape',
+      requestId: 'req-1',
+      isLatest: true,
+      messages: [],
+    },
+  ]);
+});
+
+test('scrape_reply_targets_history skips targets without normalized phones before parsing', async () => {
+  const server = new BridgeServer(3001, '/tmp/auth', '/tmp/profile');
+  let receivedTargets = null;
+  server.historyParser = {
+    async scrapeReplyTargets(targets) {
+      receivedTargets = targets;
+      return {
+        status: 'history_scraped',
+        results: [],
+      };
+    },
+  };
+
+  const ack = await server.handleCommand({
+    type: 'scrape_reply_targets_history',
+    targets: [
+      {
+        chatId: '123@s.whatsapp.net',
+        phone: '1234567890',
+        searchTerms: ['Alice'],
+      },
+      {
+        chatId: 'missing-phone@s.whatsapp.net',
+        searchTerms: ['Missing Phone'],
+      },
+    ],
+  });
+
+  assert.equal(ack.status, 'history_scraped');
+  assert.deepEqual(receivedTargets, [
+    {
+      chatId: '123@s.whatsapp.net',
+      phone: '1234567890',
+      searchTerms: ['Alice'],
+    },
+  ]);
+});
+
+test('scrape_direct_history emits a terminal latest history batch for request-scoped sync completion', async () => {
+  const server = new BridgeServer(3001, '/tmp/auth', '/tmp/profile');
+  const broadcasts = [];
+  server.broadcast = (msg) => broadcasts.push(msg);
+  server.historyParser = {
+    async scrapeHistory() {
+      return {
+        status: 'history_scraped',
+        messages: [
+          {
+            id: 'hist-123@s.whatsapp.net',
+            content: 'Hello from web',
+            timestamp: '2026-03-09T10:11:37.000Z',
+            fromMe: false,
+            pushName: 'Alice',
+          },
+        ],
+      };
+    },
+  };
+
+  const ack = await server.handleCommand({
+    type: 'scrape_direct_history',
+    requestId: 'req-2',
+    target: {
+      chatId: '123@s.whatsapp.net',
+      phone: '1234567890',
+      searchTerms: ['Alice'],
+    },
+  });
+
+  assert.equal(ack.status, 'history_scraped');
+  assert.deepEqual(broadcasts, [
+    {
+      type: 'history',
+      source: 'web_scrape',
+      requestId: 'req-2',
+      messages: [
+        {
+          id: 'hist-123@s.whatsapp.net',
+          sender: '123@s.whatsapp.net',
+          pn: '1234567890',
+          content: 'Hello from web',
+          timestamp: 1773051097,
+          fromMe: false,
+          isGroup: false,
+          pushName: 'Alice',
+        },
+      ],
+      target: '123@s.whatsapp.net',
+    },
+    {
+      type: 'history',
+      source: 'web_scrape',
+      requestId: 'req-2',
+      isLatest: true,
+      messages: [],
+      target: '123@s.whatsapp.net',
     },
   ]);
 });
@@ -185,6 +294,26 @@ test('scrape_direct_history returns login_required when browser scrape cannot st
 
   assert.equal(ack.status, 'login_required');
   assert.equal(ack.detail, 'Log in first');
+});
+
+test('scrape_direct_history rejects targets without a normalized phone', async () => {
+  const server = new BridgeServer(3001, '/tmp/auth', '/tmp/profile');
+  server.historyParser = {
+    async scrapeHistory() {
+      throw new Error('should not run');
+    },
+  };
+
+  const ack = await server.handleCommand({
+    type: 'scrape_direct_history',
+    target: {
+      chatId: '123@s.whatsapp.net',
+      searchTerms: ['Alice'],
+    },
+  });
+
+  assert.equal(ack.status, 'chat_not_found');
+  assert.equal(ack.detail, 'No valid direct-message target with a normalized phone was provided.');
 });
 
 test('scrape_direct_history forwards simplified parse failures', async () => {

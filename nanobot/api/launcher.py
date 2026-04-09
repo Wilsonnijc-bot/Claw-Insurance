@@ -561,7 +561,7 @@ class LauncherServer:
             self._ws_clients.discard(ws)
 
     async def _run_login_history_parse(self) -> None:
-        """Kick off one bulk WhatsApp history parse after login without blocking the UI."""
+        """Kick off one background WhatsApp direct-history parse after login without blocking the UI."""
         try:
             if not self._channels:
                 return
@@ -573,16 +573,19 @@ class LauncherServer:
                 return
             await self._api_server._append_journal(
                 action="LOGIN_HISTORY_PARSE",
-                description="已完成登录后的 WhatsApp 批量历史同步",
+                description="已完成登录后的 WhatsApp 定向历史同步",
                 details={
                     "requestedTargets": result.get("requested_targets", 0),
                     "scrapedTargets": result.get("scraped_targets", 0),
                     "missedTargets": result.get("missed_targets", 0),
                     "matchedEntries": result.get("matched_entries", 0),
                     "importedEntries": result.get("imported_entries", 0),
+                    "verifiedTargets": result.get("verified_targets", 0),
+                    "verifiedEntries": result.get("verified_entries", 0),
+                    "verifiedPhones": result.get("verified_phones", []),
                     "status": result.get("status"),
                     "detail": result.get("detail", ""),
                 },
             )
         except Exception:
-            logger.exception("Login-time WhatsApp bulk parse failed")
+            logger.exception("Login-time WhatsApp direct history parse failed")

@@ -40,7 +40,9 @@ class HistoryImportResult:
     channel: str
     matched_entries: int = 0
     imported_entries: int = 0
+    verified_entries: int = 0
     phones: list[str] = field(default_factory=list)
+    verified_phones: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

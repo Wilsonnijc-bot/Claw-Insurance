@@ -51,8 +51,8 @@ These are the most important implementation facts right now:
 | ChannelManager | Starts WhatsApp and any other enabled channels | after gateway start |
 | WhatsAppChannel | Python-side WhatsApp routing, sync orchestration, status caching | after gateway start |
 | Node bridge | Baileys transport plus Playwright/CDP helper actions | after gateway start |
-| DraftComposer | launch-mode WhatsApp Web draft placement only | inside bridge |
-| HistoryParser | parse-only CDP history scraping with session reuse/fresh-window retry | inside bridge |
+| DraftComposer | launch-mode WhatsApp Web draft placement only; disabled in `cdp` mode | inside bridge |
+| HistoryParser | parse-only CDP history scraping with session reuse, one fresh-window retry, and first-result chat entry | inside bridge |
 
 ### Frontend Routes Actually Used
 
@@ -178,6 +178,12 @@ Equivalent:
 python3 -m nanobot ui
 ```
 
+Stop the local UI/launcher/bridge dev processes:
+
+```bash
+python3 -m nanobot stop-dev
+```
+
 What this actually does:
 
 1. Resolves the frontend directory at `Insurance frontend/`.
@@ -212,26 +218,28 @@ After `POST /api/login`, the launcher starts the full runtime in this order:
 5. start background mirror/observer tasks for outbound messages, inbound capture, persisted history, auth status, and bridge health
 6. start the agent loop and channel manager
 7. mark the gateway ready
-8. kick off one background bulk WhatsApp history parse for enabled direct reply targets
+8. kick off one background direct WhatsApp history parse for enabled direct reply targets
 
 The WebSocket stays on `/ws` the whole time. Before readiness it is served by the launcher. After readiness the launcher proxies real API routes to `ApiServer`.
 
 ### 4. WhatsApp Login Is Split Across Two Surfaces
 
-There are two separate WhatsApp-related runtime states:
+WhatsApp uses two separate states:
 
-1. Baileys auth state in `whatsapp-auth/`
-   This controls real inbound/outbound WhatsApp transport.
-2. WhatsApp Web browser state in `whatsapp-web/`
-   This controls parse-only CDP history scraping against WhatsApp Web.
+- `whatsapp-auth/` for Baileys transport login
+- `whatsapp-web/` for parse-only CDP history scraping
 
-Current operator impact:
+The UI exposes the Baileys QR flow directly. WhatsApp Web login is separate, uses the `whatsapp-web/` browser profile, and affects only history parsing. During parsing, the bridge reuses an existing usable CDP session when possible and opens one fresh CDP window only if parsing cannot proceed.
 
-- if Baileys auth is missing or invalid, the UI receives `whatsapp_auth_status` and shows a QR code
-- if the CDP browser profile is not logged into WhatsApp Web, manual sync and the one login-time bulk parse can fail even when Baileys is connected
-- when parsing starts, the bridge tries to reuse an existing usable CDP WhatsApp Web session first and only opens a fresh window if parsing cannot proceed
+Current CDP behavior is intentionally narrow:
 
-The UI directly exposes the Baileys QR flow. The WhatsApp Web browser login is separate and uses the Chrome/Chromium profile in `whatsapp-web/`.
+- CDP mode is reserved for history parsing. WhatsApp Web draft placement is disabled in `cdp` mode.
+- Both manual sync and login-time bulk parse use the same direct parse routine.
+- History parsing reuses a logged-in usable WhatsApp Web tab when possible.
+- If the attached CDP page is poisoned or unusable, parsing opens one fresh CDP window and retries once.
+- True `chat_not_found` results do not trigger a fresh-window retry.
+- The parse entry flow is: acquire a usable WhatsApp page, focus search input, clear old search state, type the normalized phone once, confirm the input value, wait 3 seconds for search to settle, collect visible real result rows from `#pane-side div[role="gridcell"][tabindex="0"]`, click the first/top real row, verify the main chat is open, then scrape history.
+- History parsing requires a normalized phone. `searchTerms` can still be carried in payloads for metadata or launch-mode draft use, but the parse routine does not use them to choose a row.
 
 ### 5. Inbound Direct Message Flow
 
@@ -346,8 +354,9 @@ There are two real sync paths today.
 
 Automatic login-time sync:
 
-- after the gateway becomes ready, the launcher starts one background bulk parse
-- it only targets enabled direct reply targets from `data/whatsapp_reply_targets.json`
+- after the gateway becomes ready, the launcher starts one background direct history parse
+- it only targets enabled direct reply targets from `data/whatsapp_reply_targets.json` that have normalized phones
+- it uses the same phone-first CDP parse routine as manual sync
 - it does not block UI readiness
 
 Manual per-client sync:
@@ -355,21 +364,34 @@ Manual per-client sync:
 1. operator clicks sync in the client profile
 2. frontend calls `POST /api/sync/{phone}`
 3. `ApiServer` calls `WhatsAppChannel.sync_direct_history([phone])`
-4. `WhatsAppChannel` replays any matching cached history first
-5. the channel sends `scrape_direct_history` to the bridge
-6. the bridge's `HistoryParser` reuses a usable CDP WhatsApp Web session when possible, otherwise opens one fresh CDP window and retries once
-7. scraped messages come back as bridge `history` events
-8. `WhatsAppChannel` filters them against enabled direct reply targets and publishes one `InboundHistoryBatch`
-9. `AgentLoop._import_history_batch()` merges them into `session.jsonl`
-10. `ApiServer` returns `matchedEntries` and `importedEntries`
+4. the channel replays matching cached history, then sends `scrape_direct_history` to the bridge
+5. `HistoryParser` reuses an existing usable CDP session or opens one fresh CDP window and retries once
+6. the unified direct parse routine clears search, types the normalized phone once, waits for settle, clicks the first real visible row, verifies chat open, then scrapes history
+7. scraped history is published back through the bridge and imported into `session.jsonl`
+8. backend success remains JSONL-confirmed truth: the requested phone only succeeds when its `sessions/whatsapp__{phone}/session.jsonl` contains the intended messages for that sync attempt
+9. after backend success, the frontend follows the already-chosen transcript refresh/load semantics; that policy is not defined by the CDP layer
+
+The current direct CDP parse entry sequence is:
+
+1. locate the exact WhatsApp sidebar search input
+2. clear and verify the old search state is empty
+3. type the target phone number once
+4. verify the input contains that exact query
+5. wait 3 seconds for the WhatsApp search view to settle
+6. collect visible real rows under `#pane-side div[role="gridcell"][tabindex="0"]`
+7. click the first/top real row only
+8. verify the open chat from the main chat area, not the left app header
+9. scrape history from the opened chat
 
 Important sync constraints:
 
 - sync works only for phones that already exist as enabled direct reply targets
+- parse requests without a normalized phone are dropped before CDP parse begins
 - sync depends on the bridge being reachable
 - sync depends on the WhatsApp Web browser session being logged in and ready
 - sync imports history silently and does not invoke the LLM
 - sync updates `data/whatsapp_reply_targets.json` with observed `chat_id`, `sender_id`, `push_name`, and `last_seen_at` for existing target rows
+- sync retry is narrow: `session_unusable` can trigger one fresh CDP window retry, but `chat_not_found` remains a final non-retriable parse result
 
 ### 11. Health And Status Behavior
 
@@ -492,6 +514,7 @@ So the checked-in compose file does not expose the port the current frontend exp
 | `whatsapp-web-nanobot-ui` | starts launcher if needed, then runs Vite |
 | `whatsapp-web-nanobot-gateway` | starts the full backend immediately |
 | `python3 -m nanobot ui` | non-wrapper form of the UI start |
+| `python3 -m nanobot stop-dev` | stops local dev processes on ports `5173`, `5174`, `3456`, and `3001` |
 | `python3 -m nanobot launcher` | pre-login launcher only |
 | `python3 -m nanobot gateway` | full backend only |
 | `python3 -m nanobot status` | prints current path and provider summary |

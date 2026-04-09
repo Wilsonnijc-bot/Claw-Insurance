@@ -24,6 +24,7 @@ import {
   addReplyTarget as apiAddReplyTarget,
   restartBridge as apiRestartBridge,
   type ApiClient,
+  type SyncResult,
 } from '../services/api';
 import { nanobotWS, type WSEvent } from '../services/websocket';
 import type { Client } from '../types';
@@ -103,14 +104,16 @@ export interface UseNanobotReturn {
   aiGeneratingStatus: string | null;
   messageReloadToken: number;
   refreshClients: () => Promise<void>;
-  loadMessages: (phone: string) => Promise<void>;
+  loadMessages: (phone: string) => Promise<number>;
+  waitForMessagesLoaded: (phone: string, reloadToken: number, timeoutMs?: number) => Promise<void>;
+  markMessagesLoaded: (phone: string, reloadToken: number) => void;
   sendMessage: (phone: string, content: string) => Promise<void>;
   deleteClient: (phone: string) => Promise<void>;
   requestAIDraft: (phone: string) => Promise<string | null>;
   sendAIDraft: (phone: string, content: string) => Promise<void>;
   toggleAutoDraft: (phone: string, enabled: boolean) => Promise<void>;
   broadcast: (phones: string[], content: string) => Promise<void>;
-  syncWhatsApp: (phone: string) => Promise<void>;
+  syncWhatsApp: (phone: string) => Promise<SyncResult>;
   addReplyTarget: (phone: string, label?: string, autoDraft?: boolean) => Promise<boolean>;
   restartBridge: () => Promise<void>;
 }
@@ -138,6 +141,26 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const wsUnsubscribes = useRef<(() => void)[]>([]);
   const selectedClientPhoneRef = useRef<string | null>(null);
   const clientListRequestIdRef = useRef(0);
+  const messageReloadTokenRef = useRef(0);
+  const lastLoadedTranscriptRef = useRef<{ phone: string; reloadToken: number } | null>(null);
+  const transcriptLoadWaitersRef = useRef(new Map<string, {
+    timer: number;
+    waiters: Array<{ resolve: () => void; reject: (error: Error) => void }>;
+  }>());
+
+  const bumpMessageReloadToken = useCallback(() => {
+    messageReloadTokenRef.current += 1;
+    setMessageReloadToken(messageReloadTokenRef.current);
+    return messageReloadTokenRef.current;
+  }, []);
+
+  const cancelTranscriptLoadWaiters = useCallback((message: string) => {
+    transcriptLoadWaitersRef.current.forEach((entry) => {
+      window.clearTimeout(entry.timer);
+      entry.waiters.forEach((waiter) => waiter.reject(new Error(message)));
+    });
+    transcriptLoadWaitersRef.current.clear();
+  }, []);
 
   const applyGatewayStatus = useCallback((status: {
     status: string;
@@ -170,8 +193,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     }
     selectedClientPhoneRef.current = null;
     setSelectedClientPhone(null);
-    setMessageReloadToken((prev) => prev + 1);
-  }, []);
+    bumpMessageReloadToken();
+  }, [bumpMessageReloadToken]);
 
   const refreshClientList = useCallback(async (): Promise<Client[] | null> => {
     const requestId = ++clientListRequestIdRef.current;
@@ -188,8 +211,48 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const loadMessages = useCallback(async (phone: string) => {
     selectedClientPhoneRef.current = phone;
     setSelectedClientPhone(phone);
-    setMessageReloadToken((prev) => prev + 1);
-  }, []);
+    return bumpMessageReloadToken();
+  }, [bumpMessageReloadToken]);
+
+  const makeTranscriptLoadKey = useCallback((phone: string, reloadToken: number) => `${phone}:${reloadToken}`, []);
+
+  const markMessagesLoaded = useCallback((phone: string, reloadToken: number) => {
+    lastLoadedTranscriptRef.current = { phone, reloadToken };
+    const key = makeTranscriptLoadKey(phone, reloadToken);
+    const entry = transcriptLoadWaitersRef.current.get(key);
+    if (!entry) {
+      return;
+    }
+    window.clearTimeout(entry.timer);
+    transcriptLoadWaitersRef.current.delete(key);
+    entry.waiters.forEach((waiter) => waiter.resolve());
+  }, [makeTranscriptLoadKey]);
+
+  const waitForMessagesLoaded = useCallback(async (phone: string, reloadToken: number, timeoutMs: number = 15000) => {
+    const loaded = lastLoadedTranscriptRef.current;
+    if (loaded && loaded.phone === phone && loaded.reloadToken === reloadToken) {
+      return;
+    }
+
+    const key = makeTranscriptLoadKey(phone, reloadToken);
+    return new Promise<void>((resolve, reject) => {
+      const existing = transcriptLoadWaitersRef.current.get(key);
+      if (existing) {
+        existing.waiters.push({ resolve, reject });
+        return;
+      }
+
+      const timer = window.setTimeout(() => {
+        const pending = transcriptLoadWaitersRef.current.get(key);
+        transcriptLoadWaitersRef.current.delete(key);
+        (pending?.waiters || []).forEach((waiter) => waiter.reject(new Error('聊天记录加载超时，请重试')));
+      }, timeoutMs);
+      transcriptLoadWaitersRef.current.set(key, {
+        timer,
+        waiters: [{ resolve, reject }],
+      });
+    });
+  }, [makeTranscriptLoadKey]);
 
   const refreshClients = useCallback(async () => {
     try {
@@ -226,6 +289,9 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setAiGeneratingPhone(null);
       setAiGeneratingStatus(null);
       setMessageReloadToken(0);
+      messageReloadTokenRef.current = 0;
+      lastLoadedTranscriptRef.current = null;
+      cancelTranscriptLoadWaiters('聊天记录加载已取消');
       return;
     }
 
@@ -272,7 +338,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     const unsub1 = nanobotWS.on('new_message', (event: WSEvent) => {
       if (!event.phone) return;
       if (selectedClientPhoneRef.current === event.phone) {
-        setMessageReloadToken((prev) => prev + 1);
+        bumpMessageReloadToken();
       }
       void refreshClients();
     });
@@ -401,11 +467,14 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     return () => {
       mounted = false;
       wsUnsubscribes.current.forEach((unsubscribe) => unsubscribe());
+      cancelTranscriptLoadWaiters('聊天记录加载已取消');
       nanobotWS.disconnect();
     };
   }, [
     enabled,
     applyGatewayStatus,
+    bumpMessageReloadToken,
+    cancelTranscriptLoadWaiters,
     clearCurrentThread,
     refreshClientList,
     refreshClients,
@@ -415,14 +484,14 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     try {
       await apiSend(phone, content);
       if (selectedClientPhoneRef.current === phone) {
-        setMessageReloadToken((prev) => prev + 1);
+        bumpMessageReloadToken();
       }
       await refreshClients();
     } catch (err) {
       console.error('Failed to send message:', err);
       throw err;
     }
-  }, [refreshClients]);
+  }, [bumpMessageReloadToken, refreshClients]);
 
   const handleDeleteClient = useCallback(async (phone: string) => {
     try {
@@ -450,14 +519,14 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     try {
       await apiSendDraft(phone, content);
       if (selectedClientPhoneRef.current === phone) {
-        setMessageReloadToken((prev) => prev + 1);
+        bumpMessageReloadToken();
       }
       await refreshClients();
     } catch (err) {
       console.error('Failed to send AI draft:', err);
       throw err;
     }
-  }, [refreshClients]);
+  }, [bumpMessageReloadToken, refreshClients]);
 
   const handleToggleAutoDraft = useCallback(async (phone: string, enabled: boolean) => {
     setClients((prev) =>
@@ -488,7 +557,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
 
   const handleSync = useCallback(async (phone: string) => {
     try {
-      await apiSync(phone);
+      return await apiSync(phone);
     } catch (err) {
       console.error('Sync failed:', err);
       throw err;
@@ -537,6 +606,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     messageReloadToken,
     refreshClients,
     loadMessages,
+    waitForMessagesLoaded,
+    markMessagesLoaded,
     sendMessage: handleSendMessage,
     deleteClient: handleDeleteClient,
     requestAIDraft: handleRequestAIDraft,

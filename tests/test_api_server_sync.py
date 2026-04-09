@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -28,27 +29,22 @@ class _JSONRequest:
 
 
 class _FakeWhatsApp:
-    def __init__(self) -> None:
-        self.check_calls = 0
+    def __init__(self, result: dict[str, object] | None = None) -> None:
         self.sync_calls = 0
-
-    async def check_browser_status(self) -> dict[str, object]:
-        self.check_calls += 1
-        return {
-            "status": "scrape_not_ready",
-            "reusable": False,
-            "detail": "stale precheck",
-            "severity": "warning",
+        self.result = result or {
+            "status": "history_scraped",
+            "matched_entries": 3,
+            "imported_entries": 0,
+            "verified_entries": 3,
+            "verified_phones": ["1234567890"],
+            "backend_success": True,
+            "request_id": "req-123",
         }
 
     async def sync_direct_history(self, phones: list[str]) -> dict[str, object]:
         self.sync_calls += 1
         assert phones == ["1234567890"]
-        return {
-            "status": "history_scraped",
-            "matched_entries": 3,
-            "imported_entries": 2,
-        }
+        return dict(self.result)
 
 
 def _draft_cdp_config(tmp_path: Path) -> SimpleNamespace:
@@ -64,7 +60,7 @@ def _draft_cdp_config(tmp_path: Path) -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_api_sync_uses_actual_history_sync_without_blocking_on_precheck(tmp_path: Path) -> None:
+async def test_api_sync_uses_actual_history_sync_result_without_any_browser_gate(tmp_path: Path) -> None:
     whatsapp = _FakeWhatsApp()
     config = SimpleNamespace(
         channels=SimpleNamespace(
@@ -82,6 +78,102 @@ async def test_api_sync_uses_actual_history_sync_without_blocking_on_precheck(tm
         agent=None,
         channel_manager=channel_manager,
     )
+    server._append_journal = AsyncMock()
+
+    response = await server._handle_sync(SimpleNamespace(match_info={"phone": "1234567890"}))
+
+    assert response.status == 200
+    assert json.loads(response.text) == {
+        "status": "history_scraped",
+        "phone": "1234567890",
+        "matchedEntries": 3,
+        "importedEntries": 0,
+        "verifiedEntries": 3,
+        "verifiedPhones": ["1234567890"],
+        "backendSuccess": True,
+        "requestId": "req-123",
+    }
+    assert whatsapp.sync_calls == 1
+    server._append_journal.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_api_sync_returns_success_when_channel_reports_jsonl_confirmed_backend_success(tmp_path: Path) -> None:
+    whatsapp = _FakeWhatsApp(
+        {
+            "status": "history_scraped",
+            "matched_entries": 0,
+            "imported_entries": 0,
+            "verified_entries": 1,
+            "verified_phones": ["1234567890"],
+            "backend_success": True,
+            "request_id": "req-jsonl",
+        }
+    )
+    config = SimpleNamespace(
+        channels=SimpleNamespace(
+            whatsapp=SimpleNamespace(reply_targets_file=str(tmp_path / "reply_targets.json"))
+        )
+    )
+    channel_manager = SimpleNamespace(
+        get_channel=lambda name: whatsapp if name == "whatsapp" else None,
+        enabled_channels=[],
+    )
+    server = ApiServer(
+        config=config,
+        bus=MessageBus(),
+        session_manager=_FakeSessionManager(tmp_path),
+        agent=None,
+        channel_manager=channel_manager,
+    )
+    server._append_journal = AsyncMock()
+
+    response = await server._handle_sync(SimpleNamespace(match_info={"phone": "1234567890"}))
+
+    assert response.status == 200
+    assert json.loads(response.text) == {
+        "status": "history_scraped",
+        "phone": "1234567890",
+        "matchedEntries": 0,
+        "importedEntries": 0,
+        "verifiedEntries": 1,
+        "verifiedPhones": ["1234567890"],
+        "backendSuccess": True,
+        "requestId": "req-jsonl",
+    }
+    server._append_journal.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_api_sync_history_scraped_without_verified_session_stays_backend_unsuccessful(tmp_path: Path) -> None:
+    whatsapp = _FakeWhatsApp(
+        {
+            "status": "history_scraped",
+            "matched_entries": 3,
+            "imported_entries": 2,
+            "verified_entries": 0,
+            "verified_phones": [],
+            "backend_success": False,
+            "request_id": "req-456",
+        }
+    )
+    config = SimpleNamespace(
+        channels=SimpleNamespace(
+            whatsapp=SimpleNamespace(reply_targets_file=str(tmp_path / "reply_targets.json"))
+        )
+    )
+    channel_manager = SimpleNamespace(
+        get_channel=lambda name: whatsapp if name == "whatsapp" else None,
+        enabled_channels=[],
+    )
+    server = ApiServer(
+        config=config,
+        bus=MessageBus(),
+        session_manager=_FakeSessionManager(tmp_path),
+        agent=None,
+        channel_manager=channel_manager,
+    )
+    server._append_journal = AsyncMock()
 
     response = await server._handle_sync(SimpleNamespace(match_info={"phone": "1234567890"}))
 
@@ -91,9 +183,12 @@ async def test_api_sync_uses_actual_history_sync_without_blocking_on_precheck(tm
         "phone": "1234567890",
         "matchedEntries": 3,
         "importedEntries": 2,
+        "verifiedEntries": 0,
+        "verifiedPhones": [],
+        "backendSuccess": False,
+        "requestId": "req-456",
     }
-    assert whatsapp.sync_calls == 1
-    assert whatsapp.check_calls == 0
+    server._append_journal.assert_not_awaited()
 
 
 @pytest.mark.asyncio

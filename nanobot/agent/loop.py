@@ -507,7 +507,7 @@ class AgentLoop:
                 target_stats.get("group_reply_target_count", -1),
             )
             if instruction.individuals is not None:
-                # Reply-target updates are passive until the next login bulk parse
+                # Reply-target updates are passive until the next login direct history parse
                 # or an explicit manual sync from the UI.
                 pass
         except Exception:
@@ -964,12 +964,12 @@ class AgentLoop:
         await self._connect_mcp()
         logger.info("Agent loop started")
         inbound_task = asyncio.create_task(self.bus.consume_inbound())
-        history_task = asyncio.create_task(self.bus.consume_history())
+        history_worker = asyncio.create_task(self._history_import_worker())
 
         try:
             while self._running:
                 done, _pending = await asyncio.wait(
-                    {inbound_task, history_task},
+                    {inbound_task},
                     timeout=1.0,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -985,15 +985,16 @@ class AgentLoop:
                         task = asyncio.create_task(self._dispatch(msg))
                         self._active_tasks.setdefault(msg.session_key, []).append(task)
                         task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
-
-                if history_task in done:
-                    batch = history_task.result()
-                    history_task = asyncio.create_task(self.bus.consume_history())
-                    asyncio.create_task(self._dispatch_history(batch))
         finally:
             inbound_task.cancel()
-            history_task.cancel()
-            await asyncio.gather(inbound_task, history_task, return_exceptions=True)
+            history_worker.cancel()
+            await asyncio.gather(inbound_task, history_worker, return_exceptions=True)
+
+    async def _history_import_worker(self) -> None:
+        """Consume history batches in bus order so request-scoped terminal signals stay ordered."""
+        while self._running:
+            batch = await self.bus.consume_history()
+            await self._dispatch_history(batch)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -1091,7 +1092,9 @@ class AgentLoop:
                     channel=batch.channel,
                     matched_entries=0,
                     imported_entries=0,
+                    verified_entries=0,
                     phones=[],
+                    verified_phones=[],
                     metadata=dict(batch.metadata or {}),
                 )
             return None
@@ -1103,6 +1106,7 @@ class AgentLoop:
         matched_entries = 0
         imported_entries = 0
         phones_seen: set[str] = set()
+        intended_message_ids_by_phone: dict[str, set[str]] = {}
         for raw in batch.entries:
             if not isinstance(raw, dict):
                 continue
@@ -1153,6 +1157,7 @@ class AgentLoop:
             matched_entries += 1
             if phone_norm:
                 phones_seen.add(phone_norm)
+                intended_message_ids_by_phone.setdefault(phone_norm, set()).add(message_id)
 
             bucket = touched.setdefault(
                 session_key,
@@ -1221,11 +1226,32 @@ class AgentLoop:
             )
             logger.info("Imported {} WhatsApp history messages into {}", len(imports), session_key)
 
+        verified_entries = 0
+        verified_phones: set[str] = set()
+        for phone_norm, intended_ids in intended_message_ids_by_phone.items():
+            if not intended_ids:
+                continue
+            session_key = f"whatsapp:{phone_norm}"
+            session = touched.get(session_key, {}).get("session")
+            if session is None:
+                session = self.sessions.get_or_create(session_key)
+            existing_ids = {
+                str(existing.get("message_id", "") or "").strip()
+                for existing in session.messages
+                if str(existing.get("message_id", "") or "").strip()
+            }
+            verified_ids = intended_ids.intersection(existing_ids)
+            if verified_ids:
+                verified_entries += len(verified_ids)
+                verified_phones.add(phone_norm)
+
         return HistoryImportResult(
             channel=batch.channel,
             matched_entries=matched_entries,
             imported_entries=imported_entries,
+            verified_entries=verified_entries,
             phones=sorted(phones_seen),
+            verified_phones=sorted(verified_phones),
             metadata=dict(batch.metadata or {}),
         )
 

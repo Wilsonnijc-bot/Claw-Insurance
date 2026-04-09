@@ -7,6 +7,7 @@ interface MessageThreadProps {
   clientName: string;
   isAILoading: boolean;
   reloadToken: number;
+  onTranscriptLoaded?: (clientId: string, reloadToken: number) => void;
 }
 
 export const MessageThread: React.FC<MessageThreadProps> = ({
@@ -14,6 +15,7 @@ export const MessageThread: React.FC<MessageThreadProps> = ({
   clientName,
   isAILoading,
   reloadToken,
+  onTranscriptLoaded,
 }) => {
   const transcriptUrl = useMemo(
     () => getMessagesViewUrl(clientId, reloadToken),
@@ -27,6 +29,7 @@ export const MessageThread: React.FC<MessageThreadProps> = ({
         src={transcriptUrl}
         title={`${clientName} transcript`}
         className="h-full w-full border-0 bg-transparent"
+        onLoad={() => onTranscriptLoaded?.(clientId, reloadToken)}
       />
 
       {isAILoading && (

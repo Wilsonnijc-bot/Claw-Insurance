@@ -10,11 +10,10 @@ import {
   HISTORY_SCROLL_WAIT_MS,
   ParseSessionUnavailableError,
   type PageDriver,
+  POST_SEARCH_SETTLE_WAIT_MS,
   READY_CHECK_TIMEOUT_MS,
   READY_TIMEOUT_MS,
   SEARCH_TIMEOUT_MS,
-  SIDEBAR_SCROLL_LIMIT,
-  SIDEBAR_SCROLL_WAIT_MS,
   WhatsAppWebSession,
 } from './webAutomation.js';
 
@@ -84,6 +83,14 @@ export class HistoryParser extends WhatsAppWebSession {
   }
 
   private async _scrapeHistory(target: ChatTarget): Promise<HistoryScrapeResult> {
+    const phone = String(target.phone || '').trim();
+    if (!phone) {
+      return {
+        status: 'chat_not_found',
+        detail: `Chat ${target.chatId} is not available for history parsing without a normalized phone.`,
+      };
+    }
+
     return this._runParseWithSessionReuse(async (page) => {
       if (!await this._ensureWhatsAppReady(page)) {
         return {
@@ -92,31 +99,33 @@ export class HistoryParser extends WhatsAppWebSession {
         };
       }
 
-      const opened = await this._openTargetForParse(page, target, { allowPhoneNavigation: false });
-      if (opened === 'session_unusable') {
+      const result = await this._scrapeTargetOnPage(page, target);
+      if (result.status === 'session_unusable') {
         throw new ParseSessionUnavailableError('WhatsApp Web attached tab is not usable for history parsing.');
       }
-      if (opened !== 'opened') {
+      if (result.status !== 'history_scraped') {
         return {
           status: 'chat_not_found',
           detail: `Chat ${target.chatId} is not available in WhatsApp Web search.`,
         };
       }
-
-      const messages = await this._collectOpenChatHistory(page);
       return {
         status: 'history_scraped',
-        messages,
+        messages: result.messages,
       };
     });
   }
 
   private async _scrapeReplyTargets(targets: ChatTarget[]): Promise<BulkHistoryScrapeResult> {
-    const normalizedTargets = targets.filter((target) => target && target.chatId);
+    const normalizedTargets = targets.filter((target) => {
+      const chatId = String(target?.chatId || '').trim();
+      const phone = String(target?.phone || '').trim();
+      return Boolean(chatId && phone);
+    });
     if (normalizedTargets.length === 0) {
       return {
         status: 'history_scraped',
-        detail: 'No reply targets were provided for bulk parsing.',
+        detail: 'No reply targets with a normalized phone were provided for history parsing.',
         results: [],
       };
     }
@@ -129,12 +138,25 @@ export class HistoryParser extends WhatsAppWebSession {
           results: [],
         };
       }
-
-      if (!await this._resetSearchBox(page)) {
-        throw new ParseSessionUnavailableError('WhatsApp Web sidebar search could not be reset before bulk history parsing.');
+      const results: BulkHistoryTargetResult[] = [];
+      for (const target of normalizedTargets) {
+        const result = await this._scrapeTargetOnPage(page, target);
+        if (result.status === 'session_unusable') {
+          throw new ParseSessionUnavailableError('WhatsApp Web attached tab is not usable for history parsing.');
+        }
+        if (result.status === 'chat_not_found') {
+          results.push({
+            target,
+            status: 'chat_not_found',
+          });
+          continue;
+        }
+        results.push({
+          target,
+          status: 'history_scraped',
+          messages: result.messages,
+        });
       }
-
-      const results = await this._scanSidebarAndScrapeTargets(page, normalizedTargets);
       return {
         status: 'history_scraped',
         results,
@@ -230,19 +252,59 @@ export class HistoryParser extends WhatsAppWebSession {
   private async _openTargetForParse(
     page: PageDriver,
     target: ChatTarget,
-    options: { allowPhoneNavigation: boolean },
   ): Promise<'opened' | 'chat_not_found' | 'session_unusable'> {
-    const opened = await this._openTargetWithOptions(page, target, options);
-    if (opened.status === 'opened') {
-      return 'opened';
+    const query = String(target.phone || '').trim();
+    if (!query) {
+      return 'chat_not_found';
     }
-    if (opened.status === 'session_unusable') {
+    const searchBoxState = await this._getSearchBoxState(page);
+    if (!searchBoxState.found) {
       return 'session_unusable';
+    }
+    if (!await this._focusExactSearchBox(page)) {
+      return 'session_unusable';
+    }
+    if (!await this._resetSearchBox(page)) {
+      return 'session_unusable';
+    }
+    const searchResultsMutationBaseline = await this._armSearchResultsRefreshObserver(page);
+    if (searchResultsMutationBaseline === null) {
+      return 'session_unusable';
+    }
+    if (!await this._typeSearchQuery(page, query)) {
+      return 'session_unusable';
+    }
+    await page.waitForTimeout?.(POST_SEARCH_SETTLE_WAIT_MS);
+    if (!await this._waitForFirstSearchResultRow(page, query, searchResultsMutationBaseline, SEARCH_TIMEOUT_MS)) {
+      if (!await this._ensureWhatsAppReady(page, READY_CHECK_TIMEOUT_MS)) {
+        return 'session_unusable';
+      }
+      return 'chat_not_found';
+    }
+    if (!await this._clickFirstSearchResultRow(page)) {
+      return 'session_unusable';
+    }
+    if (await this._waitForOpenedChatReady(page, SEARCH_TIMEOUT_MS)) {
+      return 'opened';
     }
     if (!await this._ensureWhatsAppReady(page, READY_CHECK_TIMEOUT_MS)) {
       return 'session_unusable';
     }
-    return 'chat_not_found';
+    return 'session_unusable';
+  }
+
+  private async _scrapeTargetOnPage(
+    page: PageDriver,
+    target: ChatTarget,
+  ): Promise<{ status: 'history_scraped' | 'chat_not_found' | 'session_unusable'; messages?: ScrapedHistoryMessage[] }> {
+    const opened = await this._openTargetForParse(page, target);
+    if (opened !== 'opened') {
+      return { status: opened };
+    }
+    return {
+      status: 'history_scraped',
+      messages: await this._collectOpenChatHistory(page),
+    };
   }
 
   private async _collectOpenChatHistory(page: PageDriver): Promise<ScrapedHistoryMessage[]> {
@@ -280,73 +342,6 @@ export class HistoryParser extends WhatsAppWebSession {
     }
 
     return this._normalizeScrapedMessages([...collected.values()]);
-  }
-
-  private async _scanSidebarAndScrapeTargets(
-    page: PageDriver,
-    targets: ChatTarget[],
-  ): Promise<BulkHistoryTargetResult[]> {
-    if (!await this._isSidebarReady(page)) {
-      throw new ParseSessionUnavailableError('WhatsApp Web sidebar is not usable for bulk history parsing.');
-    }
-
-    const remaining = new Map<string, ChatTarget>();
-    for (const target of targets) {
-      remaining.set(target.chatId, target);
-    }
-
-    const results: BulkHistoryTargetResult[] = [];
-    let stagnantRounds = 0;
-
-    for (let attempt = 0; attempt < SIDEBAR_SCROLL_LIMIT && remaining.size > 0; attempt += 1) {
-      const visibleTargetIds = await this._findVisibleSidebarTargets(page, [...remaining.values()]);
-      let openedThisRound = 0;
-
-      for (const targetId of visibleTargetIds) {
-        const target = remaining.get(targetId);
-        if (!target) {
-          continue;
-        }
-
-        const opened = await this._openVisibleSidebarTarget(page, target);
-        if (!opened) {
-          continue;
-        }
-
-        const messages = await this._collectOpenChatHistory(page);
-        results.push({
-          target,
-          status: 'history_scraped',
-          messages,
-        });
-        remaining.delete(targetId);
-        openedThisRound += 1;
-      }
-
-      if (remaining.size === 0) {
-        break;
-      }
-
-      const scrolled = await this._scrollSidebarDown(page);
-      if (!scrolled && openedThisRound === 0) {
-        stagnantRounds += 1;
-      } else {
-        stagnantRounds = 0;
-      }
-      if (stagnantRounds >= 2) {
-        break;
-      }
-      await page.waitForTimeout?.(SIDEBAR_SCROLL_WAIT_MS);
-    }
-
-    for (const target of remaining.values()) {
-      results.push({
-        target,
-        status: 'chat_not_found',
-      });
-    }
-
-    return results;
   }
 
   private async _extractHistorySnapshot(page: PageDriver): Promise<HistorySnapshot> {
@@ -545,160 +540,4 @@ export class HistoryParser extends WhatsAppWebSession {
     return parsed.toISOString();
   }
 
-  private async _findVisibleSidebarTargets(page: PageDriver, targets: ChatTarget[]): Promise<string[]> {
-    return page.evaluate(({ action, targets }) => {
-      if (action !== 'find_sidebar_targets') {
-        return [];
-      }
-      const normalize = (value: string): string => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
-      const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
-      const isVisible = (node: Element | null): node is HTMLElement => {
-        if (!(node instanceof HTMLElement)) {
-          return false;
-        }
-        const style = window.getComputedStyle(node);
-        const rect = node.getBoundingClientRect();
-        return style.visibility !== 'hidden'
-          && style.display !== 'none'
-          && rect.width > 0
-          && rect.height > 0;
-      };
-
-      const rows = Array.from(document.querySelectorAll(
-        '#pane-side [role="listitem"], #pane-side div[data-testid="cell-frame-container"], #pane-side a[role="link"]',
-      ))
-        .filter((node) => isVisible(node))
-        .map((node) => ({
-          text: normalize((node as HTMLElement).innerText || node.textContent || ''),
-          digits: digits((node as HTMLElement).innerText || node.textContent || ''),
-        }))
-        .filter((row) => row.text || row.digits);
-
-      const remaining = new Set<string>();
-      const matched: string[] = [];
-      for (const target of targets) {
-        remaining.add(String(target.chatId || ''));
-      }
-
-      for (const row of rows) {
-        for (const target of targets) {
-          const targetId = String(target.chatId || '');
-          if (!targetId || !remaining.has(targetId)) {
-            continue;
-          }
-          const phone = digits(String(target.phone || ''));
-          if (phone && row.digits.includes(phone)) {
-            remaining.delete(targetId);
-            matched.push(targetId);
-            break;
-          }
-
-          const terms = (Array.isArray(target.searchTerms) ? target.searchTerms : [])
-            .map((value) => normalize(String(value || '')))
-            .filter((value) => value.length >= 4);
-          if (terms.some((term) => row.text.includes(term))) {
-            remaining.delete(targetId);
-            matched.push(targetId);
-            break;
-          }
-        }
-      }
-      return matched;
-    }, { action: 'find_sidebar_targets', targets });
-  }
-
-  private async _isSidebarReady(page: PageDriver): Promise<boolean> {
-    try {
-      return await page.evaluate(({ action }) => {
-        if (action !== 'sidebar_ready') {
-          return false;
-        }
-        const isVisible = (node: Element | null): node is HTMLElement => {
-          if (!(node instanceof HTMLElement)) {
-            return false;
-          }
-          const style = window.getComputedStyle(node);
-          const rect = node.getBoundingClientRect();
-          return style.visibility !== 'hidden'
-            && style.display !== 'none'
-            && rect.width > 0
-            && rect.height > 0;
-        };
-
-        return isVisible(document.querySelector('#pane-side'));
-      }, { action: 'sidebar_ready' });
-    } catch {
-      return false;
-    }
-  }
-
-  private async _openVisibleSidebarTarget(page: PageDriver, target: ChatTarget): Promise<boolean> {
-    const clicked = await page.evaluate(({ action, target }) => {
-      if (action !== 'open_sidebar_target') {
-        return false;
-      }
-      const normalize = (value: string): string => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
-      const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
-      const isVisible = (node: Element | null): node is HTMLElement => {
-        if (!(node instanceof HTMLElement)) {
-          return false;
-        }
-        const style = window.getComputedStyle(node);
-        const rect = node.getBoundingClientRect();
-        return style.visibility !== 'hidden'
-          && style.display !== 'none'
-          && rect.width > 0
-          && rect.height > 0;
-      };
-
-      const rows = Array.from(document.querySelectorAll(
-        '#pane-side [role="listitem"], #pane-side div[data-testid="cell-frame-container"], #pane-side a[role="link"]',
-      ));
-      const phone = digits(String(target.phone || ''));
-      const terms = (Array.isArray(target.searchTerms) ? target.searchTerms : [])
-        .map((value) => normalize(String(value || '')))
-        .filter((value) => value.length >= 4);
-
-      for (const row of rows) {
-        if (!isVisible(row)) {
-          continue;
-        }
-        const text = normalize((row as HTMLElement).innerText || row.textContent || '');
-        const textDigits = digits((row as HTMLElement).innerText || row.textContent || '');
-        const matched = (phone && textDigits.includes(phone))
-          || terms.some((term) => text.includes(term));
-        if (!matched) {
-          continue;
-        }
-        (row as HTMLElement).click();
-        return true;
-      }
-      return false;
-    }, { action: 'open_sidebar_target', target });
-
-    if (!clicked) {
-      return false;
-    }
-    return (await this._findVisibleLocator(page, COMPOSE_BOX_SELECTORS, SEARCH_TIMEOUT_MS)) !== null;
-  }
-
-  private async _scrollSidebarDown(page: PageDriver): Promise<boolean> {
-    return page.evaluate(({ action }) => {
-      if (action !== 'scroll_sidebar_down') {
-        return false;
-      }
-      const root = document.querySelector('#pane-side') || document.body;
-      const candidates = Array.from(root.querySelectorAll('*'))
-        .filter((node) => node.scrollHeight > node.clientHeight + 200);
-      const scroller = candidates
-        .sort((left, right) => right.scrollHeight - left.scrollHeight)[0] || null;
-      if (!scroller) {
-        return false;
-      }
-      const before = scroller.scrollTop;
-      const nextTop = Math.min(scroller.scrollTop + Math.max(scroller.clientHeight - 120, 200), scroller.scrollHeight);
-      scroller.scrollTop = nextTop;
-      return nextTop > before;
-    }, { action: 'scroll_sidebar_down' });
-  }
 }

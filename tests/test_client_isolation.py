@@ -258,7 +258,7 @@ class TestHistoryImportIsolation:
         loop = MagicMock()
         loop.sessions = sessions
         loop.workspace = ws
-        loop._save_session = lambda s: sessions.save(s)
+        loop._save_session = lambda s, **_: sessions.save(s)
         loop._refresh_whatsapp_history_exports = lambda s: None
         # Bind the real methods
         from nanobot.agent.loop import AgentLoop

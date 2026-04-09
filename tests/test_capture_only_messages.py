@@ -187,7 +187,9 @@ async def test_dispatch_history_publishes_import_result_for_request_scoped_batch
     assert result.metadata["request_id"] == "req-123"
     assert result.matched_entries == 1
     assert result.imported_entries == 1
+    assert result.verified_entries == 1
     assert result.phones == ["15550001111"]
+    assert result.verified_phones == ["15550001111"]
 
 
 @pytest.mark.asyncio
@@ -352,13 +354,18 @@ async def test_whatsapp_history_batch_imports_both_sides_without_llm_and_updates
     await channel._handle_bridge_message(json.dumps(rewrite_payload))
     batch = await loop.bus.consume_history()
 
-    loop._import_history_batch(batch)
+    first_result = loop._import_history_batch(batch)
     loop.provider.chat.assert_not_called()
 
     session = loop.sessions.get_or_create(f"whatsapp:{normalized_phone}")
     assert [msg["role"] for msg in session.messages] == ["client", "me"]
     assert [msg["content"] for msg in session.messages] == ["Hi", "Hello Alice"]
     assert [msg["message_id"] for msg in session.messages] == ["wa-hist-1", "wa-hist-2"]
+    assert first_result is not None
+    assert first_result.matched_entries == 2
+    assert first_result.imported_entries == 2
+    assert first_result.verified_entries == 2
+    assert first_result.verified_phones == [normalized_phone]
 
     bundle_meta = loop.sessions.get_session_meta_path(f"whatsapp:{normalized_phone}")
     assert bundle_meta.exists()
@@ -374,8 +381,13 @@ async def test_whatsapp_history_batch_imports_both_sides_without_llm_and_updates
     assert meta["client"]["push_name"] == "Alice"
     assert meta["metadata"]["client_name"] == "Alice Chan"
 
-    loop._import_history_batch(batch)
+    second_result = loop._import_history_batch(batch)
     assert len(loop.sessions.get_or_create(f"whatsapp:{normalized_phone}").messages) == 2
+    assert second_result is not None
+    assert second_result.matched_entries == 2
+    assert second_result.imported_entries == 0
+    assert second_result.verified_entries == 2
+    assert second_result.verified_phones == [normalized_phone]
 
 
 @pytest.mark.asyncio

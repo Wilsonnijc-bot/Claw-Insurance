@@ -1388,26 +1388,36 @@ class ApiServer:
                         status=response_status,
                     )
 
-                client_name = self._journal_client_name(phone)
-                await self._append_journal(
-                    action="SYNC_WHATSAPP",
-                    description=f"已同步 {client_name} 的 WhatsApp 历史记录",
-                    client_id=phone,
-                    client_name=client_name,
-                    details={
-                        "chatId": chat_id,
-                        "matchedEntries": result.get("matched_entries", 0),
-                        "importedEntries": result.get("imported_entries", 0),
-                    },
-                )
-                return web.json_response(
-                    {
-                        "status": "history_scraped",
-                        "phone": phone,
-                        "matchedEntries": result.get("matched_entries", 0),
-                        "importedEntries": result.get("imported_entries", 0),
-                    }
-                )
+                backend_success = bool(result.get("backend_success"))
+                response_payload = {
+                    "status": "history_scraped",
+                    "phone": phone,
+                    "matchedEntries": result.get("matched_entries", 0),
+                    "importedEntries": result.get("imported_entries", 0),
+                    "verifiedEntries": result.get("verified_entries", 0),
+                    "verifiedPhones": result.get("verified_phones", []),
+                    "backendSuccess": backend_success,
+                    "requestId": result.get("request_id"),
+                }
+
+                if backend_success:
+                    client_name = self._journal_client_name(phone)
+                    await self._append_journal(
+                        action="SYNC_WHATSAPP",
+                        description=f"已同步 {client_name} 的 WhatsApp 历史记录",
+                        client_id=phone,
+                        client_name=client_name,
+                        details={
+                            "chatId": chat_id,
+                            "matchedEntries": result.get("matched_entries", 0),
+                            "importedEntries": result.get("imported_entries", 0),
+                            "verifiedEntries": result.get("verified_entries", 0),
+                            "verifiedPhones": result.get("verified_phones", []),
+                            "requestId": result.get("request_id"),
+                        },
+                    )
+
+                return web.json_response(response_payload)
 
             return web.json_response({"error": "WhatsApp channel is not ready."}, status=503)
         except Exception:

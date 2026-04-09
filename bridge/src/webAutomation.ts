@@ -19,6 +19,7 @@ export interface KeyboardDriver {
 
 export interface LocatorDriver {
   first(): LocatorDriver;
+  nth(index: number): LocatorDriver;
   waitFor(options?: Record<string, unknown>): Promise<unknown>;
   click(options?: Record<string, unknown>): Promise<unknown>;
   count(): Promise<number>;
@@ -86,8 +87,7 @@ export const HISTORY_SCROLL_LIMIT = 60;
 export const READY_POLL_WAIT_MS = 1000;
 export const CDP_CONNECT_TIMEOUT_MS = 15000;
 export const CDP_CONNECT_RETRY_WAIT_MS = 500;
-export const SIDEBAR_SCROLL_WAIT_MS = 250;
-export const SIDEBAR_SCROLL_LIMIT = 80;
+export const POST_SEARCH_SETTLE_WAIT_MS = 3000;
 
 export const SEARCH_BOX_SELECTORS = [
   'input[aria-label="搜索或开始新聊天"]',
@@ -113,11 +113,14 @@ export const COMPOSE_BOX_SELECTORS = [
   'footer div[contenteditable="true"]',
 ] as const;
 
+export const SEARCH_RESULT_ROW_SELECTOR = 'div[role="gridcell"][tabindex="0"]';
+
 export class ParseSessionUnavailableError extends Error {}
 
 interface OpenedTargetSnapshot {
   url: string;
   title: string;
+  headerFound: boolean;
   headerText: string;
   composeLabel: string;
   composePlaceholder: string;
@@ -128,12 +131,10 @@ interface SearchBoxState {
   value: string;
 }
 
-type SearchOpenState = 'search_reset' | 'search_typed' | 'result_found' | 'chat_opened';
-
-interface OpenTargetResult {
-  status: 'opened' | 'chat_not_found' | 'session_unusable';
-  state?: SearchOpenState;
-  matchedTerm?: string;
+interface SearchResultsRefreshState {
+  queryMatches: boolean;
+  refreshed: boolean;
+  hasRow: boolean;
 }
 
 export class WhatsAppWebSession {
@@ -534,113 +535,13 @@ export class WhatsAppWebSession {
     }
   }
 
-  protected async _openChatByPhone(page: PageDriver, phone: string): Promise<boolean> {
-    await page.goto(
-      `${WHATSAPP_WEB_URL}send?phone=${encodeURIComponent(phone)}&app_absent=0`,
-      { waitUntil: 'domcontentloaded' },
-    );
-    const composeBox = await this._findVisibleLocator(page, COMPOSE_BOX_SELECTORS, SEARCH_TIMEOUT_MS);
-    return composeBox !== null;
-  }
-
-  protected async _searchAndOpenChat(page: PageDriver, target: ChatTarget): Promise<OpenTargetResult> {
-    const searchBoxState = await this._getSearchBoxState(page);
-    if (!searchBoxState.found) {
-      return {
-        status: 'session_unusable',
-      };
-    }
-
-    for (const rawTerm of target.searchTerms) {
-      const term = rawTerm.trim();
-      if (!term) {
-        continue;
-      }
-
-      if (!await this._resetSearchBox(page)) {
-        return {
-          status: 'session_unusable',
-        };
-      }
-
-      if (!await this._typeSearchQuery(page, term)) {
-        return {
-          status: 'session_unusable',
-          state: 'search_reset',
-          matchedTerm: term,
-        };
-      }
-
-      if (!await this._waitForMatchingSearchResultRow(page, target, term, SEARCH_TIMEOUT_MS)) {
-        continue;
-      }
-
-      if (!await this._clickMatchingSearchResultRow(page, target, term)) {
-        return {
-          status: 'session_unusable',
-          state: 'result_found',
-          matchedTerm: term,
-        };
-      }
-
-      if (await this._waitForOpenedChat(page, target, term, SEARCH_TIMEOUT_MS)) {
-        return {
-          status: 'opened',
-          state: 'chat_opened',
-          matchedTerm: term,
-        };
-      }
-
-      return {
-        status: 'session_unusable',
-        state: 'result_found',
-        matchedTerm: term,
-      };
-    }
-
-    return {
-      status: 'chat_not_found',
-    };
-  }
-
-  protected async _openTarget(page: PageDriver, target: ChatTarget): Promise<boolean> {
-    const result = await this._openTargetWithOptions(page, target, { allowPhoneNavigation: true });
-    return result.status === 'opened';
-  }
-
-  protected async _openTargetWithOptions(
-    page: PageDriver,
-    target: ChatTarget,
-    options: { allowPhoneNavigation: boolean },
-  ): Promise<OpenTargetResult> {
-    const searchResult = await this._searchAndOpenChat(page, target);
-    if (searchResult.status === 'opened') {
-      return searchResult;
-    }
-
-    if (options.allowPhoneNavigation && target.phone) {
-      const openedByPhone = await this._openChatByPhone(page, target.phone);
-      if (openedByPhone) {
-        return {
-          status: 'opened',
-          state: 'chat_opened',
-        };
-      }
-    }
-
-    return searchResult;
-  }
-
-  protected async _openedChatMatchesTarget(
-    page: PageDriver,
-    target: ChatTarget,
-    matchedTerm: string,
-  ): Promise<boolean> {
-    const snapshot = await page.evaluate(({ action }) => {
+  protected async _getOpenedChatSnapshot(page: PageDriver): Promise<OpenedTargetSnapshot> {
+    return await page.evaluate(({ action }) => {
       if (action !== 'opened_chat_snapshot') {
         return {
           url: '',
           title: '',
+          headerFound: false,
           headerText: '',
           composeLabel: '',
           composePlaceholder: '',
@@ -658,53 +559,27 @@ export class WhatsAppWebSession {
       return {
         url: String(location.href || ''),
         title: String(document.title || ''),
+        headerFound: header instanceof HTMLElement,
         headerText: String((header as HTMLElement | null)?.innerText || ''),
         composeLabel: String((compose as HTMLElement | null)?.getAttribute('aria-label') || ''),
         composePlaceholder: String((compose as HTMLElement | null)?.getAttribute('aria-placeholder') || ''),
       };
     }, { action: 'opened_chat_snapshot' }) as OpenedTargetSnapshot;
-
-    const normalize = (value: string): string => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
-    const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
-
-    const combined = normalize(
-      `${snapshot.title} ${snapshot.headerText} ${snapshot.composeLabel} ${snapshot.composePlaceholder}`,
-    );
-    const combinedDigits = digits(
-      `${snapshot.title} ${snapshot.headerText} ${snapshot.composeLabel} ${snapshot.composePlaceholder}`,
-    );
-    const targetPhone = digits(target.phone || '');
-    const matchedDigits = digits(matchedTerm);
-
-    if (targetPhone) {
-      if (combinedDigits.includes(targetPhone)) {
-        return true;
-      }
-      if (snapshot.url.includes(`phone=${encodeURIComponent(target.phone || '')}`)) {
-        return true;
-      }
-      if (matchedDigits && matchedDigits !== targetPhone) {
-        return false;
-      }
-    }
-
-    const strictTerms = [matchedTerm, ...(target.searchTerms || [])]
-      .map((term) => normalize(term))
-      .filter((term) => term.length >= 4);
-
-    return strictTerms.some((term) => combined.includes(term));
   }
 
-  protected async _waitForOpenedChat(
+  protected async _openedChatIsReady(page: PageDriver): Promise<boolean> {
+    const snapshot = await this._getOpenedChatSnapshot(page);
+    return snapshot.headerFound;
+  }
+
+  protected async _waitForOpenedChatReady(
     page: PageDriver,
-    target: ChatTarget,
-    matchedTerm: string,
     timeoutMs: number,
   ): Promise<boolean> {
     const deadline = Date.now() + Math.max(timeoutMs, READY_CHECK_TIMEOUT_MS);
     while (Date.now() < deadline) {
       const composeBox = await this._findVisibleLocator(page, COMPOSE_BOX_SELECTORS, READY_CHECK_TIMEOUT_MS);
-      if (composeBox && await this._openedChatMatchesTarget(page, target, matchedTerm)) {
+      if (composeBox && await this._openedChatIsReady(page)) {
         return true;
       }
       await page.waitForTimeout?.(200);
@@ -895,15 +770,55 @@ export class WhatsAppWebSession {
     }, { action: 'focus_exact_search_box', selectors: SEARCH_BOX_SELECTORS });
   }
 
-  protected async _waitForMatchingSearchResultRow(
+  protected async _armSearchResultsRefreshObserver(page: PageDriver): Promise<number | null> {
+    return page.evaluate(({ action }) => {
+      if (action !== 'arm_search_results_refresh_observer') {
+        return null;
+      }
+
+      const root = document.querySelector('#pane-side');
+      if (!(root instanceof HTMLElement)) {
+        return null;
+      }
+
+      type SearchResultsWindow = Window & typeof globalThis & {
+        __nanobotSearchResultsMutationCount?: number;
+        __nanobotSearchResultsObserver?: MutationObserver;
+        __nanobotSearchResultsObserverRoot?: HTMLElement | null;
+      };
+
+      const scopedWindow = window as SearchResultsWindow;
+      if (scopedWindow.__nanobotSearchResultsObserverRoot !== root || !scopedWindow.__nanobotSearchResultsObserver) {
+        scopedWindow.__nanobotSearchResultsObserver?.disconnect();
+        scopedWindow.__nanobotSearchResultsMutationCount = 0;
+        scopedWindow.__nanobotSearchResultsObserverRoot = root;
+        scopedWindow.__nanobotSearchResultsObserver = new MutationObserver((records) => {
+          if (records.length > 0) {
+            scopedWindow.__nanobotSearchResultsMutationCount = (scopedWindow.__nanobotSearchResultsMutationCount || 0) + 1;
+          }
+        });
+        scopedWindow.__nanobotSearchResultsObserver.observe(root, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+      } else if (typeof scopedWindow.__nanobotSearchResultsMutationCount !== 'number') {
+        scopedWindow.__nanobotSearchResultsMutationCount = 0;
+      }
+
+      return scopedWindow.__nanobotSearchResultsMutationCount ?? 0;
+    }, { action: 'arm_search_results_refresh_observer' }) as Promise<number | null>;
+  }
+
+  protected async _waitForFirstSearchResultRow(
     page: PageDriver,
-    target: ChatTarget,
-    query: string,
+    expectedQuery: string,
+    baselineMutationCount: number,
     timeoutMs: number,
   ): Promise<boolean> {
     const deadline = Date.now() + Math.max(timeoutMs, READY_CHECK_TIMEOUT_MS);
     while (Date.now() < deadline) {
-      if (await this._hasMatchingSearchResultRow(page, target, query)) {
+      if (await this._hasFirstSearchResultRow(page, expectedQuery, baselineMutationCount)) {
         return true;
       }
       await page.waitForTimeout?.(200);
@@ -911,113 +826,27 @@ export class WhatsAppWebSession {
     return false;
   }
 
-  protected async _hasMatchingSearchResultRow(
+  protected async _hasFirstSearchResultRow(
     page: PageDriver,
-    target: ChatTarget,
-    query: string,
+    expectedQuery: string,
+    baselineMutationCount: number,
   ): Promise<boolean> {
-    return page.evaluate(({ action, target, query }) => {
-      if (action !== 'search_result_row_visible') {
-        return false;
-      }
-
-      const isVisible = (node: Element | null): node is HTMLElement => {
-        if (!(node instanceof HTMLElement)) {
-          return false;
-        }
-        const style = window.getComputedStyle(node);
-        const rect = node.getBoundingClientRect();
-        return style.visibility !== 'hidden'
-          && style.display !== 'none'
-          && rect.width > 0
-          && rect.height > 0;
-      };
-
-      const normalize = (value: string): string => String(value || '')
-        .toLowerCase()
-        .replace(/\u200B/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-      const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
-
-      const root = document.querySelector('#pane-side');
-      if (!(root instanceof HTMLElement) || !isVisible(root)) {
-        return false;
-      }
-
-      const seen = new Set<HTMLElement>();
-      const rows: HTMLElement[] = [];
-      const selectors = [
-        '[role="listitem"]',
-        'div[data-testid="cell-frame-container"]',
-        'a[role="link"]',
-      ];
-
-      const addRow = (node: Element | null): void => {
-        if (!(node instanceof HTMLElement) || !root.contains(node) || !isVisible(node) || seen.has(node)) {
-          return;
-        }
-        seen.add(node);
-        rows.push(node);
-      };
-
-      for (const selector of selectors) {
-        for (const node of Array.from(root.querySelectorAll(selector))) {
-          addRow(node);
-        }
-      }
-
-      for (const node of Array.from(root.querySelectorAll('*'))) {
-        if (!(node instanceof HTMLElement) || !isVisible(node)) {
-          continue;
-        }
-        const row = node.closest(
-          '[role="listitem"], [role="button"], a[role="link"], div[data-testid="cell-frame-container"], div[tabindex="0"], div[tabindex="-1"]',
-        );
-        addRow(row);
-      }
-
-      const targetPhone = digits(String(target.phone || ''));
-      const queryDigits = digits(String(query || ''));
-      const queryTerm = normalize(String(query || ''));
-      const terms = [queryTerm, ...(Array.isArray(target.searchTerms) ? target.searchTerms : [])]
-        .map((value) => normalize(String(value || '')))
-        .filter((value, index, all) => value && all.indexOf(value) === index && (value.length >= 4 || value === queryTerm));
-
-      const scoreRow = (row: HTMLElement): number => {
-        const rowText = normalize(row.innerText || row.textContent || '');
-        const rowDigits = digits(rowText);
-        if (!rowText && !rowDigits) {
-          return 0;
-        }
-
-        let score = 0;
-        if (targetPhone && rowDigits.includes(targetPhone)) {
-          score = Math.max(score, 1000);
-        }
-        if (queryDigits && rowDigits.includes(queryDigits)) {
-          score = Math.max(score, 700 + queryDigits.length);
-        }
-        for (const term of terms) {
-          if (rowText.includes(term)) {
-            score = Math.max(score, 400 + term.length);
-          }
-        }
-        return score;
-      };
-
-      return rows.some((row) => scoreRow(row) > 0);
-    }, { action: 'search_result_row_visible', target, query });
+    const state = await this._getSearchResultsRefreshState(page, expectedQuery, baselineMutationCount);
+    return state.queryMatches && state.refreshed && state.hasRow;
   }
 
-  protected async _clickMatchingSearchResultRow(
+  protected async _getSearchResultsRefreshState(
     page: PageDriver,
-    target: ChatTarget,
-    query: string,
-  ): Promise<boolean> {
-    return page.evaluate(({ action, target, query }) => {
-      if (action !== 'click_search_result_row') {
-        return false;
+    expectedQuery: string,
+    baselineMutationCount: number,
+  ): Promise<SearchResultsRefreshState> {
+    return page.evaluate(({ action, selectors, expectedValue, selector, baseline }) => {
+      if (action !== 'search_results_refresh_state') {
+        return {
+          queryMatches: false,
+          refreshed: false,
+          hasRow: false,
+        };
       }
 
       const isVisible = (node: Element | null): node is HTMLElement => {
@@ -1032,108 +861,144 @@ export class WhatsAppWebSession {
           && rect.height > 0;
       };
 
+      const isRowVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width >= 80
+          && rect.height >= 24;
+      };
+
       const normalize = (value: string): string => String(value || '')
-        .toLowerCase()
         .replace(/\u200B/g, '')
         .replace(/\s+/g, ' ')
         .trim();
-      const digits = (value: string): string => String(value || '').replace(/\D+/g, '');
+
+      const readValue = (node: HTMLElement): string => {
+        if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+          return node.value;
+        }
+        return node.innerText || node.textContent || '';
+      };
+
+      type SearchResultsWindow = Window & typeof globalThis & {
+        __nanobotSearchResultsMutationCount?: number;
+      };
+
+      const scopedWindow = window as SearchResultsWindow;
+      const root = document.querySelector('#pane-side');
+      if (!(root instanceof HTMLElement) || !isVisible(root)) {
+        return {
+          queryMatches: false,
+          refreshed: false,
+          hasRow: false,
+        };
+      }
+
+      let queryMatches = false;
+      for (const searchSelector of selectors) {
+        for (const node of Array.from(document.querySelectorAll(searchSelector))) {
+          if (!isVisible(node) || node.closest('footer')) {
+            continue;
+          }
+          queryMatches = normalize(readValue(node as HTMLElement)) === normalize(expectedValue);
+          break;
+        }
+        if (queryMatches) {
+          break;
+        }
+      }
+
+      const mutationCount = scopedWindow.__nanobotSearchResultsMutationCount || 0;
+      const hasRow = Array.from(root.querySelectorAll(selector)).some((node) => isRowVisible(node));
+
+      return {
+        queryMatches,
+        refreshed: mutationCount > baseline,
+        hasRow,
+      };
+    }, {
+      action: 'search_results_refresh_state',
+      selectors: SEARCH_BOX_SELECTORS,
+      expectedValue: expectedQuery,
+      selector: SEARCH_RESULT_ROW_SELECTOR,
+      baseline: baselineMutationCount,
+    }) as Promise<SearchResultsRefreshState>;
+  }
+
+  protected async _getFirstSearchResultRowIndex(page: PageDriver): Promise<number | null> {
+    return page.evaluate(({ action, selector }) => {
+      if (action !== 'first_search_result_row_index') {
+        return null;
+      }
+
+      const isVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+
+      const isRowVisible = (node: Element | null): node is HTMLElement => {
+        if (!(node instanceof HTMLElement)) {
+          return false;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && rect.width >= 80
+          && rect.height >= 24;
+      };
 
       const root = document.querySelector('#pane-side');
       if (!(root instanceof HTMLElement) || !isVisible(root)) {
+        return null;
+      }
+
+      const candidates = Array.from(root.querySelectorAll(selector))
+        .map((node, index) => ({ node, index }))
+        .filter(({ node }) => isRowVisible(node))
+        .map(({ node, index }) => {
+          const rect = (node as HTMLElement).getBoundingClientRect();
+          return {
+            index,
+            top: rect.top,
+            left: rect.left,
+          };
+        })
+        .sort((left, right) => left.top - right.top || left.left - right.left);
+
+      return candidates[0]?.index ?? null;
+    }, { action: 'first_search_result_row_index', selector: SEARCH_RESULT_ROW_SELECTOR }) as Promise<number | null>;
+  }
+
+  protected async _clickFirstSearchResultRow(page: PageDriver): Promise<boolean> {
+    const rowIndex = await this._getFirstSearchResultRowIndex(page);
+    if (rowIndex === null) {
+      return false;
+    }
+
+    const locator = page.locator(`#pane-side ${SEARCH_RESULT_ROW_SELECTOR}`).nth(rowIndex);
+    try {
+      await locator.waitFor({ state: 'visible', timeout: READY_CHECK_TIMEOUT_MS });
+      if ((await locator.count()) === 0) {
         return false;
       }
-
-      const seen = new Set<HTMLElement>();
-      const rows: HTMLElement[] = [];
-      const selectors = [
-        '[role="listitem"]',
-        'div[data-testid="cell-frame-container"]',
-        'a[role="link"]',
-      ];
-
-      const addRow = (node: Element | null): void => {
-        if (!(node instanceof HTMLElement) || !root.contains(node) || !isVisible(node) || seen.has(node)) {
-          return;
-        }
-        seen.add(node);
-        rows.push(node);
-      };
-
-      for (const selector of selectors) {
-        for (const node of Array.from(root.querySelectorAll(selector))) {
-          addRow(node);
-        }
-      }
-
-      for (const node of Array.from(root.querySelectorAll('*'))) {
-        if (!(node instanceof HTMLElement) || !isVisible(node)) {
-          continue;
-        }
-        const row = node.closest(
-          '[role="listitem"], [role="button"], a[role="link"], div[data-testid="cell-frame-container"], div[tabindex="0"], div[tabindex="-1"]',
-        );
-        addRow(row);
-      }
-
-      const targetPhone = digits(String(target.phone || ''));
-      const queryDigits = digits(String(query || ''));
-      const queryTerm = normalize(String(query || ''));
-      const terms = [queryTerm, ...(Array.isArray(target.searchTerms) ? target.searchTerms : [])]
-        .map((value) => normalize(String(value || '')))
-        .filter((value, index, all) => value && all.indexOf(value) === index && (value.length >= 4 || value === queryTerm));
-
-      const scoreRow = (row: HTMLElement): number => {
-        const rowText = normalize(row.innerText || row.textContent || '');
-        const rowDigits = digits(rowText);
-        if (!rowText && !rowDigits) {
-          return 0;
-        }
-
-        let score = 0;
-        if (targetPhone && rowDigits.includes(targetPhone)) {
-          score = Math.max(score, 1000);
-        }
-        if (queryDigits && rowDigits.includes(queryDigits)) {
-          score = Math.max(score, 700 + queryDigits.length);
-        }
-        for (const term of terms) {
-          if (rowText.includes(term)) {
-            score = Math.max(score, 400 + term.length);
-          }
-        }
-        return score;
-      };
-
-      let bestRow: HTMLElement | null = null;
-      let bestScore = 0;
-      for (const row of rows) {
-        const score = scoreRow(row);
-        if (score > bestScore) {
-          bestScore = score;
-          bestRow = row;
-        }
-      }
-
-      if (!bestRow || bestScore <= 0) {
-        return false;
-      }
-
-      bestRow.click();
+      await locator.click();
       return true;
-    }, { action: 'click_search_result_row', target, query });
-  }
-
-  protected _chatResultSelectors(term: string): string[] {
-    const escaped = cssEscape(term);
-    return [
-      `span[title="${escaped}"]`,
-      `div[title="${escaped}"]`,
-      `span[title*="${escaped}"]`,
-      `div[title*="${escaped}"]`,
-      `[aria-label*="${escaped}"]`,
-      `[data-testid*="${escaped}"]`,
-    ];
+    } catch {
+      return false;
+    }
   }
 
   protected async _findVisibleLocator(
@@ -1246,10 +1111,6 @@ export class WhatsAppWebSession {
       .replace(/\s+/g, ' ')
       .trim();
   }
-}
-
-function cssEscape(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 function sleep(timeoutMs: number): Promise<void> {
