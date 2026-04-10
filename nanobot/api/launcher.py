@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from aiohttp import web, WSMsgType
@@ -68,6 +69,10 @@ class LauncherServer:
         # All other /api/* routes — proxy to real ApiServer or 503
         self.app.router.add_get("/api/clients", self._proxy)
         self.app.router.add_get("/api/clients/{phone}", self._proxy)
+        self.app.router.add_get("/api/clients/{phone}/offline-meeting-notes", self._proxy)
+        self.app.router.add_get("/api/clients/{phone}/offline-meeting-notes/{noteId}", self._proxy)
+        self.app.router.add_post("/api/clients/{phone}/offline-meeting-note/save", self._proxy)
+        self.app.router.add_post("/api/clients/{phone}/offline-meeting-note/transcribe", self._proxy)
         self.app.router.add_delete("/api/clients/{phone}", self._proxy)
         self.app.router.add_get("/api/messages/{phone}", self._proxy)
         self.app.router.add_post("/api/messages/{phone}", self._proxy)
@@ -301,15 +306,17 @@ class LauncherServer:
 
         if not handler:
             # Try parameterized route matching
-            for (m, pattern), h in handler_map.items():
+            for (m, pattern), h in sorted(
+                handler_map.items(),
+                key=lambda item: len(item[0][1]),
+                reverse=True,
+            ):
                 if m != method:
                     continue
-                if "{phone}" in pattern:
-                    prefix = pattern.split("{phone}")[0]
-                    suffix = pattern.split("{phone}")[1] if len(pattern.split("{phone}")) > 1 else ""
-                    if path.startswith(prefix) and path.endswith(suffix):
-                        handler = h
-                        break
+                regex_pattern = re.sub(r"\{[^/]+\}", r"[^/]+", pattern)
+                if re.fullmatch(regex_pattern, path):
+                    handler = h
+                    break
 
         if handler:
             return await handler(request)
@@ -324,6 +331,10 @@ class LauncherServer:
         return {
             ("GET", "/api/clients"): s._handle_get_clients,
             ("GET", "/api/clients/{phone}"): s._handle_get_client,
+            ("GET", "/api/clients/{phone}/offline-meeting-notes"): s._handle_get_offline_meeting_notes,
+            ("GET", "/api/clients/{phone}/offline-meeting-notes/{noteId}"): s._handle_get_offline_meeting_note_detail,
+            ("POST", "/api/clients/{phone}/offline-meeting-note/save"): s._handle_save_offline_meeting_note,
+            ("POST", "/api/clients/{phone}/offline-meeting-note/transcribe"): s._handle_transcribe_offline_meeting_note,
             ("DELETE", "/api/clients/{phone}"): s._handle_delete_client,
             ("GET", "/api/messages/{phone}"): s._handle_get_messages,
             ("POST", "/api/messages/{phone}"): s._handle_send_message,

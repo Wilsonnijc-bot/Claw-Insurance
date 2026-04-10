@@ -23,7 +23,8 @@ RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
 # Copy the full source and install
 COPY nanobot/ nanobot/
 COPY bridge/ bridge/
-RUN uv pip install --system --no-cache .
+RUN uv pip install --system --no-cache . && \
+    python3 -c "import google.cloud.speech_v2"
 
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
@@ -33,7 +34,8 @@ WORKDIR /app
 # Create project-local runtime directories
 RUN mkdir -p /app/data /app/sessions /app/state /app/memory \
     /app/whatsapp-auth /app/whatsapp-web /app/whatsapp-web-debug \
-    /app/skills /app/media /app/cron
+    /app/skills /app/media /app/cron \
+    /app/secrets
 
 # Gateway default port
 EXPOSE 18790

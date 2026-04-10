@@ -169,6 +169,12 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if "insurance_cycle_active" in meta:
             cycle_active = "true" if bool(meta.get("insurance_cycle_active")) else "false"
             lines.append(f"Insurance Cycle Active: {cycle_active}")
+        offline_notes = meta.get("offline_meeting_notes")
+        if isinstance(offline_notes, list):
+            for index, note in enumerate(offline_notes, start=1):
+                text = cls._sanitize_runtime_value(note, max_chars=320)
+                if text:
+                    lines.append(f"Offline Meeting Note {index}: {text}")
 
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 

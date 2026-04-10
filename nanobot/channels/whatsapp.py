@@ -1108,6 +1108,25 @@ class WhatsAppChannel(BaseChannel):
         if request_id and source == "web_scrape" and isinstance(raw_messages, list) and raw_messages:
             self._record_manual_sync_web_scrape_messages(request_id, raw_messages)
 
+        if source == "upsert" and isinstance(raw_messages, list) and raw_messages:
+            filtered_messages = []
+            dropped_outbound_echoes = 0
+            for raw in raw_messages:
+                if (
+                    isinstance(raw, dict)
+                    and not bool(raw.get("isGroup", False))
+                    and bool(raw.get("fromMe", False))
+                ):
+                    dropped_outbound_echoes += 1
+                    continue
+                filtered_messages.append(raw)
+            if dropped_outbound_echoes:
+                logger.info(
+                    "Dropped {} WhatsApp outbound upsert echo(es) before history import",
+                    dropped_outbound_echoes,
+                )
+            raw_messages = filtered_messages
+
         if isinstance(raw_messages, list) and raw_messages:
             self._cache_history_messages(raw_messages)
 

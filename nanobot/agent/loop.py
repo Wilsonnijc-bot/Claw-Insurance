@@ -59,6 +59,8 @@ class AgentLoop:
     _INSURANCE_WAITING_FOR_ANSWER_KEY = "insurance_waiting_for_answer"
     _INSURANCE_GENERIC_LIMIT = 2
     _INSURANCE_SKILL_NAME = "insurance-product-advisor"
+    _OFFLINE_MEETING_RUNTIME_KEY = "offline_meeting_notes"
+    _OFFLINE_MEETING_CONTEXT_LIMIT = 3
     _INSURANCE_TOPIC_KEYWORDS = (
         "insurance",
         "insured",
@@ -585,6 +587,21 @@ class AgentLoop:
             cls._INSURANCE_FLOW_MODE_KEY: state[cls._INSURANCE_FLOW_MODE_KEY],
             cls._INSURANCE_GENERIC_REPLY_COUNT_KEY: state[cls._INSURANCE_GENERIC_REPLY_COUNT_KEY],
             cls._INSURANCE_CYCLE_ACTIVE_KEY: state[cls._INSURANCE_CYCLE_ACTIVE_KEY],
+        }
+
+    @classmethod
+    def _offline_meeting_runtime_metadata(cls, session: Session) -> dict[str, Any]:
+        """Expose recent offline-meeting transcripts to the matching client prompt only."""
+        notes = [
+            str(note.get("transcript") or "").strip()
+            for note in session.offline_meeting_notes
+            if isinstance(note, dict) and str(note.get("transcript") or "").strip()
+        ]
+        if not notes:
+            return {}
+
+        return {
+            cls._OFFLINE_MEETING_RUNTIME_KEY: notes[-cls._OFFLINE_MEETING_CONTEXT_LIMIT:],
         }
 
     @staticmethod
@@ -1180,12 +1197,26 @@ class AgentLoop:
                 continue
 
             timestamp_iso = self._history_timestamp_iso(raw.get("timestamp"))
+            timestamp_value = self._history_sort_value(timestamp_iso)
+            raw_content = str(raw.get("content", "") or "")
+            normalized_reply: dict[str, Any] | None = None
+            if batch.channel == "whatsapp" and not bool(raw.get("from_me", False)) and raw_content.strip():
+                previous_messages = [
+                    existing for existing in session.messages
+                    if self._history_sort_value(existing.get("timestamp")) <= timestamp_value
+                ]
+                previous_messages.extend(
+                    existing for existing in bucket["imports"]
+                    if self._history_sort_value(existing.get("timestamp")) <= timestamp_value
+                )
+                normalized_reply = self.detect_imported_client_reply_block(raw_content, previous_messages)
+
             entry = {
                 "role": storage_role_for_session(
                     session_key,
                     "assistant" if bool(raw.get("from_me", False)) else "user",
                 ),
-                "content": str(raw.get("content", "") or ""),
+                "content": str((normalized_reply or {}).get("reply_text") or raw_content),
                 "timestamp": timestamp_iso,
                 "message_id": message_id,
                 "chat_id": chat_id,
@@ -1196,6 +1227,13 @@ class AgentLoop:
                 "historical_import": True,
                 "from_me": bool(raw.get("from_me", False)),
             }
+            if normalized_reply is not None:
+                entry["message_type"] = normalized_reply["message_type"]
+                entry["reply_text"] = normalized_reply["reply_text"]
+                entry["quoted_text"] = normalized_reply["quoted_text"]
+                quoted_message_id = str(normalized_reply.get("quoted_message_id", "") or "").strip()
+                if quoted_message_id:
+                    entry["quoted_message_id"] = quoted_message_id
             bucket["imports"].append(entry)
             imported_entries += 1
             existing_ids.add(message_id)
@@ -1268,6 +1306,92 @@ class AgentLoop:
                     break
             merged.insert(insert_at, entry)
         return merged
+
+    @staticmethod
+    def _tokenize_imported_reply_text(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+        """Return non-whitespace tokens and their spans for deterministic quote matching."""
+        tokens: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for match in re.finditer(r"\S+", str(text or "")):
+            tokens.append(match.group(0))
+            spans.append(match.span())
+        return tokens, spans
+
+    @classmethod
+    def detect_imported_client_reply_block(
+        cls,
+        raw_block: str,
+        previous_messages: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Split imported inbound `你` quote blocks into quoted text and reply text."""
+        text = str(raw_block or "")
+        if not text.strip():
+            return None
+
+        lines = text.splitlines()
+        first_nonempty_index: int | None = None
+        for index, line in enumerate(lines):
+            if line.strip():
+                first_nonempty_index = index
+                break
+        if first_nonempty_index is None:
+            return None
+        if lines[first_nonempty_index].strip() != "你":
+            return None
+
+        remaining_lines = lines[first_nonempty_index + 1:]
+        if not any(line.strip() for line in remaining_lines):
+            return None
+
+        candidate_body = "\n".join(remaining_lines).strip()
+        candidate_tokens, candidate_spans = cls._tokenize_imported_reply_text(candidate_body)
+        if not candidate_tokens:
+            return None
+
+        for previous in reversed(previous_messages):
+            role = str(previous.get("role", "") or "")
+            if role not in {"me", "assistant"}:
+                continue
+
+            previous_text = str(previous.get("content", "") or "")
+            if not previous_text.strip():
+                continue
+
+            previous_tokens, _ = cls._tokenize_imported_reply_text(previous_text)
+            if not previous_tokens or len(previous_tokens) > len(candidate_tokens):
+                continue
+
+            match_start: int | None = None
+            duplicate_match = False
+            for offset in range(len(candidate_tokens) - len(previous_tokens) + 1):
+                if candidate_tokens[offset:offset + len(previous_tokens)] != previous_tokens:
+                    continue
+                if match_start is not None:
+                    duplicate_match = True
+                    break
+                match_start = offset
+            if duplicate_match or match_start is None:
+                continue
+
+            start_char = candidate_spans[match_start][0]
+            end_char = candidate_spans[match_start + len(previous_tokens) - 1][1]
+            before = candidate_body[:start_char].strip()
+            after = candidate_body[end_char:].strip()
+            reply_text = "\n".join(part for part in (before, after) if part).strip()
+            if not reply_text:
+                continue
+
+            payload: dict[str, Any] = {
+                "message_type": "imported_client_reply_with_quote",
+                "reply_text": reply_text,
+                "quoted_text": previous_text,
+            }
+            quoted_message_id = str(previous.get("message_id", "") or "").strip()
+            if quoted_message_id:
+                payload["quoted_message_id"] = quoted_message_id
+            return payload
+
+        return None
 
     @staticmethod
     def _history_timestamp_iso(value: Any) -> str:
@@ -1426,6 +1550,9 @@ class AgentLoop:
         insurance_turn = False
         runtime_metadata = dict(msg.metadata or {})
         skill_names: list[str] | None = None
+
+        if msg.channel == "whatsapp":
+            runtime_metadata.update(self._offline_meeting_runtime_metadata(session))
 
         if insurance_state is not None:
             insurance_turn = self._is_whatsapp_insurance_turn(msg, session, insurance_state)

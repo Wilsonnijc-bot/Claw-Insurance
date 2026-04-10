@@ -1,6 +1,7 @@
-export type LogAction = 
+export type KnownLogAction =
   | 'LOGIN'
   | 'LOGOUT'
+  | 'LOGIN_HISTORY_PARSE'
   | 'INBOUND_MESSAGE'
   | 'SEND_MESSAGE'
   | 'AI_GENERATE'
@@ -19,6 +20,8 @@ export type LogAction =
   | 'BROADCAST'
   | 'VIEW_LOGS';
 
+export type LogAction = KnownLogAction | (string & {});
+
 export interface LogEntry {
   id: string;
   timestamp: string;
@@ -35,6 +38,6 @@ export interface LogEntry {
 export interface LogFilter {
   startDate?: string;
   endDate?: string;
-  action?: LogAction;
+  action?: KnownLogAction;
   clientId?: string;
 }

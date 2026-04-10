@@ -40,9 +40,12 @@ export interface Message {
 export interface VoiceMemo {
   id: string;
   clientId: string;
-  duration: string;
-  timestamp: string;
-  transcript?: string;
+  noteName: string;
+  createdAt: string;
+}
+
+export interface VoiceMemoDetail extends VoiceMemo {
+  transcript: string;
 }
 
 export interface LoadingState {

@@ -318,6 +318,11 @@ export class WhatsAppClient {
         continue;
       }
 
+      if (meta.source === 'upsert' && normalized.fromMe) {
+        console.log(`↪️ Ignoring outbound upsert echo ${normalized.id || ''}`);
+        continue;
+      }
+
       if (normalized.sender) {
         this.rememberChatTarget(normalized.sender, normalized.pn, normalized.pushName);
       }

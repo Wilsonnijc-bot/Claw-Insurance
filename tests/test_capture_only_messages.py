@@ -467,3 +467,119 @@ async def test_manual_history_replay_can_import_cached_messages_for_new_reply_ta
     session = loop.sessions.get_or_create(f"whatsapp:{normalized_phone}")
     assert [msg["role"] for msg in session.messages] == ["client", "me"]
     assert [msg["message_id"] for msg in session.messages] == ["wa-cache-1", "wa-cache-2"]
+
+
+def test_history_import_normalizes_imported_client_reply_with_quote(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    session = loop.sessions.get_or_create("whatsapp:85212345678")
+    session.add_message(
+        "me",
+        "how’s going on\nthe poster...",
+        message_id="agent-quote-1",
+        timestamp="2026-01-01T10:00:00",
+    )
+    loop.sessions.save(session)
+
+    batch = InboundHistoryBatch(
+        channel="whatsapp",
+        entries=[
+            {
+                "session_key": "whatsapp:85212345678",
+                "message_id": "hist-quoted-1",
+                "chat_id": "85212345678@s.whatsapp.net",
+                "phone": "85212345678",
+                "sender": "85212345678@s.whatsapp.net",
+                "content": "你\nhow’s going on the poster...\nI’ve been doing the whole thing anyways\nYou don't need to pay",
+                "timestamp": "2026-01-01T11:00:00",
+                "from_me": False,
+                "push_name": "Alice",
+            }
+        ],
+    )
+
+    result = loop._import_history_batch(batch)
+
+    assert result is not None
+    assert result.imported_entries == 1
+    imported = loop.sessions.get_or_create("whatsapp:85212345678").messages[-1]
+    assert imported["message_type"] == "imported_client_reply_with_quote"
+    assert imported["content"] == "I’ve been doing the whole thing anyways\nYou don't need to pay"
+    assert imported["reply_text"] == "I’ve been doing the whole thing anyways\nYou don't need to pay"
+    assert imported["quoted_text"] == "how’s going on\nthe poster..."
+    assert imported["quoted_message_id"] == "agent-quote-1"
+
+
+def test_history_import_prefers_nearest_earlier_outbound_quote_match(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    session = loop.sessions.get_or_create("whatsapp:85212345678")
+    session.add_message("me", "Same quoted text", message_id="agent-quote-old", timestamp="2026-01-01T09:00:00")
+    session.add_message("me", "Same quoted text", message_id="agent-quote-near", timestamp="2026-01-01T10:00:00")
+    loop.sessions.save(session)
+
+    batch = InboundHistoryBatch(
+        channel="whatsapp",
+        entries=[
+            {
+                "session_key": "whatsapp:85212345678",
+                "message_id": "hist-quoted-2",
+                "chat_id": "85212345678@s.whatsapp.net",
+                "phone": "85212345678",
+                "sender": "85212345678@s.whatsapp.net",
+                "content": "你\nSame quoted text\nactual reply",
+                "timestamp": "2026-01-01T11:00:00",
+                "from_me": False,
+                "push_name": "Alice",
+            }
+        ],
+    )
+
+    loop._import_history_batch(batch)
+
+    imported = loop.sessions.get_or_create("whatsapp:85212345678").messages[-1]
+    assert imported["message_type"] == "imported_client_reply_with_quote"
+    assert imported["quoted_message_id"] == "agent-quote-near"
+    assert imported["content"] == "actual reply"
+
+
+@pytest.mark.parametrize(
+    ("raw_content", "quoted_seed"),
+    [
+        ("他\nQuoted seed\nactual reply", "Quoted seed"),
+        ("你\nDifferent quote\nactual reply", "Quoted seed"),
+        ("你\nQuoted seed", "Quoted seed"),
+    ],
+)
+def test_history_import_reply_with_quote_falls_back_to_flat_content_when_split_is_not_safe(
+    tmp_path: Path,
+    raw_content: str,
+    quoted_seed: str,
+) -> None:
+    loop = _make_loop(tmp_path)
+    session = loop.sessions.get_or_create("whatsapp:85212345678")
+    session.add_message("me", quoted_seed, message_id="agent-quote-seed", timestamp="2026-01-01T10:00:00")
+    loop.sessions.save(session)
+
+    batch = InboundHistoryBatch(
+        channel="whatsapp",
+        entries=[
+            {
+                "session_key": "whatsapp:85212345678",
+                "message_id": "hist-flat-1",
+                "chat_id": "85212345678@s.whatsapp.net",
+                "phone": "85212345678",
+                "sender": "85212345678@s.whatsapp.net",
+                "content": raw_content,
+                "timestamp": "2026-01-01T11:00:00",
+                "from_me": False,
+                "push_name": "Alice",
+            }
+        ],
+    )
+
+    loop._import_history_batch(batch)
+
+    imported = loop.sessions.get_or_create("whatsapp:85212345678").messages[-1]
+    assert imported["content"] == raw_content
+    assert "message_type" not in imported
+    assert "reply_text" not in imported
+    assert "quoted_text" not in imported

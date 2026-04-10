@@ -1,0 +1,7 @@
+{
+  "projectId": "your-project-id",
+  "location": "us",
+  "languageCode": "yue-Hant-HK",
+  "model": "chirp_3",
+  "credentialJsonPath": "secrets/google-credentials.json"
+}

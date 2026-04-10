@@ -7,11 +7,13 @@ Per-client isolation invariant:
 """
 
 import json
+import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger
 
@@ -55,6 +57,37 @@ def model_role_for_session(key: str, role: str) -> str:
     return text
 
 
+OFFLINE_MEETING_NOTE_TYPE = "offline_meeting_note"
+LEGACY_OFFLINE_MEETING_TRANSCRIPTS_KEY = "offline_meeting_transcripts"
+OFFLINE_MEETING_NOTE_INDEX_KEY = "offline_meeting_note_index"
+OFFLINE_MEETING_NOTE_NAME_PREFIX = "笔记"
+LEGACY_OFFLINE_MEETING_NOTE_NAME_PREFIX = "笔记编号"
+OFFLINE_MEETING_NOTE_NAME_PATTERN = re.compile(r"^笔记([1-9][0-9]*)$")
+
+
+def generate_offline_meeting_note_id() -> str:
+    """Return one new offline-meeting note id."""
+    return f"offline_note_{uuid4().hex}"
+
+
+def offline_meeting_note_reference(note_id: str) -> str:
+    """Return the short note reference suffix shown in the UI."""
+    normalized = str(note_id or "").strip()
+    if normalized.startswith("offline_note_"):
+        normalized = normalized[len("offline_note_"):]
+    return normalized[-6:].upper() or "000000"
+
+
+def legacy_offline_meeting_note_name(note_id: str) -> str:
+    """Build the legacy saved-note label from a note id suffix."""
+    return f"{LEGACY_OFFLINE_MEETING_NOTE_NAME_PREFIX} {offline_meeting_note_reference(note_id)}"
+
+
+def sequential_offline_meeting_note_name(number: int) -> str:
+    """Build one sequential saved-note label."""
+    return f"{OFFLINE_MEETING_NOTE_NAME_PREFIX}{max(1, int(number))}"
+
+
 @dataclass
 class Session:
     """
@@ -69,6 +102,7 @@ class Session:
 
     key: str  # channel:chat_id
     messages: list[dict[str, Any]] = field(default_factory=list)
+    offline_meeting_notes: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -500,6 +534,312 @@ class SessionManager:
         """Read the canonical on-disk session for a WhatsApp client."""
         return self.read_persisted(client_key.session_key)
 
+    @staticmethod
+    def _normalize_legacy_offline_meeting_transcripts(raw_value: Any) -> list[str]:
+        """Normalize legacy metadata-backed offline meeting note strings."""
+        if not isinstance(raw_value, list):
+            return []
+        notes: list[str] = []
+        for item in raw_value:
+            text = str(item or "").strip()
+            if text:
+                notes.append(text)
+        return notes
+
+    @staticmethod
+    def _parse_offline_meeting_note_sequence(note_name: Any) -> int | None:
+        """Return the sequential note number when the stored name exactly matches 笔记<number>."""
+        match = OFFLINE_MEETING_NOTE_NAME_PATTERN.fullmatch(str(note_name or "").strip())
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _next_offline_meeting_note_name_from_notes(cls, notes: list[dict[str, Any]]) -> str:
+        """Compute the next sequential default note name from canonical saved notes."""
+        max_number = 0
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            parsed_number = cls._parse_offline_meeting_note_sequence(note.get("note_name"))
+            if parsed_number is not None:
+                max_number = max(max_number, parsed_number)
+        return sequential_offline_meeting_note_name(max_number + 1)
+
+    def next_offline_meeting_note_name(self, key: str) -> str:
+        """Return the next sequential default note name for one client session."""
+        session = self.read_persisted(key)
+        return self._next_offline_meeting_note_name_from_notes(session.offline_meeting_notes)
+
+    @staticmethod
+    def _build_offline_meeting_note_record(
+        session_key: str,
+        transcript: str,
+        *,
+        note_id: str | None = None,
+        note_name: str | None = None,
+        created_at: str | None = None,
+        client_phone: str | None = None,
+    ) -> dict[str, Any]:
+        """Build one canonical append-only offline meeting note record."""
+        identity = str(session_key.split(":", 1)[1] if ":" in session_key else "").strip()
+        normalized_phone = normalize_contact_id(client_phone or identity)
+        resolved_note_id = str(note_id or "").strip() or generate_offline_meeting_note_id()
+        return {
+            "_type": OFFLINE_MEETING_NOTE_TYPE,
+            "note_id": resolved_note_id,
+            "note_name": str(note_name or "").strip() or legacy_offline_meeting_note_name(resolved_note_id),
+            "session_key": session_key,
+            "client_phone": normalized_phone,
+            "transcript": str(transcript).strip(),
+            "created_at": str(created_at or datetime.now().isoformat()),
+        }
+
+    @classmethod
+    def _normalize_offline_meeting_note_record(
+        cls,
+        session_key: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Normalize one saved-note JSONL record loaded from disk."""
+        transcript = str(payload.get("transcript") or "").strip()
+        if not transcript:
+            return None
+        return cls._build_offline_meeting_note_record(
+            str(payload.get("session_key") or session_key).strip() or session_key,
+            transcript,
+            note_id=str(payload.get("note_id") or "").strip() or None,
+            note_name=str(payload.get("note_name") or "").strip() or None,
+            created_at=str(payload.get("created_at") or "").strip() or None,
+            client_phone=str(payload.get("client_phone") or "").strip() or None,
+        )
+
+    def _migrate_legacy_offline_meeting_notes(self, session: Session) -> bool:
+        """Convert legacy metadata-backed note strings into canonical note rows once."""
+        had_legacy_notes = LEGACY_OFFLINE_MEETING_TRANSCRIPTS_KEY in session.metadata
+        legacy_notes = self._normalize_legacy_offline_meeting_transcripts(
+            session.metadata.pop(LEGACY_OFFLINE_MEETING_TRANSCRIPTS_KEY, None)
+        )
+        if not had_legacy_notes:
+            return False
+
+        for transcript in legacy_notes:
+            session.offline_meeting_notes.append(
+                self._build_offline_meeting_note_record(session.key, transcript)
+            )
+        session.updated_at = datetime.now()
+        self.save(session)
+        return True
+
+    @staticmethod
+    def _build_offline_meeting_note_index(session: Session) -> list[dict[str, str]]:
+        """Return the lightweight chronological note index derived from canonical note rows."""
+        index: list[dict[str, str]] = []
+        for note in session.offline_meeting_notes:
+            note_id = str(note.get("note_id") or "").strip()
+            note_name = str(note.get("note_name") or "").strip() or legacy_offline_meeting_note_name(note_id)
+            created_at = str(note.get("created_at") or "").strip()
+            if not note_id or not created_at:
+                continue
+            index.append(
+                {
+                    "note_id": note_id,
+                    "note_name": note_name,
+                    "created_at": created_at,
+                }
+            )
+        return index
+
+    @staticmethod
+    def _normalize_offline_meeting_note_index(raw_value: Any) -> list[dict[str, str]]:
+        """Normalize lightweight note-index entries loaded from meta.json."""
+        if not isinstance(raw_value, list):
+            return []
+
+        normalized: list[dict[str, str]] = []
+        for item in raw_value:
+            if not isinstance(item, dict):
+                continue
+            note_id = str(item.get("note_id") or "").strip()
+            note_name = str(item.get("note_name") or "").strip() or legacy_offline_meeting_note_name(note_id)
+            created_at = str(item.get("created_at") or "").strip()
+            if not note_id or not created_at:
+                continue
+            normalized.append(
+                {
+                    "note_id": note_id,
+                    "note_name": note_name,
+                    "created_at": created_at,
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _offline_meeting_note_index_requires_backfill(raw_value: Any) -> bool:
+        """Return True when lightweight note-index entries are missing note names."""
+        if not isinstance(raw_value, list):
+            return False
+        for item in raw_value:
+            if not isinstance(item, dict):
+                continue
+            note_id = str(item.get("note_id") or "").strip()
+            created_at = str(item.get("created_at") or "").strip()
+            if not note_id or not created_at:
+                continue
+            if not str(item.get("note_name") or "").strip():
+                return True
+        return False
+
+    def _build_metadata_line(self, session: Session) -> dict[str, Any]:
+        """Build the canonical metadata row for a session JSONL file."""
+        self._refresh_session_metadata_hints(session)
+        session.metadata.pop(LEGACY_OFFLINE_MEETING_TRANSCRIPTS_KEY, None)
+        return {
+            "_type": "metadata",
+            "key": session.key,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "metadata": session.metadata,
+            "last_consolidated": session.last_consolidated,
+        }
+
+    def _rewrite_session_metadata_line(self, session: Session) -> None:
+        """Rewrite only the metadata row while preserving the remaining JSONL rows."""
+        path = self._get_session_path(session.key)
+        if not path.exists():
+            self.save(session)
+            return
+
+        metadata_line = json.dumps(self._build_metadata_line(session), ensure_ascii=False)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            logger.exception("Failed reading session file before metadata rewrite: {}", path)
+            self.save(session)
+            return
+
+        if not lines:
+            path.write_text(metadata_line + "\n", encoding="utf-8")
+            return
+
+        try:
+            first_row = json.loads(lines[0])
+        except Exception:
+            logger.exception("Failed parsing metadata row from {}", path)
+            self.save(session)
+            return
+
+        if first_row.get("_type") != "metadata":
+            self.save(session)
+            return
+
+        remaining = [line for line in lines[1:] if line.strip()]
+        payload = [metadata_line, *remaining]
+        path.write_text("\n".join(payload) + "\n", encoding="utf-8")
+
+    def append_offline_meeting_note(
+        self,
+        key: str,
+        transcript: str,
+        *,
+        note_id: str | None = None,
+        note_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one canonical offline-meeting note row to the session JSONL file."""
+        session = self.get_or_create(key)
+        path = self._get_session_path(session.key)
+        resolved_note_name = str(note_name or "").strip() or self._next_offline_meeting_note_name_from_notes(
+            session.offline_meeting_notes
+        )
+        note = self._build_offline_meeting_note_record(
+            session.key,
+            transcript,
+            note_id=note_id,
+            note_name=resolved_note_name,
+        )
+
+        if not path.exists():
+            self.save(session)
+
+        ensure_dir(path.parent)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(note, ensure_ascii=False) + "\n")
+
+        session.offline_meeting_notes.append(note)
+        session.updated_at = datetime.fromisoformat(note["created_at"])
+        self._rewrite_session_metadata_line(session)
+        self._write_readable_session_bundle(session)
+        self._cache[session.key] = session
+        return note
+
+    def read_offline_meeting_note_index(self, key: str) -> list[dict[str, str]]:
+        """Return the lightweight note index from meta.json, rebuilding when needed."""
+        meta_path = self._get_session_meta_path(key)
+        expected_updated_at = ""
+        session_path = self._get_session_path(key)
+
+        if session_path.exists():
+            try:
+                with open(session_path, encoding="utf-8") as handle:
+                    first_line = handle.readline().strip()
+                if first_line:
+                    first_row = json.loads(first_line)
+                    if first_row.get("_type") == "metadata":
+                        expected_updated_at = str(first_row.get("updated_at") or "").strip()
+            except Exception:
+                logger.exception("Failed reading session metadata row for note index: {}", session_path)
+
+        if meta_path.exists():
+            try:
+                meta_payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                raw_index = meta_payload.get(OFFLINE_MEETING_NOTE_INDEX_KEY)
+                index = self._normalize_offline_meeting_note_index(
+                    raw_index
+                )
+                if (
+                    index
+                    and str(meta_payload.get("updated_at") or "").strip() == expected_updated_at
+                    and not self._offline_meeting_note_index_requires_backfill(raw_index)
+                ):
+                    return index
+            except Exception:
+                logger.exception("Failed reading note index from {}", meta_path)
+
+        session = self.read_persisted(key)
+        self._write_readable_session_bundle(session)
+        return self._build_offline_meeting_note_index(session)
+
+    def find_offline_meeting_note(self, key: str, note_id: str) -> dict[str, Any] | None:
+        """Scan canonical note rows for one note id within a single client session file."""
+        target_note_id = str(note_id or "").strip()
+        if not target_note_id:
+            return None
+
+        path = self._get_session_path(key)
+        if not path.exists():
+            return None
+
+        try:
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    payload = json.loads(line)
+                    if payload.get("_type") != OFFLINE_MEETING_NOTE_TYPE:
+                        continue
+                    if str(payload.get("note_id") or "").strip() != target_note_id:
+                        continue
+                    return self._normalize_offline_meeting_note_record(key, payload)
+        except Exception:
+            logger.exception("Failed scanning note rows in {}", path)
+            return None
+
+        return None
+
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
@@ -511,9 +851,11 @@ class SessionManager:
 
         try:
             messages = []
+            offline_meeting_notes = []
             metadata = {}
             created_at = None
             last_consolidated = 0
+            note_rows_need_name_backfill = False
 
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -527,18 +869,29 @@ class SessionManager:
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
+                    elif data.get("_type") == OFFLINE_MEETING_NOTE_TYPE:
+                        if not str(data.get("note_name") or "").strip():
+                            note_rows_need_name_backfill = True
+                        note = self._normalize_offline_meeting_note_record(key, data)
+                        if note is not None:
+                            offline_meeting_notes.append(note)
                     else:
                         if "role" in data:
                             data["role"] = storage_role_for_session(key, str(data.get("role", "") or ""))
                         messages.append(data)
 
-            return Session(
+            session = Session(
                 key=key,
                 messages=messages,
+                offline_meeting_notes=offline_meeting_notes,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
                 last_consolidated=last_consolidated
             )
+            migrated_legacy_notes = self._migrate_legacy_offline_meeting_notes(session)
+            if not migrated_legacy_notes and note_rows_need_name_backfill:
+                self.save(session)
+            return session
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
@@ -546,20 +899,25 @@ class SessionManager:
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
-        self._refresh_session_metadata_hints(session)
+        metadata_line = self._build_metadata_line(session)
 
         with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            for note in session.offline_meeting_notes:
+                normalized_note = self._normalize_offline_meeting_note_record(session.key, note)
+                if normalized_note is None:
+                    continue
+                f.write(json.dumps(normalized_note, ensure_ascii=False) + "\n")
+            session.offline_meeting_notes = [
+                note
+                for note in (
+                    self._normalize_offline_meeting_note_record(session.key, note)
+                    for note in session.offline_meeting_notes
+                )
+                if note is not None
+            ]
 
         self._write_readable_session_bundle(session)
         self._cache[session.key] = session
@@ -678,6 +1036,7 @@ class SessionManager:
             "last_consolidated": session.last_consolidated,
             "message_count": len(session.messages),
             "metadata": session.metadata,
+            OFFLINE_MEETING_NOTE_INDEX_KEY: self._build_offline_meeting_note_index(session),
             "client_name": str(session.metadata.get("client_name") or ""),
             "display_name": str(session.metadata.get("client_display_name") or ""),
             "client_label": str(session.metadata.get("client_label") or ""),

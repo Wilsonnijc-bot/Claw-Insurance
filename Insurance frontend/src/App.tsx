@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { 
   AlertTriangle, MessageSquare, Radio, Shield, LogOut, FileText, 
   ChevronLeft, ChevronRight, Menu, X, Wifi, WifiOff, UserPlus
@@ -17,6 +17,16 @@ import { useRecording } from './hooks/useRecording';
 import { useAIGeneration } from './hooks/useAIGeneration';
 import { useLogger } from './hooks/useLogger';
 import { useNanobot } from './hooks/useNanobot';
+import { fetchOfflineMeetingNoteDetail, fetchOfflineMeetingNotes, saveOfflineMeetingNote } from './services/api';
+import type { VoiceMemo, VoiceMemoDetail } from './types';
+
+interface OfflineMeetingDraftState {
+  clientId: string;
+  noteId: string;
+  defaultNoteName: string;
+  noteNameInput: string;
+  text: string;
+}
 
 function App() {
   // Auth State
@@ -41,16 +51,53 @@ function App() {
   const [deleteCandidateId, setDeleteCandidateId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState('');
   const [deletingClient, setDeletingClient] = useState(false);
+  const [voiceMemos, setVoiceMemos] = useState<VoiceMemo[]>([]);
+  const [voiceMemoBrowserOpen, setVoiceMemoBrowserOpen] = useState(false);
+  const [voiceMemoLoading, setVoiceMemoLoading] = useState(false);
+  const [voiceMemoError, setVoiceMemoError] = useState('');
+  const [selectedVoiceMemoId, setSelectedVoiceMemoId] = useState<string | null>(null);
+  const [selectedVoiceMemoDetail, setSelectedVoiceMemoDetail] = useState<VoiceMemoDetail | null>(null);
+  const [voiceMemoDetailLoading, setVoiceMemoDetailLoading] = useState(false);
+  const [voiceMemoDetailError, setVoiceMemoDetailError] = useState('');
+  const [offlineMeetingDraft, setOfflineMeetingDraft] = useState<OfflineMeetingDraftState | null>(null);
+  const [offlineMeetingDraftError, setOfflineMeetingDraftError] = useState('');
+  const [savingOfflineMeetingDraft, setSavingOfflineMeetingDraft] = useState(false);
+  const [recordingSuccessToken, setRecordingSuccessToken] = useState(0);
+  const selectedClientIdRef = useRef<string | null>(null);
+  const voiceMemoDetailsRef = useRef<Record<string, VoiceMemoDetail>>({});
 
   // Nanobot backend hook — only activates after login
   const nanobot = useNanobot(isAuthenticated);
 
   const clients = nanobot.clients;
+  selectedClientIdRef.current = selectedClientId;
 
   // Hooks
-  const { recordingState, startRecording, stopRecording } = useRecording();
   const { aiLoading, startGeneration, stopGeneration } = useAIGeneration();
   const { logs, addLog, setUser, clearLogs, downloadLogs } = useLogger(isAuthenticated);
+  const {
+    recordingState,
+    recordingTime,
+    error: recordingError,
+    startRecording,
+    stopRecording,
+  } = useRecording({
+    clientId: selectedClientId,
+    enabled: nanobot.backendConnected && !offlineMeetingDraft && !savingOfflineMeetingDraft,
+    onTranscriptDraft: (clientId, draft) => {
+      if (selectedClientIdRef.current !== clientId) {
+        return;
+      }
+      setOfflineMeetingDraft({
+        clientId,
+        noteId: draft.noteId,
+        defaultNoteName: draft.noteName,
+        noteNameInput: draft.noteName,
+        text: draft.transcript,
+      });
+      setOfflineMeetingDraftError('');
+    },
+  });
 
   // Check responsive on mount and resize
   useEffect(() => {
@@ -144,10 +191,156 @@ function App() {
     [clients, selectedClientId]
   );
 
-  const currentVoiceMemos = useMemo(
-    () => [],
-    []
-  );
+  useEffect(() => {
+    if (!offlineMeetingDraft) {
+      return;
+    }
+    if (!selectedClientId || offlineMeetingDraft.clientId !== selectedClientId) {
+      setOfflineMeetingDraft(null);
+      setOfflineMeetingDraftError('');
+    }
+  }, [offlineMeetingDraft, selectedClientId]);
+
+  useEffect(() => {
+    setVoiceMemos([]);
+    setSelectedVoiceMemoId(null);
+    setSelectedVoiceMemoDetail(null);
+    setVoiceMemoError('');
+    setVoiceMemoDetailError('');
+    setVoiceMemoLoading(false);
+    setVoiceMemoDetailLoading(false);
+    voiceMemoDetailsRef.current = {};
+  }, [selectedClientId]);
+
+  const handleSelectVoiceMemo = useCallback(async (noteId: string, providedDetail?: VoiceMemoDetail) => {
+    if (!selectedClientId) {
+      return;
+    }
+
+    const activeClientId = selectedClientId;
+    setSelectedVoiceMemoId(noteId);
+    setVoiceMemoDetailError('');
+    setSelectedVoiceMemoDetail(null);
+
+    if (providedDetail) {
+      voiceMemoDetailsRef.current[noteId] = providedDetail;
+      setSelectedVoiceMemoDetail(providedDetail);
+      setVoiceMemoDetailLoading(false);
+      return;
+    }
+
+    const cachedDetail = voiceMemoDetailsRef.current[noteId];
+    if (cachedDetail && cachedDetail.clientId === activeClientId) {
+      setSelectedVoiceMemoDetail(cachedDetail);
+      setVoiceMemoDetailLoading(false);
+      return;
+    }
+
+    setVoiceMemoDetailLoading(true);
+    try {
+      const { note } = await fetchOfflineMeetingNoteDetail(activeClientId, noteId);
+      if (selectedClientIdRef.current !== activeClientId) {
+        return;
+      }
+      const detail: VoiceMemoDetail = {
+        id: note.noteId,
+        clientId: activeClientId,
+        noteName: note.noteName,
+        createdAt: note.createdAt,
+        transcript: note.transcript,
+      };
+      voiceMemoDetailsRef.current[noteId] = detail;
+      setSelectedVoiceMemoDetail(detail);
+    } catch (error) {
+      if (selectedClientIdRef.current !== activeClientId) {
+        return;
+      }
+      setSelectedVoiceMemoDetail(null);
+      setVoiceMemoDetailError(error instanceof Error ? error.message : '载入笔记失败，请稍后重试。');
+    } finally {
+      if (selectedClientIdRef.current === activeClientId) {
+        setVoiceMemoDetailLoading(false);
+      }
+    }
+  }, [selectedClientId]);
+
+  useEffect(() => {
+    if (!selectedClientId || !nanobot.backendConnected) {
+      setVoiceMemos([]);
+      setSelectedVoiceMemoId(null);
+      setSelectedVoiceMemoDetail(null);
+      setVoiceMemoLoading(false);
+      setVoiceMemoError('');
+      return;
+    }
+    if (!voiceMemoBrowserOpen) {
+      setVoiceMemoLoading(false);
+      setVoiceMemoError('');
+      return;
+    }
+
+    let active = true;
+    setVoiceMemoLoading(true);
+    setVoiceMemoError('');
+
+    fetchOfflineMeetingNotes(selectedClientId)
+      .then((response) => {
+        if (!active) {
+          return;
+        }
+        const notes = Array.isArray(response.notes) ? response.notes : [];
+        const indexedNotes = notes.map((note) => ({
+          id: note.noteId,
+          clientId: selectedClientId,
+          noteName: note.noteName,
+          createdAt: note.createdAt,
+        }));
+        setVoiceMemos(indexedNotes);
+        if (indexedNotes.length === 0) {
+          setSelectedVoiceMemoId(null);
+          setSelectedVoiceMemoDetail(null);
+          setVoiceMemoDetailError('');
+          return;
+        }
+
+        const preferredNoteId = indexedNotes.some((note) => note.id === selectedVoiceMemoId)
+          ? selectedVoiceMemoId
+          : indexedNotes[indexedNotes.length - 1].id;
+        if (!preferredNoteId) {
+          return;
+        }
+        void handleSelectVoiceMemo(preferredNoteId);
+      })
+      .catch((error) => {
+        if (!active) {
+          return;
+        }
+        console.error('Failed to load offline meeting notes:', error);
+        setVoiceMemos([]);
+        setSelectedVoiceMemoId(null);
+        setSelectedVoiceMemoDetail(null);
+        setVoiceMemoError(error instanceof Error ? error.message : '载入笔记失败，请稍后重试。');
+      })
+      .finally(() => {
+        if (!active) {
+          return;
+        }
+        setVoiceMemoLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [selectedClientId, nanobot.backendConnected, voiceMemoBrowserOpen, handleSelectVoiceMemo]);
+
+  useEffect(() => {
+    if (!voiceMemoBrowserOpen) {
+      return;
+    }
+    if (!selectedVoiceMemoId && voiceMemos.length > 0) {
+      void handleSelectVoiceMemo(voiceMemos[voiceMemos.length - 1].id);
+    }
+  }, [voiceMemos, selectedVoiceMemoId, voiceMemoBrowserOpen, handleSelectVoiceMemo]);
 
   const isClientLoading = initialConversationLoading;
   const showBootstrapOverlay = isAuthenticated && (
@@ -176,6 +369,19 @@ function App() {
     setDeleteCandidateId(null);
     setDeleteError('');
     setDeletingClient(false);
+    setVoiceMemos([]);
+    setVoiceMemoBrowserOpen(false);
+    setVoiceMemoLoading(false);
+    setVoiceMemoError('');
+    setSelectedVoiceMemoId(null);
+    setSelectedVoiceMemoDetail(null);
+    setVoiceMemoDetailLoading(false);
+    setVoiceMemoDetailError('');
+    voiceMemoDetailsRef.current = {};
+    setOfflineMeetingDraft(null);
+    setOfflineMeetingDraftError('');
+    setSavingOfflineMeetingDraft(false);
+    setRecordingSuccessToken(0);
   }, [addLog, currentUser]);
 
   // Handlers
@@ -295,12 +501,111 @@ function App() {
   );
 
   const handleStartRecording = useCallback(() => {
-    startRecording();
+    return startRecording();
   }, [startRecording]);
 
   const handleStopRecording = useCallback(() => {
-    stopRecording();
+    return stopRecording();
   }, [stopRecording]);
+
+  const handleOfflineMeetingDraftChange = useCallback((value: string) => {
+    setOfflineMeetingDraft((current) => {
+      if (!current) {
+        return current;
+      }
+      return {
+        ...current,
+        text: value,
+      };
+    });
+    setOfflineMeetingDraftError('');
+  }, []);
+
+  const handleOfflineMeetingDraftNoteNameChange = useCallback((value: string) => {
+    setOfflineMeetingDraft((current) => {
+      if (!current) {
+        return current;
+      }
+      return {
+        ...current,
+        noteNameInput: value,
+      };
+    });
+    setOfflineMeetingDraftError('');
+  }, []);
+
+  const handleCancelOfflineMeetingDraft = useCallback(() => {
+    if (savingOfflineMeetingDraft) {
+      return;
+    }
+    setOfflineMeetingDraft(null);
+    setOfflineMeetingDraftError('');
+  }, [savingOfflineMeetingDraft]);
+
+  const handleSaveOfflineMeetingDraft = useCallback(async () => {
+    if (!selectedClientId || !offlineMeetingDraft || savingOfflineMeetingDraft) {
+      return;
+    }
+    if (offlineMeetingDraft.clientId !== selectedClientId) {
+      setOfflineMeetingDraft(null);
+      setOfflineMeetingDraftError('');
+      return;
+    }
+
+    const finalTranscript = offlineMeetingDraft.text;
+    const finalNoteName = offlineMeetingDraft.noteNameInput.trim() || offlineMeetingDraft.defaultNoteName;
+    if (!finalTranscript.trim()) {
+      setOfflineMeetingDraftError('请先确认并填写整理后的内容。');
+      return;
+    }
+
+    const draftClientId = offlineMeetingDraft.clientId;
+    const draftNoteId = offlineMeetingDraft.noteId;
+    setSavingOfflineMeetingDraft(true);
+    setOfflineMeetingDraftError('');
+
+    try {
+      const { note } = await saveOfflineMeetingNote(
+        draftClientId,
+        finalNoteName,
+        finalTranscript,
+        draftNoteId,
+      );
+      setOfflineMeetingDraft(null);
+      setOfflineMeetingDraftError('');
+      if (selectedClientIdRef.current === draftClientId) {
+        const savedNoteIndex: VoiceMemo = {
+          id: note.noteId,
+          clientId: draftClientId,
+          noteName: note.noteName,
+          createdAt: note.createdAt,
+        };
+        const savedNoteDetail: VoiceMemoDetail = {
+          ...savedNoteIndex,
+          transcript: note.transcript,
+        };
+        voiceMemoDetailsRef.current[note.noteId] = savedNoteDetail;
+        setVoiceMemos((previous) => [
+          ...previous.filter((item) => item.id !== note.noteId),
+          savedNoteIndex,
+        ]);
+        setVoiceMemoBrowserOpen(true);
+        setSelectedVoiceMemoId(note.noteId);
+        setSelectedVoiceMemoDetail(savedNoteDetail);
+        setVoiceMemoDetailError('');
+        setRecordingSuccessToken((value) => value + 1);
+      }
+    } catch (error) {
+      setOfflineMeetingDraftError(error instanceof Error ? error.message : '保存失败，请稍后重试。');
+    } finally {
+      setSavingOfflineMeetingDraft(false);
+    }
+  }, [offlineMeetingDraft, savingOfflineMeetingDraft, selectedClientId]);
+
+  const handleToggleVoiceMemoBrowser = useCallback(() => {
+    setVoiceMemoBrowserOpen((current) => !current);
+    setVoiceMemoError('');
+  }, []);
 
   const handleOpenLogs = useCallback(() => {
     setShowLogViewer(true);
@@ -606,8 +911,36 @@ function App() {
         >
           <ClientProfile
             client={selectedClient}
-            voiceMemos={currentVoiceMemos}
+            voiceMemos={voiceMemos}
+            voiceMemoBrowserOpen={voiceMemoBrowserOpen}
+            voiceMemoLoading={voiceMemoLoading}
+            voiceMemoError={voiceMemoError}
+            selectedVoiceMemoId={selectedVoiceMemoId}
+            selectedVoiceMemoDetail={selectedVoiceMemoDetail}
+            selectedVoiceMemoLoading={voiceMemoDetailLoading}
+            selectedVoiceMemoError={voiceMemoDetailError}
             recordingState={recordingState}
+            recordingTime={recordingTime}
+            recordingError={recordingError}
+            recordingSuccessToken={recordingSuccessToken}
+            draftTranscript={
+              offlineMeetingDraft && offlineMeetingDraft.clientId === selectedClientId
+                ? offlineMeetingDraft.text
+                : null
+            }
+            draftNoteName={
+              offlineMeetingDraft && offlineMeetingDraft.clientId === selectedClientId
+                ? offlineMeetingDraft.noteNameInput
+                : ''
+            }
+            draftError={offlineMeetingDraftError}
+            isSavingDraft={savingOfflineMeetingDraft}
+            onDraftNoteNameChange={handleOfflineMeetingDraftNoteNameChange}
+            onDraftChange={handleOfflineMeetingDraftChange}
+            onSaveDraft={handleSaveOfflineMeetingDraft}
+            onCancelDraft={handleCancelOfflineMeetingDraft}
+            onToggleVoiceMemoBrowser={handleToggleVoiceMemoBrowser}
+            onSelectVoiceMemo={handleSelectVoiceMemo}
             onStartRecording={handleStartRecording}
             onStopRecording={handleStopRecording}
             onSyncWhatsApp={handleSyncWhatsApp}

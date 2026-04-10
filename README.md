@@ -62,6 +62,10 @@ The current frontend uses these routes:
 - `POST /api/login`
 - `GET /api/clients`
 - `GET /api/clients/{phone}`
+- `GET /api/clients/{phone}/offline-meeting-notes`
+- `GET /api/clients/{phone}/offline-meeting-notes/{noteId}`
+- `POST /api/clients/{phone}/offline-meeting-note/save`
+- `POST /api/clients/{phone}/offline-meeting-note/transcribe`
 - `DELETE /api/clients/{phone}`
 - `GET /api/messages/{phone}?format=html`
 - `POST /api/messages/{phone}`
@@ -88,11 +92,13 @@ The system is intentionally project-local. Runtime state lives under this reposi
 | Path | What it stores | Source-of-truth status |
 | --- | --- | --- |
 | `config.json` | runtime configuration | canonical config |
+| `googleconfig.json` | Google STT feature settings only | canonical Google STT config |
+| `secrets/google-credentials.json` | Google service-account credential loaded at runtime from disk | canonical Google credential path |
 | `data/contacts/whatsapp.json` | direct-contact allowlist | canonical direct inbound allowlist |
 | `data/whatsapp_groups.csv` | group-member allowlist | canonical group inbound allowlist |
 | `data/whatsapp_reply_targets.json` | direct/group reply targets, auto-draft flags, observed IDs | canonical operator target registry |
-| `sessions/whatsapp__{phone}/session.jsonl` | append-only persisted conversation history | canonical chat history |
-| `sessions/whatsapp__{phone}/meta.json` | derived session metadata and pointers | derived from `session.jsonl` |
+| `sessions/whatsapp__{phone}/session.jsonl` | append-only persisted conversation history and saved `offline_meeting_note` records | canonical chat and note history |
+| `sessions/whatsapp__{phone}/meta.json` | derived session metadata, pointers, and offline-meeting note index entries | derived from `session.jsonl` |
 | `memory/{phone}/MEMORY.md` | per-client long-term memory | canonical per-client memory |
 | `memory/{phone}/HISTORY.md` | per-client consolidated history log | canonical per-client memory log |
 | `memory/GLOBAL.md` | shared operator-curated knowledge | canonical shared knowledge file |
@@ -110,6 +116,7 @@ Important source-of-truth rules:
 - The operator transcript view is rendered from `sessions/.../session.jsonl`, not from WebSocket payloads or frontend cache.
 - `sessions/.../meta.json` is a convenience index. If it disagrees with `session.jsonl`, `session.jsonl` wins.
 - AI drafts are not persisted when they are only drafts. Only approved/sent content is written to session history.
+- Offline meeting voice notes do not persist audio. Draft transcription persists nothing; only user-saved transcript text is appended as `offline_meeting_note` rows in the matching client's `session.jsonl`, while `meta.json` keeps only a lightweight `offline_meeting_note_index` with `note_id` and `created_at`.
 
 ## Install And Setup
 
@@ -120,29 +127,104 @@ Important source-of-truth rules:
 - `npm`
 - Chrome or Chromium available if you use CDP mode or history scraping
 
-### Backend
+### Recommended Local Runtime
+
+Use a project-local virtualenv in this checkout. Do not rely on random system Python installs.
+
+### 1. Create And Activate The Project Venv
 
 ```bash
 cd /path/to/Nanobot-Whatsapp
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install --upgrade pip
 ```
 
-### Frontend
+### 2. Install Backend Dependencies Into That Venv
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+For normal local runs, `pip install -e .` is enough.
+Only install `pip install -e ".[dev]"` if you specifically need the repo's test and lint tooling.
+
+### 3. Install Frontend Dependencies
 
 ```bash
 cd "/path/to/Nanobot-Whatsapp/Insurance frontend"
 npm install
 ```
 
-### Optional Wrapper Commands
+### 4. Put The Google STT Files In Place
 
-Run this once per checkout if you want stable commands:
+For the existing `线下会面录音` feature, keep Google files separate from the main app config:
+
+- `config.json` remains the normal app config.
+- `googleconfig.json` contains only Google STT settings such as `projectId`, `location`, `languageCode`, `model`, and `credentialJsonPath`.
+- `secrets/google-credentials.json` is the real Google service-account JSON file.
+
+The backend loads the credential only from `googleconfig.json -> credentialJsonPath` at runtime. The credential is never bundled into the frontend, never merged into `config.json`, and never written into session history.
+
+Place the files like this:
 
 ```bash
 cd /path/to/Nanobot-Whatsapp
-python3 -m nanobot install-ui-command
+mkdir -p secrets
+# put your real service-account JSON at:
+#   /path/to/Nanobot-Whatsapp/secrets/google-credentials.json
+# or update googleconfig.json to match the exact filename you shipped
+```
+
+A minimal `googleconfig.json` looks like:
+
+```json
+{
+  "projectId": "your-project-id",
+  "location": "us",
+  "languageCode": "yue-Hant-HK",
+  "model": "chirp_3",
+  "credentialJsonPath": "secrets/google-credentials.json"
+}
+```
+
+The offline meeting flow stays on the existing client-profile card labeled `线下会面录音`. It records one short note up to 60 seconds, uploads the final blob once, transcribes it with Google Speech-to-Text V2, shows an editable draft in the UI, and discards the audio immediately after transcription. Nothing is stored until the user presses `保存`. Saved note bodies stay only in appended `offline_meeting_note` rows in `session.jsonl`; the note browser loads its chronological note list from `meta.json` and fetches full transcript content lazily per note.
+
+### Chirp Transcript Meeting Notes
+
+This system is the real implementation behind the existing `线下会面录音` entry in the client profile.
+
+- Google Cloud Speech-to-Text V2 is used in one-shot mode with model `chirp_3`.
+- Audio is recorded in the browser, uploaded once, processed in memory on the backend, and discarded after transcription.
+- `POST /api/clients/{phone}/offline-meeting-note/transcribe` returns draft transcript text only and persists nothing.
+- The operator may edit that draft in the UI; only `保存` writes anything locally.
+- `POST /api/clients/{phone}/offline-meeting-note/save` stores the final confirmed transcript and returns the saved note body for immediate UI update.
+- Canonical saved-note storage is append-only `offline_meeting_note` rows in `sessions/whatsapp__{phone}/session.jsonl`.
+- `meta.json` is only a lightweight note index for browsing. It stores `offline_meeting_note_index` entries with `note_id` and `created_at`, not transcript content.
+- `GET /api/clients/{phone}/offline-meeting-notes` reads the chronological note index from `meta.json`.
+- `GET /api/clients/{phone}/offline-meeting-notes/{noteId}` resolves the selected note by scanning that client's canonical JSONL note rows and returns the actual transcript text.
+- Nanobot context uses saved note transcripts from canonical JSONL note rows only. Unsaved drafts never enter context.
+
+### 5. Sanity Check The Local Install
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+python -m nanobot status
+```
+
+Use this to confirm the config, workspace, sessions, memory, auth, and browser paths all resolve inside the repo.
+
+### 6. Install The Wrapper Commands
+
+Run this once per checkout:
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+python -m nanobot install-ui-command
 ```
 
 That installs:
@@ -154,13 +236,21 @@ Those wrapper scripts point back to this checkout, export `NANOBOT_CONFIG_PATH` 
 
 If the repo moves on disk, run the installer again so the wrapper paths are refreshed.
 
-### Sanity Check
+### 7. Launch The App With The Wrapper
 
 ```bash
-python3 -m nanobot status
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+whatsapp-web-nanobot-ui
 ```
 
-Use this to confirm the config, workspace, sessions, memory, auth, and browser paths all resolve inside the repo.
+### 8. Stop The Local UI And Backend Processes
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+python -m nanobot stop-dev
+```
 
 ## Real End-To-End Operator Flow
 
@@ -170,12 +260,6 @@ Recommended daily command:
 
 ```bash
 whatsapp-web-nanobot-ui
-```
-
-Equivalent:
-
-```bash
-python3 -m nanobot ui
 ```
 
 Stop the local UI/launcher/bridge dev processes:
@@ -273,7 +357,7 @@ WhatsApp direct sessions use one canonical bundle per client:
 `session.jsonl` format:
 
 - first line: metadata record (`_type = "metadata"`)
-- following lines: append-only message records
+- following lines: append-only message records and saved `offline_meeting_note` records
 
 Persistence behavior:
 
@@ -283,6 +367,7 @@ Persistence behavior:
 - approved AI sends are persisted before outbound delivery
 - unsent AI drafts are not persisted
 - history sync imports both client-side and from-me messages without calling the LLM
+- imported inbound `你` reply-with-quote history blocks may be normalized into `message_type = imported_client_reply_with_quote`; `content` stays the actual reply text and `quoted_text` / `quoted_message_id` may also be stored
 
 The frontend transcript is always rebuilt from persisted JSONL. It does not trust unsaved in-memory session cache.
 

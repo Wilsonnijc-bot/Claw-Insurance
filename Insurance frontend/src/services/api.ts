@@ -9,9 +9,13 @@ const API_BASE = import.meta.env.VITE_API_BASE || '/api';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}${path}`;
+  const headers = new Headers(options?.headers);
+  if (!(options?.body instanceof FormData) && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
     ...options,
+    headers,
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
@@ -89,6 +93,37 @@ export interface SyncResult {
   requestId?: string | null;
 }
 
+export interface OfflineMeetingNotesResponse {
+  notes: OfflineMeetingNoteIndex[];
+}
+
+export interface OfflineMeetingNoteIndex {
+  noteId: string;
+  noteName: string;
+  createdAt: string;
+}
+
+export interface OfflineMeetingNote {
+  noteId: string;
+  noteName: string;
+  transcript: string;
+  createdAt: string;
+}
+
+export interface OfflineMeetingNoteDetailResponse {
+  note: OfflineMeetingNote;
+}
+
+export interface OfflineMeetingNoteDraftResponse {
+  noteId: string;
+  noteName: string;
+  transcript: string;
+}
+
+export interface OfflineMeetingNoteSaveResponse {
+  note: OfflineMeetingNote;
+}
+
 // ─── Client endpoints ───────────────────────────────────────────────
 
 /** List all WhatsApp clients (reply targets). */
@@ -102,10 +137,54 @@ export async function fetchClient(phone: string): Promise<ApiClient> {
   return request<ApiClient>(`/clients/${phone}`);
 }
 
+export async function fetchOfflineMeetingNotes(phone: string): Promise<OfflineMeetingNotesResponse> {
+  return request<OfflineMeetingNotesResponse>(`/clients/${phone}/offline-meeting-notes`);
+}
+
+export async function fetchOfflineMeetingNoteDetail(
+  phone: string,
+  noteId: string,
+): Promise<OfflineMeetingNoteDetailResponse> {
+  return request<OfflineMeetingNoteDetailResponse>(
+    `/clients/${phone}/offline-meeting-notes/${encodeURIComponent(noteId)}`
+  );
+}
+
 /** Delete a client session and remove it from reply targets. */
 export async function deleteClient(phone: string): Promise<{ status: string; phone: string }> {
   return request<{ status: string; phone: string }>(`/clients/${phone}`, {
     method: 'DELETE',
+  });
+}
+
+export async function transcribeOfflineMeetingNote(
+  phone: string,
+  audioBlob: Blob,
+  durationMs: number,
+): Promise<OfflineMeetingNoteDraftResponse> {
+  const extension = audioBlob.type.includes('ogg')
+    ? 'ogg'
+    : audioBlob.type.includes('mp4')
+    ? 'm4a'
+    : 'webm';
+  const formData = new FormData();
+  formData.append('audio', audioBlob, `offline-meeting-note.${extension}`);
+  formData.append('durationMs', String(durationMs));
+  return request<OfflineMeetingNoteDraftResponse>(`/clients/${phone}/offline-meeting-note/transcribe`, {
+    method: 'POST',
+    body: formData,
+  });
+}
+
+export async function saveOfflineMeetingNote(
+  phone: string,
+  noteName: string,
+  transcript: string,
+  noteId?: string,
+): Promise<OfflineMeetingNoteSaveResponse> {
+  return request<OfflineMeetingNoteSaveResponse>(`/clients/${phone}/offline-meeting-note/save`, {
+    method: 'POST',
+    body: JSON.stringify({ noteId, noteName, transcript }),
   });
 }
 

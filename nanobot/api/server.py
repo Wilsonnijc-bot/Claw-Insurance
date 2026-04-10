@@ -21,10 +21,15 @@ from aiohttp import web, WSMsgType
 from loguru import logger
 
 from nanobot.api.journal import ActivityJournal
+from nanobot.config.google_loader import GoogleConfigError, load_google_config
+from nanobot.providers.google_speech import GoogleSpeechProvider
+from nanobot.session.manager import generate_offline_meeting_note_id
 
 CDP_DRAFT_DISABLED_DETAIL = (
     "WhatsApp Web draft placement is disabled in CDP mode; CDP is reserved for history parsing."
 )
+OFFLINE_MEETING_MAX_DURATION_MS = 60_000
+OFFLINE_MEETING_MAX_AUDIO_BYTES = 12 * 1024 * 1024
 
 
 class ApiServer:
@@ -68,6 +73,22 @@ class ApiServer:
     def _setup_routes(self) -> None:
         self.app.router.add_get("/api/clients", self._handle_get_clients)
         self.app.router.add_get("/api/clients/{phone}", self._handle_get_client)
+        self.app.router.add_get(
+            "/api/clients/{phone}/offline-meeting-notes",
+            self._handle_get_offline_meeting_notes,
+        )
+        self.app.router.add_get(
+            "/api/clients/{phone}/offline-meeting-notes/{noteId}",
+            self._handle_get_offline_meeting_note_detail,
+        )
+        self.app.router.add_post(
+            "/api/clients/{phone}/offline-meeting-note/save",
+            self._handle_save_offline_meeting_note,
+        )
+        self.app.router.add_post(
+            "/api/clients/{phone}/offline-meeting-note/transcribe",
+            self._handle_transcribe_offline_meeting_note,
+        )
         self.app.router.add_delete("/api/clients/{phone}", self._handle_delete_client)
         self.app.router.add_get("/api/messages/{phone}", self._handle_get_messages)
         self.app.router.add_post("/api/messages/{phone}", self._handle_send_message)
@@ -703,6 +724,144 @@ class ApiServer:
             notify_observers=notify_observers,
         )
 
+    @staticmethod
+    def _serialize_offline_meeting_note(note: dict[str, Any]) -> dict[str, str]:
+        """Return the frontend response shape for one saved offline-meeting note."""
+        return {
+            "noteId": str(note.get("note_id") or ""),
+            "noteName": str(note.get("note_name") or ""),
+            "transcript": str(note.get("transcript") or ""),
+            "createdAt": str(note.get("created_at") or ""),
+        }
+
+    @staticmethod
+    def _serialize_offline_meeting_note_index_entry(entry: dict[str, Any]) -> dict[str, str]:
+        """Return the frontend response shape for one lightweight note index item."""
+        return {
+            "noteId": str(entry.get("note_id") or ""),
+            "noteName": str(entry.get("note_name") or ""),
+            "createdAt": str(entry.get("created_at") or ""),
+        }
+
+    @staticmethod
+    def _sanitize_saved_offline_meeting_transcript(raw_value: Any) -> str:
+        """Trim the final saved transcript while preserving user edits inside the text."""
+        if not isinstance(raw_value, str):
+            raise ValueError("transcript must be a string")
+        transcript = raw_value.strip()
+        if not transcript:
+            raise ValueError("transcript must not be empty")
+        return transcript
+
+    @staticmethod
+    def _sanitize_saved_offline_meeting_note_id(raw_value: Any) -> str | None:
+        """Validate an optional draft note id carried from transcription to save."""
+        if raw_value is None:
+            return None
+        if not isinstance(raw_value, str):
+            raise ValueError("noteId must be a string")
+        note_id = raw_value.strip()
+        if not note_id:
+            return None
+        if not note_id.startswith("offline_note_"):
+            raise ValueError("noteId must start with offline_note_")
+        return note_id
+
+    @staticmethod
+    def _sanitize_saved_offline_meeting_note_name(raw_value: Any) -> str | None:
+        """Trim the final saved note name while preserving blank as backend-default."""
+        if raw_value is None:
+            return None
+        if not isinstance(raw_value, str):
+            raise ValueError("noteName must be a string")
+        note_name = raw_value.strip()
+        if not note_name:
+            return None
+        return note_name
+
+    def _get_offline_meeting_notes(self, phone: str) -> list[dict[str, str]]:
+        client = self._resolve_client_key(phone)
+        index = self.session_manager.read_offline_meeting_note_index(client.session_key)
+        return [
+            self._serialize_offline_meeting_note_index_entry(entry)
+            for entry in index
+        ]
+
+    def _get_offline_meeting_note_detail(self, phone: str, note_id: str) -> dict[str, str]:
+        client = self._resolve_client_key(phone)
+        note = self.session_manager.find_offline_meeting_note(client.session_key, note_id)
+        if note is None:
+            raise LookupError("Offline meeting note not found")
+        return self._serialize_offline_meeting_note(note)
+
+    def _save_offline_meeting_note(
+        self,
+        phone: str,
+        transcript: Any,
+        note_name: Any,
+        note_id: Any = None,
+    ) -> dict[str, str]:
+        client = self._resolve_client_key(phone)
+        final_note_id = self._sanitize_saved_offline_meeting_note_id(note_id) or generate_offline_meeting_note_id()
+        final_note_name = self._sanitize_saved_offline_meeting_note_name(note_name)
+        final_transcript = self._sanitize_saved_offline_meeting_transcript(transcript)
+        note = self.session_manager.append_offline_meeting_note(
+            client.session_key,
+            final_transcript,
+            note_id=final_note_id,
+            note_name=final_note_name,
+        )
+        return self._serialize_offline_meeting_note(note)
+
+    async def _read_offline_meeting_audio_upload(
+        self,
+        request: web.Request,
+    ) -> tuple[bytes, int]:
+        reader = await request.multipart()
+        audio_buffer = bytearray()
+        duration_ms: int | None = None
+        has_audio = False
+
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+
+            name = str(getattr(part, "name", "") or "")
+            if name == "durationMs":
+                raw_duration = (await part.text()).strip()
+                try:
+                    duration_ms = int(raw_duration)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("durationMs must be an integer number of milliseconds") from exc
+                continue
+
+            if name != "audio":
+                await part.release()
+                continue
+
+            has_audio = True
+            while True:
+                chunk = await part.read_chunk()
+                if not chunk:
+                    break
+                audio_buffer.extend(chunk)
+                if len(audio_buffer) > OFFLINE_MEETING_MAX_AUDIO_BYTES:
+                    raise ValueError("Uploaded audio is too large for a 60-second voice note")
+
+        if not has_audio:
+            raise ValueError("Missing audio upload")
+        if duration_ms is None:
+            raise ValueError("Missing durationMs")
+        if duration_ms <= 0:
+            raise ValueError("durationMs must be greater than 0")
+        if duration_ms > OFFLINE_MEETING_MAX_DURATION_MS:
+            raise ValueError("Recording exceeds the 60-second limit")
+        if not audio_buffer:
+            raise ValueError("Uploaded audio is empty")
+
+        return bytes(audio_buffer), duration_ms
+
     def _get_session_messages(self, phone: str) -> list[dict]:
         """Return visible messages for a WhatsApp phone session."""
         client = self._resolve_client_key(phone)
@@ -719,7 +878,7 @@ class ApiServer:
             # Skip deleted
             if m.get("deleted_by_sender"):
                 continue
-            messages.append({
+            item = {
                 "id": m.get("message_id", m.get("timestamp", "")),
                 "role": role,
                 "sender": "client" if role == "client" else ("ai" if m.get("is_ai_draft") else "agent"),
@@ -727,7 +886,20 @@ class ApiServer:
                 "timestamp": m.get("timestamp", ""),
                 "isAIDraft": bool(m.get("is_ai_draft")),
                 "fromMe": role in ("me", "assistant"),
-            })
+            }
+            message_type = str(m.get("message_type", "") or "").strip()
+            if message_type:
+                item["messageType"] = message_type
+            reply_text = str(m.get("reply_text", "") or "").strip()
+            if reply_text:
+                item["replyText"] = reply_text
+            quoted_text = str(m.get("quoted_text", "") or "")
+            if quoted_text.strip():
+                item["quotedText"] = quoted_text
+            quoted_message_id = str(m.get("quoted_message_id", "") or "").strip()
+            if quoted_message_id:
+                item["quotedMessageId"] = quoted_message_id
+            messages.append(item)
         return messages
 
     def _render_messages_view_html(self, phone: str, messages: list[dict]) -> str:
@@ -762,13 +934,21 @@ class ApiServer:
                 else ("AI" if role_class == "ai" else "\u6211")
             )
             content = html.escape(str(message.get("content") or ""))
+            message_type = str(message.get("messageType") or "")
+            quoted_text = html.escape(str(message.get("quotedText") or ""))
+            bubble_content = content
+            if message_type == "imported_client_reply_with_quote" and quoted_text:
+                bubble_content = (
+                    f'<div class="quoted-block">{quoted_text}</div>'
+                    f'<div class="reply-block">{content}</div>'
+                )
             timestamp = html.escape(render_timestamp(str(message.get("timestamp") or "")))
             rows.append(
                 f"""
                 <article class="row {role_class}" style="animation-delay: {index * 50}ms">
                   <div class="avatar">{avatar}</div>
                   <div class="bubble-wrap">
-                    <div class="bubble">{content}</div>
+                    <div class="bubble">{bubble_content}</div>
                     <div class="timestamp">{timestamp}</div>
                   </div>
                 </article>
@@ -890,11 +1070,30 @@ class ApiServer:
         white-space: pre-wrap;
         word-break: break-word;
       }}
+      .quoted-block {{
+        margin-bottom: 8px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        border-left: 3px solid rgba(100, 116, 139, 0.45);
+        background: rgba(148, 163, 184, 0.12);
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }}
+      .reply-block {{
+        white-space: pre-wrap;
+      }}
       .row.client .bubble {{
         background: var(--client);
         border: 1px solid var(--line);
         border-top-left-radius: 6px;
         box-shadow: 0 10px 25px rgba(15, 23, 42, 0.05);
+      }}
+      .row.agent .quoted-block,
+      .row.ai .quoted-block {{
+        background: rgba(255, 255, 255, 0.18);
+        color: rgba(255, 255, 255, 0.88);
+        border-left-color: rgba(255, 255, 255, 0.45);
       }}
       .row.ai .bubble {{
         background: var(--ai);
@@ -1032,6 +1231,91 @@ class ApiServer:
         except Exception:
             logger.exception("Error getting client {}", phone)
             return web.json_response({"error": "Internal error"}, status=500)
+
+    async def _handle_get_offline_meeting_notes(self, request: web.Request) -> web.Response:
+        """GET /api/clients/:phone/offline-meeting-notes — lightweight note index for one client."""
+        phone = request.match_info["phone"]
+        try:
+            notes = self._get_offline_meeting_notes(phone)
+            return web.json_response({"notes": notes})
+        except ValueError:
+            return web.json_response({"error": "Invalid client phone"}, status=400)
+        except Exception:
+            logger.exception("Error loading offline meeting notes for {}", phone)
+            return web.json_response({"error": "Internal error"}, status=500)
+
+    async def _handle_get_offline_meeting_note_detail(self, request: web.Request) -> web.Response:
+        """GET /api/clients/:phone/offline-meeting-notes/:noteId — canonical transcript detail."""
+        phone = request.match_info["phone"]
+        note_id = request.match_info["noteId"]
+        try:
+            note = self._get_offline_meeting_note_detail(phone, note_id)
+            return web.json_response({"note": note})
+        except ValueError:
+            return web.json_response({"error": "Invalid client phone"}, status=400)
+        except LookupError:
+            return web.json_response({"error": "Offline meeting note not found"}, status=404)
+        except Exception:
+            logger.exception("Error loading offline meeting note detail for {} / {}", phone, note_id)
+            return web.json_response({"error": "Internal error"}, status=500)
+
+    async def _handle_save_offline_meeting_note(self, request: web.Request) -> web.Response:
+        """POST /api/clients/:phone/offline-meeting-note/save — persist one confirmed note row."""
+        phone = request.match_info["phone"]
+        try:
+            try:
+                body = await request.json()
+            except Exception as exc:
+                raise ValueError("Request body must be valid JSON") from exc
+            note = self._save_offline_meeting_note(
+                phone,
+                body.get("transcript"),
+                body.get("noteName"),
+                body.get("noteId"),
+            )
+            return web.json_response({"note": note})
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            logger.exception("Error saving offline meeting note for {}", phone)
+            return web.json_response({"error": "Internal error"}, status=500)
+
+    async def _handle_transcribe_offline_meeting_note(self, request: web.Request) -> web.Response:
+        """POST /api/clients/:phone/offline-meeting-note/transcribe — transcribe one draft."""
+        phone = request.match_info["phone"]
+        audio_bytes = b""
+        try:
+            client = self._resolve_client_key(phone)
+            audio_bytes, _duration_ms = await self._read_offline_meeting_audio_upload(request)
+
+            google_config = load_google_config()
+            provider = GoogleSpeechProvider(google_config)
+            transcript = " ".join((await provider.transcribe(audio_bytes)).split()).strip()
+            if not transcript:
+                return web.json_response(
+                    {"error": "未识别到有效语音内容，请重试。"},
+                    status=422,
+                )
+
+            draft_note_id = generate_offline_meeting_note_id()
+            return web.json_response(
+                {
+                    "noteId": draft_note_id,
+                    "noteName": self.session_manager.next_offline_meeting_note_name(client.session_key),
+                    "transcript": transcript,
+                }
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except GoogleConfigError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        except RuntimeError as exc:
+            return web.json_response({"error": str(exc)}, status=502)
+        except Exception:
+            logger.exception("Error processing offline meeting note for {}", phone)
+            return web.json_response({"error": "Internal error"}, status=500)
+        finally:
+            audio_bytes = b""
 
     async def _handle_delete_client(self, request: web.Request) -> web.Response:
         """DELETE /api/clients/:phone — delete a client session and target."""

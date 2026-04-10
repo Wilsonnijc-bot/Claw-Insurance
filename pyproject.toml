@@ -45,6 +45,7 @@ dependencies = [
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
     "aiohttp>=3.9.0,<4.0.0",
+    "google-cloud-speech>=2.35.0,<3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -99,6 +100,8 @@ include = [
     "bridge/",
     "README.md",
     "LICENSE",
+    "googleconfig.json",
+    "googleconfig.example.json",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]

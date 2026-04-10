@@ -35,6 +35,10 @@ media/
 state/
 cron/
 config.json
+secrets/*.json
+!secrets/.gitkeep
+test_words/*
+!test_words/.gitkeep
 .cli-history
 .bridge-build/
 .nanobot-bin/

@@ -22,7 +22,7 @@ test('isSelfDirectChat matches own direct JID and rejects groups', () => {
   assert.equal(isSelfDirectChat('1203630@g.us', '85212345678@s.whatsapp.net'), false);
 });
 
-test('non-notify upserts are emitted as direct history batches', async () => {
+test('non-notify upserts drop direct outbound echoes and keep inbound history entries', async () => {
   const historyBatches = [];
   const liveMessages = [];
   const client = new WhatsAppClient({
@@ -39,7 +39,7 @@ test('non-notify upserts are emitted as direct history batches', async () => {
     messages: [
       {
         key: {
-          id: 'hist-1',
+          id: 'echo-1',
           remoteJid: '85212345678@s.whatsapp.net',
           fromMe: true,
         },
@@ -47,6 +47,18 @@ test('non-notify upserts are emitted as direct history batches', async () => {
           conversation: 'sent earlier',
         },
         messageTimestamp: 1700000000,
+      },
+      {
+        key: {
+          id: 'hist-1',
+          remoteJid: '85212345678@s.whatsapp.net',
+          fromMe: false,
+        },
+        pushName: 'Alice',
+        message: {
+          conversation: 'received earlier',
+        },
+        messageTimestamp: 1700000001,
       },
       {
         key: {
@@ -71,11 +83,43 @@ test('non-notify upserts are emitted as direct history batches', async () => {
     id: 'hist-1',
     sender: '85212345678@s.whatsapp.net',
     pn: '85212345678',
-    content: 'sent earlier',
-    timestamp: 1700000000,
-    fromMe: true,
+    content: 'received earlier',
+    timestamp: 1700000001,
+    fromMe: false,
     isGroup: false,
+    pushName: 'Alice',
   });
+});
+
+test('outbound-only non-notify upserts emit no history batch', async () => {
+  const historyBatches = [];
+  const client = new WhatsAppClient({
+    authDir: '/tmp/auth',
+    onMessage() {},
+    onHistory: (batch) => historyBatches.push(batch),
+    onDelete() {},
+    onQR() {},
+    onStatus() {},
+  });
+
+  await client.handleMessagesUpsert({
+    type: 'append',
+    messages: [
+      {
+        key: {
+          id: 'echo-only',
+          remoteJid: '85212345678@s.whatsapp.net',
+          fromMe: true,
+        },
+        message: {
+          conversation: 'just sent',
+        },
+        messageTimestamp: 1700000002,
+      },
+    ],
+  });
+
+  assert.equal(historyBatches.length, 0);
 });
 
 test('messaging-history.set emits normalized direct history with media placeholders', async () => {

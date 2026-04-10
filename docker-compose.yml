@@ -4,10 +4,12 @@ x-common-config: &common-config
     dockerfile: Dockerfile
   volumes:
     - ./config.json:/app/config.json
+    - ./googleconfig.json:/app/googleconfig.json
     - ./data:/app/data
     - ./sessions:/app/sessions
     - ./state:/app/state
     - ./memory:/app/memory
+    - ./secrets:/app/secrets
     - ./whatsapp-auth:/app/whatsapp-auth
     - ./whatsapp-web:/app/whatsapp-web
     - ./whatsapp-web-debug:/app/whatsapp-web-debug

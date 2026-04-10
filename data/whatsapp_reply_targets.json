@@ -1,17 +1,17 @@
 {
   "version": 1,
-  "updated_at": "2026-04-09T09:06:13.914573+00:00",
+  "updated_at": "2026-04-10T11:51:18.365672+00:00",
   "source": "frontend_add",
   "direct_reply_targets": [
     {
-      "phone": "8801797493497",
+      "phone": "85269984395",
       "enabled": true,
-      "auto_draft": true,
+      "auto_draft": false,
       "label": "",
-      "chat_id": "8801797493497@s.whatsapp.net",
-      "sender_id": "8801797493497@s.whatsapp.net",
-      "push_name": "+880 1797-493497",
-      "last_seen_at": "2026-04-09T09:06:13.904261+00:00"
+      "chat_id": "85269984395@s.whatsapp.net",
+      "sender_id": "85269984395@s.whatsapp.net",
+      "push_name": "+852 6998 4395",
+      "last_seen_at": "2026-04-10T11:51:18.364407+00:00"
     },
     {
       "phone": "8613136101623",
@@ -21,17 +21,7 @@
       "chat_id": "8613136101623@s.whatsapp.net",
       "sender_id": "8613136101623@s.whatsapp.net",
       "push_name": "HaHa Qi",
-      "last_seen_at": "2026-04-09T09:06:13.913141+00:00"
-    },
-    {
-      "phone": "85269984395",
-      "enabled": true,
-      "auto_draft": true,
-      "label": "",
-      "chat_id": "85269984395@s.whatsapp.net",
-      "sender_id": "85269984395@s.whatsapp.net",
-      "push_name": "+852 6998 4395",
-      "last_seen_at": "2026-04-09T09:06:13.914566+00:00"
+      "last_seen_at": "2026-04-10T11:51:18.365669+00:00"
     }
   ],
   "group_reply_targets": []
