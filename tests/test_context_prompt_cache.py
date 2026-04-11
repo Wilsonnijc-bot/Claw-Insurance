@@ -7,7 +7,6 @@ from pathlib import Path
 import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.utils.helpers import sync_workspace_templates
 
 
 class _FakeDatetime(real_datetime):
@@ -144,10 +143,9 @@ def test_runtime_context_includes_insurance_flow_state(tmp_path) -> None:
     assert "Insurance Cycle Active: true" in user_content
 
 
-def test_synced_templates_build_insurance_persona_prompt(tmp_path) -> None:
-    """Workspace templates should encode the insurance persona and missing-facts guardrails."""
+def test_shipped_templates_build_insurance_persona_prompt(tmp_path) -> None:
+    """Shipped templates should encode the insurance persona and missing-facts guardrails."""
     workspace = _make_workspace(tmp_path)
-    sync_workspace_templates(workspace, silent=True)
     builder = ContextBuilder(workspace)
 
     prompt = builder.build_system_prompt()

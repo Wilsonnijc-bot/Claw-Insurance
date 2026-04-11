@@ -116,7 +116,7 @@ python -m nanobot stop-dev
 
 These are the most important implementation facts right now:
 
-- The checked-in `config.json` enables WhatsApp, uses the repo root as the workspace, and sets `channels.whatsapp.deliveryMode` to `"send"`.
+- The shipped config flow is LiteLLM-first and enables WhatsApp with `channels.whatsapp.deliveryMode` set to `"draft"` by default.
 - The active UI/API port is `3456`, and the packaged Docker/compose assets now follow that same backend port.
 - The UI login page is not real credential enforcement. `POST /api/login` uses the username for journaling and ignores the password.
 - The frontend does not persist chat history in browser storage. The rendered transcript always comes from backend session JSONL files.
@@ -138,7 +138,7 @@ These are the most important implementation facts right now:
 5. Node bridge
    Started by the Python CLI when WhatsApp is enabled. It runs from `.bridge-build/` and listens on `ws://127.0.0.1:3001` by default.
 6. Optional privacy gateway
-   Started automatically on `127.0.0.1:8787` when the active model/provider resolves to the custom provider and `privacy_gateway.enabled` is true.
+   Started automatically on `127.0.0.1:8787` when the active model/provider resolves to the configured LiteLLM endpoint and `privacy_gateway.enabled` is true.
 
 ### Components and Roles
 
@@ -223,7 +223,7 @@ The setup command keeps the internal split-config architecture but hides that co
 
 | File | What it stores | When to edit manually |
 | --- | --- | --- |
-| `config.json` | core runtime config such as provider choice, model, API base, and WhatsApp runtime settings | edit when you want to change the main model/provider or other core runtime behavior |
+| `config.json` | core runtime config such as the LiteLLM model, LiteLLM base URL, and WhatsApp runtime settings | edit when you want to change the main model or other core runtime behavior |
 | `supabaseconfig.json` | optional Supabase catalog settings only | edit when catalog URL, keys, tables, or restore behavior change |
 | `googleconfig.json` | optional Google STT settings only | edit when project ID, location, language, or credential path changes |
 
@@ -451,11 +451,11 @@ Approved AI send:
 3. `ApiServer` publishes the outbound bus event
 4. the same WhatsApp send path runs
 
-Because the checked-in config currently uses `deliveryMode: "send"`:
+Because the shipped config flow currently uses `deliveryMode: "draft"` by default:
 
-- outbound bridge commands are `{"type":"send", ...}`
-- the bridge delivers immediately through Baileys
-- the operator is not editing inside WhatsApp Web before send
+- outbound bridge commands are `{"type":"prepare_draft", ...}`
+- the bridge writes the draft into WhatsApp instead of sending immediately
+- the operator remains in the approval loop before anything is sent
 
 If you change the config to `deliveryMode: "draft"`, the same outbound bus events become `prepare_draft` bridge commands and the bridge writes text into the WhatsApp Web compose box instead of sending immediately.
 

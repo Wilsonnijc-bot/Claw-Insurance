@@ -38,8 +38,6 @@ config.json
 googleconfig.json
 supabaseconfig.json
 data/whatsapp_reply_targets.json
-data/contacts/whatsapp.json
-data/whatsapp_groups.csv
 secrets/*.json
 !secrets/.gitkeep
 test_words/*
@@ -48,8 +46,5 @@ test_words/*
 .bridge-build/
 .nanobot-bin/
 .nanobot-legacy/
-AGENTS.md
 HEARTBEAT.md
-SOUL.md
-TOOLS.md
-USER.md
+

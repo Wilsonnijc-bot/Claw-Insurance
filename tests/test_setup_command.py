@@ -43,9 +43,8 @@ def test_setup_first_run_core_only_and_status(monkeypatch, tmp_path: Path) -> No
         input="\n".join(
             [
                 "3456",
-                "custom",
-                "gpt-4.1-mini",
-                "http://localhost:4000/v1",
+                "litellm/kimi-k2.5",
+                "http://43.129.246.127:4000",
                 "sk-test-core",
                 "n",
                 "n",
@@ -62,15 +61,19 @@ def test_setup_first_run_core_only_and_status(monkeypatch, tmp_path: Path) -> No
     assert not (tmp_path / "googleconfig.json").exists()
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    assert payload["providers"]["custom"]["apiKey"] == "sk-test-core"
-    assert payload["providers"]["custom"]["apiBase"] == "http://localhost:4000/v1"
-    assert payload["agents"]["defaults"]["provider"] == "custom"
-    assert payload["agents"]["defaults"]["model"] == "gpt-4.1-mini"
+    assert payload["providers"]["litellm"]["apiKey"] == "sk-test-core"
+    assert payload["providers"]["litellm"]["baseUrl"] == "http://43.129.246.127:4000"
+    assert payload["agents"]["defaults"]["provider"] == "litellm"
+    assert payload["agents"]["defaults"]["model"] == "litellm/kimi-k2.5"
     assert payload["channels"]["whatsapp"]["enabled"] is True
-    assert payload["channels"]["whatsapp"]["deliveryMode"] == "send"
+    assert payload["channels"]["whatsapp"]["deliveryMode"] == "draft"
     assert "catalog" not in payload
 
-    assert (tmp_path / "AGENTS.md").exists()
+    config = load_config()
+    assert config.agents.defaults.provider == "litellm"
+    assert config.agents.defaults.model == "litellm/kimi-k2.5"
+
+    assert (tmp_path / "HEARTBEAT.md").exists()
     assert (tmp_path / "memory" / "GLOBAL.md").exists()
     assert (tmp_path / "media").exists()
 
@@ -91,9 +94,8 @@ def test_setup_supabase_only(monkeypatch, tmp_path: Path) -> None:
         input="\n".join(
             [
                 "3456",
-                "custom",
-                "gpt-4.1-mini",
-                "http://localhost:4000/v1",
+                "litellm/kimi-k2.5",
+                "http://43.129.246.127:4000",
                 "sk-test-supabase",
                 "y",
                 "https://example.supabase.co",
@@ -136,9 +138,9 @@ def test_setup_google_only(monkeypatch, tmp_path: Path) -> None:
         input="\n".join(
             [
                 "3456",
-                "openai",
-                "gpt-4.1-mini",
-                "sk-openai-test",
+                "litellm/kimi-k2.5",
+                "http://43.129.246.127:4000",
+                "sk-litellm-test",
                 "n",
                 "y",
                 "demo-project",
@@ -174,9 +176,9 @@ def test_setup_both_enabled(monkeypatch, tmp_path: Path) -> None:
         input="\n".join(
             [
                 "3456",
-                "openrouter",
-                "openai/gpt-4.1-mini",
-                "sk-or-test",
+                "litellm/kimi-k2.5",
+                "http://43.129.246.127:4000",
+                "sk-litellm-test",
                 "y",
                 "https://example.supabase.co",
                 "service-role-key",
@@ -200,7 +202,7 @@ def test_setup_both_enabled(monkeypatch, tmp_path: Path) -> None:
     assert (tmp_path / "googleconfig.json").exists()
 
     config = load_config()
-    assert config.agents.defaults.provider == "openrouter"
+    assert config.agents.defaults.provider == "litellm"
     assert config.catalog.supabase_project_ref == "example-ref"
 
     google = load_google_config(tmp_path / "googleconfig.json")
@@ -217,14 +219,14 @@ def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Pa
             {
                 "agents": {
                     "defaults": {
-                        "provider": "custom",
-                        "model": "old-model",
+                        "provider": "litellm",
+                        "model": "old-model"
                     }
                 },
                 "providers": {
-                    "custom": {
+                    "litellm": {
                         "apiKey": "old-key",
-                        "apiBase": "http://old.example/v1",
+                        "baseUrl": "http://old.example/v1",
                     }
                 },
                 "tools": {
@@ -266,8 +268,7 @@ def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Pa
         input="\n".join(
             [
                 "4567",
-                "custom",
-                "gpt-4.1-mini",
+                "litellm/kimi-k2.5",
                 "https://new.example/v1",
                 "new-key",
                 "y",
@@ -296,10 +297,16 @@ def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Pa
     supabase_payload = json.loads((tmp_path / "supabaseconfig.json").read_text(encoding="utf-8"))
     google_payload = json.loads((tmp_path / "googleconfig.json").read_text(encoding="utf-8"))
 
-    assert config_payload["providers"]["custom"]["apiKey"] == "new-key"
-    assert config_payload["providers"]["custom"]["apiBase"] == "https://new.example/v1"
-    assert config_payload["agents"]["defaults"]["model"] == "gpt-4.1-mini"
+    assert config_payload["providers"]["litellm"]["apiKey"] == "new-key"
+    assert config_payload["providers"]["litellm"]["baseUrl"] == "https://new.example/v1"
+    assert config_payload["agents"]["defaults"]["provider"] == "litellm"
+    assert config_payload["agents"]["defaults"]["model"] == "litellm/kimi-k2.5"
+    assert config_payload["channels"]["whatsapp"]["deliveryMode"] == "draft"
     assert config_payload["tools"]["exec"]["timeout"] == 123
+
+    config = load_config()
+    assert config.agents.defaults.provider == "litellm"
+    assert config.agents.defaults.model == "litellm/kimi-k2.5"
 
     assert supabase_payload["supabaseUrl"] == "https://old.supabase.co"
     assert supabase_payload["supabaseCatalogTables"] == ["legacy_table"]

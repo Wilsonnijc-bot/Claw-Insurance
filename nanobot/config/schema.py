@@ -236,10 +236,8 @@ class AgentDefaults(Base):
     """Default agent configuration."""
 
     workspace: str = Field(default_factory=lambda: _project_path_str())
-    model: str = "anthropic/claude-opus-4-5"
-    provider: str = (
-        "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
-    )
+    model: str = "litellm/kimi-k2.5"
+    provider: str = "litellm"
     max_tokens: int = 8192
     temperature: float = 0.1
     max_tool_iterations: int = 40
@@ -256,15 +254,26 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
+    base_url: str | None = None
     api_key: str = ""
-    api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+
+    @property
+    def api_base(self) -> str | None:
+        """Legacy compatibility alias for older runtime code paths."""
+        return self.base_url
+
+    @api_base.setter
+    def api_base(self, value: str | None) -> None:
+        self.base_url = value
 
 
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
-    custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
+    litellm: ProviderConfig = Field(
+        default_factory=lambda: ProviderConfig(base_url="http://43.129.246.127:4000")
+    )
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -295,7 +304,7 @@ class PrivacyGatewayConfig(Base):
     """Local privacy gateway configuration.
 
     Privacy pipeline step 1 in ``PRIVACY_PIPELINE.md``.
-    These fields control whether custom-provider traffic is rerouted through
+    These fields control whether LiteLLM endpoint traffic is rerouted through
     the local privacy gateway before leaving the machine.
     """
 
@@ -469,8 +478,8 @@ class Config(BaseSettings):
         from nanobot.providers.registry import find_by_name
 
         p, name = self._match_provider(model)
-        if p and p.api_base:
-            return p.api_base
+        if p and p.base_url:
+            return p.base_url
         # Only gateways get a default api_base here. Standard providers
         # (like Moonshot) set their base URL via env vars in _setup_env
         # to avoid polluting the global litellm.api_base.

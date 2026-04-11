@@ -683,8 +683,7 @@ def onboard():
 
     console.print(f"\n{__logo__} nanobot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]config.json[/cyan]")
-    console.print("     Get one at: https://openrouter.ai/keys")
+    console.print("  1. Add your LiteLLM endpoint and API key to [cyan]config.json[/cyan]")
     console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
 
@@ -704,15 +703,6 @@ def _make_provider(config: Config):
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
         return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    from nanobot.providers.custom_provider import CustomProvider
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
 
     # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
     if provider_name == "azure_openai":
@@ -746,19 +736,19 @@ def _make_provider(config: Config):
 
 
 def _maybe_enable_privacy_gateway(config: Config):
-    """Route custom-provider traffic through the local privacy gateway when enabled."""
+    """Route LiteLLM endpoint traffic through the local privacy gateway when enabled."""
     # Privacy pipeline step 2:
     # - decide whether the privacy gateway should sit in front of the real cloud endpoint
     # - keep the real upstream URL for the child gateway process
-    # - rewrite the active custom provider to point at the local gateway instead
+    # - rewrite the active litellm provider to point at the local gateway instead
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
-    if provider_name != "custom" or not config.privacy_gateway.enabled:
+    if provider_name != "litellm" or not config.privacy_gateway.enabled:
         return None
 
     upstream_base = config.get_api_base(model) or "http://localhost:8000/v1"
     proc = _start_privacy_gateway(config, upstream_base)
-    config.providers.custom.api_base = _privacy_gateway_url(config)
+    config.providers.litellm.base_url = _privacy_gateway_url(config)
     return proc
 
 
@@ -1554,7 +1544,7 @@ def _start_whatsapp_bridge(config: Config):
 
 
 def _start_privacy_gateway(config: Config, upstream_base: str):
-    """Start the local privacy gateway when custom cloud provider routing needs privacy filtering."""
+    """Start the local privacy gateway when LiteLLM endpoint traffic needs privacy filtering."""
     # Privacy pipeline step 2b: boot the local HTTP gateway as a sibling
     # process and wait until /healthz confirms it is ready to proxy traffic.
     import subprocess

@@ -17,7 +17,7 @@ from typing import Any
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.session.client_key import ClientKey
-from nanobot.utils.helpers import detect_image_mime
+from nanobot.utils.helpers import detect_image_mime, load_shipped_template
 
 
 class ContextBuilder:
@@ -179,13 +179,16 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> list[str]:
-        """Load all bootstrap files from workspace."""
+        """Load shipped bootstrap files, with workspace fallback for extras."""
         parts: list[str] = []
 
         for filename in self.BOOTSTRAP_FILES:
-            file_path = self.workspace / filename
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
+            content = load_shipped_template(filename)
+            if content is None:
+                file_path = self.workspace / filename
+                if file_path.exists():
+                    content = file_path.read_text(encoding="utf-8")
+            if content is not None:
                 title = self.BOOTSTRAP_SECTIONS.get(filename, filename)
                 parts.append(f"# {title}\n\n## {filename}\n\n{content}")
 

@@ -1,12 +1,12 @@
 {
-  "supabaseUrl": "https://<project-ref>.supabase.co",
-  "supabaseAnonKey": "<backend service-role key>",
-  "supabaseProjectRef": "<project-ref>",
+  "supabaseUrl": "https://znhoybdxcwlatsoqmbnt.supabase.co",
+  "supabaseAnonKey": "",
+  "supabaseProjectRef": "znhoybdxcwlatsoqmbnt",
   "supabaseCatalogTables": [
     "insurance_products",
     "dental_insurance"
   ],
-  "supabaseManagementToken": "",
+  
   "autoRestorePausedProject": true,
   "restoreTimeoutSeconds": 300,
   "cacheTtlSeconds": 300

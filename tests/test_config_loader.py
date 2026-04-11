@@ -128,3 +128,13 @@ def test_save_config_writes_split_supabase_file_when_externalized(monkeypatch, t
     assert "catalog" not in saved_main
     assert saved_split["supabaseUrl"] == "https://split.supabase.co"
     assert saved_split["supabaseCatalogTables"] == ["insurance_products"]
+def test_config_example_uses_canonical_litellm_shape() -> None:
+    payload = json.loads(Path("config.example.json").read_text(encoding="utf-8"))
+
+    config = Config.model_validate(payload)
+
+    assert config.agents.defaults.provider == "litellm"
+    assert config.agents.defaults.model == "litellm/kimi-k2.5"
+    assert config.gateway.port == 3456
+    assert config.providers.litellm.base_url == "http://43.129.246.127:4000"
+    assert config.channels.whatsapp.delivery_mode == "draft"

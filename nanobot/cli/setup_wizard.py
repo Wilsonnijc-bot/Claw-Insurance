@@ -28,17 +28,8 @@ from nanobot.utils.paths import confine_path, ensure_runtime_dirs, project_root,
 
 console = Console()
 
-_SETUP_PROVIDER_CHOICES = ("custom", "openai", "openrouter")
-_SETUP_PROVIDER_DEFAULT_MODEL = {
-    "custom": "gpt-4.1-mini",
-    "openai": "gpt-4.1-mini",
-    "openrouter": "openai/gpt-4.1-mini",
-}
-_SETUP_PROVIDER_LABELS = {
-    "custom": "custom OpenAI-compatible endpoint",
-    "openai": "OpenAI",
-    "openrouter": "OpenRouter",
-}
+_DEFAULT_LITELLM_MODEL = "litellm/kimi-k2.5"
+_DEFAULT_LITELLM_BASE_URL = "http://43.129.246.127:4000"
 _DEFAULT_SUPABASE_TABLES = ["insurance_products", "dental_insurance"]
 
 
@@ -225,55 +216,31 @@ def _prompt_core_config(
     *,
     has_existing_config: bool,
 ) -> dict[str, Any]:
-    existing_provider = existing_config.agents.defaults.provider
-    if existing_provider == "auto":
-        existing_provider = existing_config.get_provider_name() or "custom"
-    if existing_provider not in _SETUP_PROVIDER_CHOICES:
-        existing_provider = "custom"
-
     api_port = _prompt_port(
         "Backend API port",
         default=int(existing_config.gateway.port or 3456),
     )
-    provider = _prompt_choice(
-        "LLM provider to configure",
-        choices=_SETUP_PROVIDER_CHOICES,
-        default=existing_provider,
-    )
-    model_default = _SETUP_PROVIDER_DEFAULT_MODEL[provider]
-    if has_existing_config and existing_provider == provider:
+    model_default = _DEFAULT_LITELLM_MODEL
+    if has_existing_config and existing_config.agents.defaults.provider == "litellm":
         model_default = existing_config.agents.defaults.model or model_default
     model = _prompt_required_text(
-        "Default model",
+        "LiteLLM model",
         default=model_default,
     )
 
-    api_key = ""
-    api_base: str | None = None
-    if provider == "custom":
-        existing_base = existing_config.providers.custom.api_base or "http://localhost:4000/v1"
-        api_base = _prompt_url("Custom provider API base URL", default=existing_base)
-        api_key = _prompt_secret(
-            "Custom provider API key",
-            existing_value=existing_config.providers.custom.api_key,
-        )
-    elif provider == "openai":
-        api_key = _prompt_secret(
-            "OpenAI API key",
-            existing_value=existing_config.providers.openai.api_key,
-        )
-    elif provider == "openrouter":
-        api_key = _prompt_secret(
-            "OpenRouter API key",
-            existing_value=existing_config.providers.openrouter.api_key,
-        )
+    existing_base = existing_config.providers.litellm.base_url or _DEFAULT_LITELLM_BASE_URL
+    base_url = _prompt_url("LiteLLM endpoint base URL", default=existing_base)
+    api_key = _prompt_secret(
+        "LiteLLM API key",
+        existing_value=existing_config.providers.litellm.api_key,
+    )
 
     return {
         "api_port": api_port,
-        "provider": provider,
+        "provider": "litellm",
         "model": model,
         "api_key": api_key,
-        "api_base": api_base,
+        "base_url": base_url,
     }
 
 
@@ -359,11 +326,6 @@ def _build_core_patch(
     existing_config: Config,
     action: str,
 ) -> dict[str, Any]:
-    provider = answers["provider"]
-    provider_block: dict[str, Any] = {"apiKey": answers["api_key"]}
-    if provider == "custom":
-        provider_block["apiBase"] = answers["api_base"]
-
     workspace_value = existing_config.agents.defaults.workspace
     if action in {"create", "overwrite"} or not str(workspace_value or "").strip():
         workspace_value = str(project_root())
@@ -374,7 +336,7 @@ def _build_core_patch(
         },
         "agents": {
             "defaults": {
-                "provider": provider,
+                "provider": "litellm",
                 "model": answers["model"],
                 "workspace": workspace_value,
             }
@@ -382,19 +344,24 @@ def _build_core_patch(
         "channels": {
             "whatsapp": {
                 "enabled": True,
-                "deliveryMode": "send",
+                "deliveryMode": "draft",
                 "bridgeUrl": "ws://localhost:3001",
             }
         },
         "providers": {
-            provider: provider_block,
+            "litellm": {
+                "baseUrl": answers["base_url"],
+                "apiKey": answers["api_key"],
+            },
         },
     }
 
 
 def _minimal_core_payload(payload: dict[str, Any]) -> dict[str, Any]:
     validated = Config.model_validate(payload)
-    return validated.model_dump(by_alias=True, exclude_defaults=True, exclude_none=True)
+    data = validated.model_dump(by_alias=True, exclude_defaults=True, exclude_none=True)
+    _preserve_explicit_core_fields(data, validated, payload)
+    return data
 
 
 def _minimal_catalog_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -413,16 +380,6 @@ def _prompt_port(label: str, *, default: int) -> int:
         if 1 <= port <= 65535:
             return port
         console.print("[red]Port must be between 1 and 65535.[/red]")
-
-
-def _prompt_choice(label: str, *, choices: tuple[str, ...], default: str) -> str:
-    joined = "/".join(choices)
-    console.print(f"[dim]{label}: {joined}[/dim]")
-    while True:
-        value = typer.prompt(label, default=default).strip().lower()
-        if value in choices:
-            return value
-        console.print(f"[red]Choose one of: {joined}[/red]")
 
 
 def _prompt_required_text(
@@ -605,6 +562,49 @@ def _merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
         else:
             base[key] = copy.deepcopy(value)
     return base
+
+
+def _preserve_explicit_core_fields(
+    serialized: dict[str, Any],
+    validated: Config,
+    original: dict[str, Any],
+) -> None:
+    providers = original.get("providers")
+    if isinstance(providers, dict) and "litellm" in providers:
+        serialized.setdefault("providers", {})["litellm"] = validated.providers.litellm.model_dump(
+            by_alias=True,
+            exclude_none=True,
+        )
+
+    agents = original.get("agents")
+    defaults = agents.get("defaults") if isinstance(agents, dict) else None
+    if isinstance(defaults, dict):
+        explicit_defaults: dict[str, Any] = {}
+        if "provider" in defaults:
+            explicit_defaults["provider"] = validated.agents.defaults.provider
+        if "model" in defaults:
+            explicit_defaults["model"] = validated.agents.defaults.model
+        if explicit_defaults:
+            serialized.setdefault("agents", {})["defaults"] = {
+                **serialized.get("agents", {}).get("defaults", {}),
+                **explicit_defaults,
+            }
+
+    channels = original.get("channels")
+    whatsapp = channels.get("whatsapp") if isinstance(channels, dict) else None
+    if isinstance(whatsapp, dict):
+        explicit_whatsapp: dict[str, Any] = {}
+        if "enabled" in whatsapp:
+            explicit_whatsapp["enabled"] = validated.channels.whatsapp.enabled
+        if "deliveryMode" in whatsapp:
+            explicit_whatsapp["deliveryMode"] = validated.channels.whatsapp.delivery_mode
+        if "bridgeUrl" in whatsapp:
+            explicit_whatsapp["bridgeUrl"] = validated.channels.whatsapp.bridge_url
+        if explicit_whatsapp:
+            serialized.setdefault("channels", {})["whatsapp"] = {
+                **serialized.get("channels", {}).get("whatsapp", {}),
+                **explicit_whatsapp,
+            }
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

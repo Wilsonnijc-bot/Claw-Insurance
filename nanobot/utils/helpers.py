@@ -3,6 +3,7 @@
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from nanobot.utils.paths import confine_path, project_root
 
@@ -119,14 +120,33 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
     return chunks
 
 
-def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to workspace. Only creates missing files."""
+def _template_root() -> Any | None:
     from importlib.resources import files as pkg_files
+
     try:
         tpl = pkg_files("nanobot") / "templates"
     except Exception:
-        return []
+        return None
     if not tpl.is_dir():
+        return None
+    return tpl
+
+
+def load_shipped_template(name: str) -> str | None:
+    """Return shipped template content by filename when available."""
+    tpl = _template_root()
+    if tpl is None:
+        return None
+    path = tpl / name
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
+    """Create mutable workspace scaffolding from bundled templates when missing."""
+    tpl = _template_root()
+    if tpl is None:
         return []
 
     added: list[str] = []
@@ -138,9 +158,11 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
         added.append(str(dest.relative_to(workspace)))
 
-    for item in tpl.iterdir():
-        if item.name.endswith(".md"):
-            _write(item, workspace / item.name)
+    # Prompt/persona files now load directly from bundled shipped templates.
+    # Only create mutable workspace-local files here.
+    heartbeat = tpl / "HEARTBEAT.md"
+    if heartbeat.is_file():
+        _write(heartbeat, workspace / "HEARTBEAT.md")
     # Per-client memory dirs are created on-demand by MemoryStore.
     # Only create the global knowledge file placeholder here.
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "GLOBAL.md")
