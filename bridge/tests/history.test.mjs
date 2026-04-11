@@ -497,6 +497,33 @@ class FakeSpawnedProcess {
   unref() {}
 }
 
+class FakeErrorSpawnedProcess {
+  constructor(message) {
+    this.exitCode = null;
+    this.killed = false;
+    this.listeners = new Map();
+    queueMicrotask(() => {
+      this.emit('error', new Error(message));
+    });
+  }
+
+  once(event, listener) {
+    this.listeners.set(event, listener);
+    return this;
+  }
+
+  emit(event, value) {
+    const listener = this.listeners.get(event);
+    if (!listener) {
+      return;
+    }
+    this.listeners.delete(event);
+    listener(value);
+  }
+
+  unref() {}
+}
+
 test('scrapeHistory collects visible and older messages without sending anything', async () => {
   const page = new FakePage({
     searchMatch: true,
@@ -692,6 +719,75 @@ test('scrapeHistory reuses an attached CDP page when it is already usable', asyn
   assert.equal(result.messages[0].content, 'Hello from reused session');
   assert.equal(spawnCalls.length, 0);
   assert.deepEqual(connector.connectCalls, ['http://127.0.0.1:9222']);
+});
+
+test('scrapeHistory asks the macOS helper to launch or adopt a host CDP browser before falling back to local spawn', async () => {
+  const page = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchMatch: true,
+    historySnapshots: [
+      [
+        {
+          id: 'false_msg-1',
+          content: 'Hello from helper-launched browser',
+          fromMe: false,
+          metaText: '[10:11, 9/3/2026] Alice:',
+        },
+      ],
+    ],
+  });
+  const connector = new FakeBrowserConnector(page, { failConnectCalls: 1 });
+  const spawnCalls = [];
+  const helperCalls = [];
+  const resolvedHosts = [];
+  const composer = new HistoryParser(
+    '/tmp/wa-web',
+    connector,
+    'cdp',
+    'http://host.docker.internal:9222',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return new FakeSpawnedProcess();
+    },
+    'http://127.0.0.1:9230',
+    '/host/wa-profile',
+    {
+      async ensureBrowser(request) {
+        helperCalls.push(request);
+        return {
+          status: 'launched',
+          detail: 'Chrome window opened on the host.',
+          endpointUrl: request.endpointUrl,
+        };
+      },
+    },
+    async (hostname) => {
+      resolvedHosts.push(hostname);
+      return '192.168.5.2';
+    },
+  );
+
+  const result = await composer.scrapeHistory(
+    { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+  );
+
+  assert.equal(result.status, 'history_scraped');
+  assert.equal(result.messages[0].content, 'Hello from helper-launched browser');
+  assert.equal(spawnCalls.length, 0);
+  assert.deepEqual(helperCalls, [
+    {
+      helperUrl: 'http://127.0.0.1:9230',
+      endpointUrl: 'http://host.docker.internal:9222',
+      profileDir: '/host/wa-profile',
+      startUrl: 'https://web.whatsapp.com/',
+      chromePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      forceNewWindow: false,
+    },
+  ]);
+  assert.deepEqual(resolvedHosts, ['host.docker.internal']);
+  assert.ok(connector.connectCalls.length >= 2);
+  assert.ok(connector.connectCalls.every((value) => value.startsWith('http://192.168.5.2:9222')));
 });
 
 test('scrapeHistory waits for refreshed search results and does not click stale pre-search rows', async () => {
@@ -1026,6 +1122,44 @@ test('scrapeHistory retries in a fresh CDP window when the attached page is not 
   }
 });
 
+test('scrapeHistory reports window_launch_failed when the macOS helper cannot launch or reuse host Chrome', async () => {
+  const page = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: false,
+  });
+  const connector = new FakeBrowserConnector(page, { failConnectCalls: Number.POSITIVE_INFINITY });
+  const helperCalls = [];
+  const spawnCalls = [];
+  const composer = new HistoryParser(
+    '/tmp/wa-web',
+    connector,
+    'cdp',
+    'http://127.0.0.1:9222',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return new FakeSpawnedProcess();
+    },
+    'http://127.0.0.1:9230',
+    '/host/wa-profile',
+    {
+      async ensureBrowser(request) {
+        helperCalls.push(request);
+        throw new Error('Mac CDP helper is not installed/running at http://127.0.0.1:9230.');
+      },
+    },
+  );
+
+  const result = await composer.scrapeHistory(
+    { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+  );
+
+  assert.equal(result.status, 'window_launch_failed');
+  assert.match(result.detail, /Mac CDP helper is not installed\/running/);
+  assert.equal(spawnCalls.length, 0);
+  assert.equal(helperCalls.length, 2);
+});
+
 test('scrapeHistory returns login_required after a fresh-window retry when WhatsApp Web is still not ready', async () => {
   const firstPage = new FakePage({
     initialUrl: 'https://web.whatsapp.com/',
@@ -1082,9 +1216,38 @@ test('scrapeHistory returns login_required after a fresh-window retry when Whats
     );
 
     assert.equal(result.status, 'login_required');
+    assert.match(result.detail, /Chrome window opened/);
     assert.equal(spawnCalls.length, 1);
     assert.ok(connector.connectCalls.length >= 2);
   } finally {
     Date.now = originalDateNow;
   }
+});
+
+test('scrapeHistory maps local spawn ENOENT failures to window_launch_failed instead of login_required', async () => {
+  const page = new FakePage({
+    initialUrl: 'https://web.whatsapp.com/',
+    searchVisible: false,
+  });
+  const connector = new FakeBrowserConnector(page, { failConnectCalls: Number.POSITIVE_INFINITY });
+  const spawnCalls = [];
+  const composer = new HistoryParser(
+    '/tmp/wa-web',
+    connector,
+    'cdp',
+    'http://127.0.0.1:9222',
+    'google-chrome',
+    (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      return new FakeErrorSpawnedProcess('spawn google-chrome ENOENT');
+    },
+  );
+
+  const result = await composer.scrapeHistory(
+    { chatId: '123@s.whatsapp.net', phone: '1234567890', searchTerms: ['Alice'] },
+  );
+
+  assert.equal(result.status, 'window_launch_failed');
+  assert.match(result.detail, /No Chrome\/Chromium executable was found for CDP launch/);
+  assert.equal(spawnCalls.length, 2);
 });

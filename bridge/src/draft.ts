@@ -1,11 +1,14 @@
 import {
   type BrowserConnector,
+  type CdpHelperClient,
+  type CdpHostResolver,
   type BrowserLauncher,
   type BrowserMode,
   type ChatTarget,
   COMPOSE_BOX_SELECTORS,
   DEFAULT_BROWSER_CONNECTOR,
   DEFAULT_BROWSER_LAUNCHER,
+  DEFAULT_CDP_HELPER_CLIENT,
   READY_CHECK_TIMEOUT_MS,
   READY_TIMEOUT_MS,
   SEARCH_TIMEOUT_MS,
@@ -33,6 +36,10 @@ export class DraftComposer extends WhatsAppWebSession {
     cdpEndpoint: string = 'http://127.0.0.1:9222',
     cdpChromePath: string = process.env.WEB_CDP_CHROME_PATH || '',
     browserLauncher: BrowserLauncher = DEFAULT_BROWSER_LAUNCHER,
+    cdpHelperUrl: string = process.env.WEB_CDP_HELPER_URL || '',
+    hostProfileDir: string = process.env.WEB_HOST_PROFILE_DIR || '',
+    cdpHelperClient: CdpHelperClient = DEFAULT_CDP_HELPER_CLIENT,
+    cdpHostResolver?: CdpHostResolver,
   ) {
     super(
       userDataDir,
@@ -41,6 +48,10 @@ export class DraftComposer extends WhatsAppWebSession {
       cdpEndpoint,
       cdpChromePath,
       browserLauncher,
+      cdpHelperUrl,
+      hostProfileDir,
+      cdpHelperClient,
+      cdpHostResolver,
     );
   }
 

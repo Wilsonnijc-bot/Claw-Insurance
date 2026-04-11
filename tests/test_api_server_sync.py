@@ -49,6 +49,15 @@ class _FakeWhatsApp:
         return dict(self.result)
 
 
+class _BridgeStatusWhatsApp(_FakeWhatsApp):
+    def __init__(self, result: dict[str, object]) -> None:
+        super().__init__(result)
+        self.bridge_status_calls: list[tuple[bool, str]] = []
+
+    def _set_bridge_status(self, is_error: bool, message: str) -> None:
+        self.bridge_status_calls.append((is_error, message))
+
+
 def _draft_cdp_config(tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
         channels=SimpleNamespace(
@@ -191,6 +200,82 @@ async def test_api_sync_history_scraped_without_verified_session_stays_backend_u
         "requestId": "req-456",
     }
     server._append_journal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_api_sync_returns_503_for_window_launch_failures_and_sets_bridge_error(tmp_path: Path) -> None:
+    whatsapp = _BridgeStatusWhatsApp(
+        {
+            "status": "window_launch_failed",
+            "detail": "Mac CDP helper is not installed/running at http://host.docker.internal:9230.",
+        }
+    )
+    config = SimpleNamespace(
+        channels=SimpleNamespace(
+            whatsapp=SimpleNamespace(reply_targets_file=str(tmp_path / "reply_targets.json"))
+        )
+    )
+    channel_manager = SimpleNamespace(
+        get_channel=lambda name: whatsapp if name == "whatsapp" else None,
+        enabled_channels=[],
+    )
+    server = ApiServer(
+        config=config,
+        bus=MessageBus(),
+        session_manager=_FakeSessionManager(tmp_path),
+        agent=None,
+        channel_manager=channel_manager,
+    )
+    server._broadcast_current_whatsapp_bridge_status = AsyncMock()
+
+    response = await server._handle_sync(SimpleNamespace(match_info={"phone": "1234567890"}))
+
+    assert response.status == 503
+    assert json.loads(response.text) == {
+        "error": "Mac CDP helper is not installed/running at http://host.docker.internal:9230.",
+        "code": "window_launch_failed",
+    }
+    assert whatsapp.bridge_status_calls == [
+        (True, "Mac CDP helper is not installed/running at http://host.docker.internal:9230.")
+    ]
+    server._broadcast_current_whatsapp_bridge_status.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_api_sync_returns_409_for_login_required_without_bridge_error_notice(tmp_path: Path) -> None:
+    whatsapp = _BridgeStatusWhatsApp(
+        {
+            "status": "login_required",
+            "detail": "Chrome window opened. Scan the WhatsApp Web QR code in that window, wait for login to finish, then retry sync.",
+        }
+    )
+    config = SimpleNamespace(
+        channels=SimpleNamespace(
+            whatsapp=SimpleNamespace(reply_targets_file=str(tmp_path / "reply_targets.json"))
+        )
+    )
+    channel_manager = SimpleNamespace(
+        get_channel=lambda name: whatsapp if name == "whatsapp" else None,
+        enabled_channels=[],
+    )
+    server = ApiServer(
+        config=config,
+        bus=MessageBus(),
+        session_manager=_FakeSessionManager(tmp_path),
+        agent=None,
+        channel_manager=channel_manager,
+    )
+    server._broadcast_current_whatsapp_bridge_status = AsyncMock()
+
+    response = await server._handle_sync(SimpleNamespace(match_info={"phone": "1234567890"}))
+
+    assert response.status == 409
+    assert json.loads(response.text) == {
+        "error": "Chrome window opened. Scan the WhatsApp Web QR code in that window, wait for login to finish, then retry sync.",
+        "code": "login_required",
+    }
+    assert whatsapp.bridge_status_calls == [(False, "")]
+    server._broadcast_current_whatsapp_bridge_status.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,8 @@ const AUTH_DIR = process.env.AUTH_DIR || join(process.cwd(), 'whatsapp-auth');
 const WEB_BROWSER_MODE = (process.env.WEB_BROWSER_MODE || 'cdp') as 'cdp' | 'launch';
 const WEB_CDP_URL = process.env.WEB_CDP_URL || 'http://127.0.0.1:9222';
 const WEB_CDP_CHROME_PATH = process.env.WEB_CDP_CHROME_PATH || '';
+const WEB_CDP_HELPER_URL = process.env.WEB_CDP_HELPER_URL || '';
+const WEB_HOST_PROFILE_DIR = process.env.WEB_HOST_PROFILE_DIR || '';
 const WEB_PROFILE_DIR = process.env.WEB_PROFILE_DIR || join(process.cwd(), 'whatsapp-web');
 const TOKEN = process.env.BRIDGE_TOKEN || undefined;
 
@@ -38,6 +40,12 @@ if (WEB_BROWSER_MODE === 'cdp') {
   console.log(`🔌 CDP endpoint: ${WEB_CDP_URL}`);
   if (WEB_CDP_CHROME_PATH) {
     console.log(`🌐 CDP Chrome path: ${WEB_CDP_CHROME_PATH}`);
+  }
+  if (WEB_CDP_HELPER_URL) {
+    console.log(`🧩 CDP helper: ${WEB_CDP_HELPER_URL}`);
+  }
+  if (WEB_HOST_PROFILE_DIR) {
+    console.log(`🗂️ Host CDP profile: ${WEB_HOST_PROFILE_DIR}`);
   }
 } else {
   console.log(`🗂️ Playwright profile: ${WEB_PROFILE_DIR}`);
@@ -51,6 +59,8 @@ const server = new BridgeServer(
   WEB_BROWSER_MODE,
   WEB_CDP_URL,
   WEB_CDP_CHROME_PATH,
+  WEB_CDP_HELPER_URL,
+  WEB_HOST_PROFILE_DIR,
 );
 
 // Handle graceful shutdown

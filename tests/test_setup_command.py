@@ -34,6 +34,16 @@ def _write_google_credential(path: Path) -> None:
     )
 
 
+def _pick_existing(tmp_path: Path, preferred: str, legacy: str) -> Path:
+    preferred_path = tmp_path / preferred
+    if preferred_path.exists():
+        return preferred_path
+    legacy_path = tmp_path / legacy
+    if legacy_path.exists():
+        return legacy_path
+    return preferred_path
+
+
 def test_setup_first_run_core_only_and_status(monkeypatch, tmp_path: Path) -> None:
     _use_temp_project(monkeypatch, tmp_path)
 
@@ -57,8 +67,8 @@ def test_setup_first_run_core_only_and_status(monkeypatch, tmp_path: Path) -> No
 
     config_path = tmp_path / "config.json"
     assert config_path.exists()
-    assert not (tmp_path / "supabaseconfig.json").exists()
-    assert not (tmp_path / "googleconfig.json").exists()
+    assert not (tmp_path / "supabase.json").exists()
+    assert not (tmp_path / "google.json").exists()
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     assert payload["providers"]["litellm"]["apiKey"] == "sk-test-core"
@@ -111,8 +121,10 @@ def test_setup_supabase_only(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.stdout
 
-    supabase_path = tmp_path / "supabaseconfig.json"
-    google_path = tmp_path / "googleconfig.json"
+    supabase_path = _pick_existing(tmp_path, "supabase.json", "supabaseconfig.json")
+    google_path = _pick_existing(tmp_path, "google.json", "googleconfig.json")
+    assert "supabase.json" in result.stdout
+    assert "google.json" in result.stdout
     assert supabase_path.exists()
     assert not google_path.exists()
 
@@ -155,8 +167,10 @@ def test_setup_google_only(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.stdout
 
-    google_path = tmp_path / "googleconfig.json"
-    supabase_path = tmp_path / "supabaseconfig.json"
+    google_path = _pick_existing(tmp_path, "google.json", "googleconfig.json")
+    supabase_path = _pick_existing(tmp_path, "supabase.json", "supabaseconfig.json")
+    assert "supabase.json" in result.stdout
+    assert "google.json" in result.stdout
     assert google_path.exists()
     assert not supabase_path.exists()
 
@@ -198,14 +212,18 @@ def test_setup_both_enabled(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.stdout
     assert (tmp_path / "config.json").exists()
-    assert (tmp_path / "supabaseconfig.json").exists()
-    assert (tmp_path / "googleconfig.json").exists()
+    assert "supabase.json" in result.stdout
+    assert "google.json" in result.stdout
+    supabase_path = _pick_existing(tmp_path, "supabase.json", "supabaseconfig.json")
+    google_path = _pick_existing(tmp_path, "google.json", "googleconfig.json")
+    assert supabase_path.exists()
+    assert google_path.exists()
 
     config = load_config()
     assert config.agents.defaults.provider == "litellm"
     assert config.catalog.supabase_project_ref == "znhoybdxcwlatsoqmbnt"
 
-    google = load_google_config(tmp_path / "googleconfig.json")
+    google = load_google_config(google_path)
     assert google.project_id == "double-scholar-487115-b1"
 
 def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Path) -> None:

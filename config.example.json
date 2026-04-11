@@ -2,7 +2,7 @@
   "providers": {
     "litellm": {
       "baseUrl": "https://api.moonshot.cn/v1",
-      "apiKey": "YOURAPIKEY"
+      "apiKey": "sk-your-real-api-key"
     }
   },
   "agents": {
@@ -14,7 +14,7 @@
   "channels": {
     "whatsapp": {
       "enabled": true,
-      "deliveryMode": "draft",
+      "deliveryMode": "send",
       "bridgeUrl": "ws://localhost:3001"
     }
   }

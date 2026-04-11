@@ -2,6 +2,7 @@ import os
 import signal
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from nanobot.cli.commands import (
     _stop_local_dev_runtime,
 )
 from nanobot.config.schema import Config
+from nanobot.utils.paths import project_root
 
 
 def test_build_whatsapp_bridge_env_uses_configured_values() -> None:
@@ -42,6 +44,8 @@ def test_build_whatsapp_bridge_env_uses_configured_values() -> None:
     assert env["WEB_CDP_URL"] == "http://127.0.0.1:9333"
     assert env["WEB_CDP_CHROME_PATH"] == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     assert env["WEB_PROFILE_DIR"] == "~/wa-profile"
+    assert env["WEB_HOST_PROFILE_DIR"] == str(project_root() / "whatsapp-web")
+    assert env["AUTH_DIR"] == str(project_root() / "whatsapp-auth")
     assert env["PATH"] == os.environ["PATH"]
 
 
@@ -53,6 +57,23 @@ def test_build_whatsapp_bridge_env_prefers_runtime_env_in_source() -> None:
     assert '_set_runtime_value("WEB_CDP_URL", wa.web_cdp_url)' in source
     assert '_set_runtime_value("WEB_CDP_CHROME_PATH", wa.web_cdp_chrome_path)' in source
     assert '_set_runtime_value("WEB_PROFILE_DIR", wa.web_profile_dir)' in source
+    assert '_set_runtime_value("WEB_HOST_PROFILE_DIR", str(_project_root / "whatsapp-web"))' in source
+    assert '_set_runtime_value("AUTH_DIR", str(_project_root / "whatsapp-auth"))' in source
+    assert 'WEB_CDP_HELPER_URL' in source
+
+
+def test_build_whatsapp_bridge_env_auto_detects_healthy_macos_helper(monkeypatch) -> None:
+    config = Config.model_validate({"channels": {"whatsapp": {"enabled": True}}})
+
+    import nanobot.macos_cdp_helper as helper
+
+    monkeypatch.setattr(commands.sys, "platform", "darwin")
+    monkeypatch.delenv("WEB_CDP_HELPER_URL", raising=False)
+    monkeypatch.setattr(helper, "request_helper_health", lambda helper_url, timeout_s=0.2: True)
+
+    env = _build_whatsapp_bridge_env(config)
+
+    assert env["WEB_CDP_HELPER_URL"] == helper.DEFAULT_HELPER_URL
 
 
 def test_whatsapp_web_gateway_entry_routes_to_gateway(monkeypatch) -> None:
@@ -73,21 +94,75 @@ def test_whatsapp_web_gateway_entry_routes_to_gateway(monkeypatch) -> None:
     ]
 
 
-def test_channels_whatsapp_web_reports_parse_managed_cdp(monkeypatch) -> None:
+def test_channels_whatsapp_web_uses_helper_when_available(monkeypatch) -> None:
     printed: list[str] = []
+    helper_calls: list[dict[str, object]] = []
 
     def fake_print(message: str, *args, **kwargs) -> None:
         printed.append(str(message))
 
     monkeypatch.setattr(commands.console, "print", fake_print)
+    monkeypatch.setattr(commands.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        commands,
+        "_build_whatsapp_bridge_env",
+        lambda _config: {
+            "WEB_CDP_URL": "http://127.0.0.1:9222",
+            "WEB_CDP_HELPER_URL": "http://127.0.0.1:9230",
+            "WEB_HOST_PROFILE_DIR": "/tmp/host-wa-profile",
+            "WEB_CDP_CHROME_PATH": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        },
+    )
 
-    with pytest.raises(commands.typer.Exit) as exc:
-        commands.channels_whatsapp_web()
+    import nanobot.config.loader as loader
+    import nanobot.macos_cdp_helper as helper
 
-    assert exc.value.exit_code == 1
-    assert printed == [
-        "[red]Standalone WhatsApp Web CDP launch is disabled. CDP is managed only during WhatsApp history parsing.[/red]"
+    monkeypatch.setattr(loader, "load_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(helper, "request_helper_health", lambda helper_url, timeout_s=0.5: True)
+
+    def fake_request_helper_ensure(
+        helper_url: str,
+        *,
+        endpoint_url: str,
+        profile_dir: str,
+        start_url: str,
+        chrome_path: str,
+        force_new_window: bool,
+        timeout_s: float = 20.0,
+    ) -> dict[str, str]:
+        helper_calls.append(
+            {
+                "helper_url": helper_url,
+                "endpoint_url": endpoint_url,
+                "profile_dir": profile_dir,
+                "start_url": start_url,
+                "chrome_path": chrome_path,
+                "force_new_window": force_new_window,
+                "timeout_s": timeout_s,
+            }
+        )
+        return {
+            "status": "launched",
+            "detail": "Chrome window opened.",
+            "endpointUrl": endpoint_url,
+        }
+
+    monkeypatch.setattr(helper, "request_helper_ensure", fake_request_helper_ensure)
+
+    commands.channels_whatsapp_web(new_window=True)
+
+    assert helper_calls == [
+        {
+            "helper_url": "http://127.0.0.1:9230",
+            "endpoint_url": "http://127.0.0.1:9222",
+            "profile_dir": "/tmp/host-wa-profile",
+            "start_url": helper.DEFAULT_START_URL,
+            "chrome_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "force_new_window": True,
+            "timeout_s": 20.0,
+        }
     ]
+    assert any("Opened a Chrome CDP window" in line for line in printed)
 
 
 def test_bridge_needs_refresh_when_source_is_newer(tmp_path: Path) -> None:

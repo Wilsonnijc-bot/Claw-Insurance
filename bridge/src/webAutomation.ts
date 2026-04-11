@@ -1,4 +1,5 @@
 import { spawn as spawnProcess, type ChildProcess, type SpawnOptions } from 'child_process';
+import { lookup as dnsLookup } from 'dns/promises';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -74,8 +75,69 @@ export type BrowserLauncher = (
   options: SpawnOptions,
 ) => SpawnedBrowserProcess;
 
+export interface CdpHelperEnsureRequest {
+  helperUrl: string;
+  endpointUrl: string;
+  profileDir: string;
+  startUrl: string;
+  chromePath?: string;
+  forceNewWindow?: boolean;
+}
+
+export interface CdpHelperEnsureResult {
+  status: 'reused' | 'launched' | 'failed';
+  detail?: string;
+  endpointUrl?: string;
+}
+
+export interface CdpHelperClient {
+  ensureBrowser(request: CdpHelperEnsureRequest): Promise<CdpHelperEnsureResult>;
+}
+
+export type CdpHostResolver = (hostname: string) => Promise<string>;
+
 export const DEFAULT_BROWSER_CONNECTOR: BrowserConnector = chromium;
 export const DEFAULT_BROWSER_LAUNCHER: BrowserLauncher = spawnProcess as BrowserLauncher;
+export const DEFAULT_CDP_HOST_RESOLVER: CdpHostResolver = async (hostname: string) => {
+  const result = await dnsLookup(hostname);
+  return result.address;
+};
+export const DEFAULT_CDP_HELPER_CLIENT: CdpHelperClient = {
+  async ensureBrowser({
+    helperUrl,
+    endpointUrl,
+    profileDir,
+    startUrl,
+    chromePath,
+    forceNewWindow,
+  }: CdpHelperEnsureRequest): Promise<CdpHelperEnsureResult> {
+    const response = await fetch(`${helperUrl.replace(/\/+$/, '')}/v1/cdp/ensure`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        endpointUrl,
+        profileDir,
+        startUrl,
+        chromePath,
+        forceNewWindow: Boolean(forceNewWindow),
+      }),
+    });
+    const rawBody = await response.text();
+    const payload = rawBody ? JSON.parse(rawBody) as Record<string, unknown> : {};
+    if (!response.ok) {
+      const detail = typeof payload.detail === 'string' ? payload.detail : `CDP helper returned HTTP ${response.status}.`;
+      throw new Error(detail);
+    }
+    const status = payload.status === 'reused' || payload.status === 'launched'
+      ? payload.status
+      : 'failed';
+    return {
+      status,
+      detail: typeof payload.detail === 'string' ? payload.detail : '',
+      endpointUrl: typeof payload.endpointUrl === 'string' ? payload.endpointUrl : endpointUrl,
+    };
+  },
+};
 
 export const WHATSAPP_WEB_URL = 'https://web.whatsapp.com/';
 export const READY_TIMEOUT_MS = 15000;
@@ -144,6 +206,8 @@ export class WhatsAppWebSession {
   protected queue: Promise<void> = Promise.resolve();
   protected launchedCdpProcess: SpawnedBrowserProcess | null = null;
   protected preferNewestAttachedPage: boolean = false;
+  protected lastCdpAcquisition: 'attached' | 'helper_reused' | 'helper_launched' | 'local_launch' | null = null;
+  protected resolvedCdpEndpoint: string | null = null;
 
   constructor(
     protected readonly userDataDir: string,
@@ -152,6 +216,10 @@ export class WhatsAppWebSession {
     protected readonly cdpEndpoint: string = 'http://127.0.0.1:9222',
     protected readonly cdpChromePath: string = process.env.WEB_CDP_CHROME_PATH || '',
     protected readonly browserLauncher: BrowserLauncher = DEFAULT_BROWSER_LAUNCHER,
+    protected readonly cdpHelperUrl: string = process.env.WEB_CDP_HELPER_URL || '',
+    protected readonly hostProfileDir: string = process.env.WEB_HOST_PROFILE_DIR || '',
+    protected readonly cdpHelperClient: CdpHelperClient = DEFAULT_CDP_HELPER_CLIENT,
+    protected readonly cdpHostResolver: CdpHostResolver = DEFAULT_CDP_HOST_RESOLVER,
   ) {}
 
   async stop(): Promise<void> {
@@ -167,6 +235,8 @@ export class WhatsAppWebSession {
     this.browser = null;
     this.context = null;
     this.page = null;
+    this.lastCdpAcquisition = null;
+    this.resolvedCdpEndpoint = null;
   }
 
   protected async _ensurePage(): Promise<PageDriver> {
@@ -252,14 +322,30 @@ export class WhatsAppWebSession {
   }
 
   protected async _connectOrLaunchCdpBrowser(): Promise<BrowserDriver> {
+    this.lastCdpAcquisition = null;
     const attached = await this._tryConnectOverCDP();
     if (attached) {
+      this.lastCdpAcquisition = 'attached';
       return attached;
+    }
+
+    const helperResult = await this._ensureCdpBrowserViaHelper();
+    if (helperResult) {
+      const acquired = await this._waitForCDPBrowser();
+      if (acquired) {
+        this.lastCdpAcquisition = helperResult.status === 'launched' ? 'helper_launched' : 'helper_reused';
+        return acquired;
+      }
+      throw new Error(
+        helperResult.detail
+        || `Host Chrome CDP is not reachable at ${this.cdpEndpoint} after the macOS helper ran.`,
+      );
     }
 
     await this._launchCdpBrowser();
     const launched = await this._waitForCDPBrowser();
     if (launched) {
+      this.lastCdpAcquisition = 'local_launch';
       return launched;
     }
 
@@ -270,7 +356,7 @@ export class WhatsAppWebSession {
 
   protected async _tryConnectOverCDP(): Promise<BrowserDriver | null> {
     try {
-      return await this.browserConnector.connectOverCDP(this.cdpEndpoint);
+      return await this.browserConnector.connectOverCDP(await this._effectiveCdpEndpoint());
     } catch {
       return null;
     }
@@ -286,6 +372,36 @@ export class WhatsAppWebSession {
       await sleep(CDP_CONNECT_RETRY_WAIT_MS);
     }
     return null;
+  }
+
+  protected async _ensureCdpBrowserViaHelper(forceNewWindow: boolean = false): Promise<CdpHelperEnsureResult | null> {
+    const helperUrl = this.cdpHelperUrl.trim();
+    if (!helperUrl) {
+      return null;
+    }
+
+    try {
+      const result = await this.cdpHelperClient.ensureBrowser({
+        helperUrl,
+        endpointUrl: this.cdpEndpoint,
+        profileDir: this._effectiveHostProfileDir(),
+        startUrl: WHATSAPP_WEB_URL,
+        chromePath: this.cdpChromePath.trim() || undefined,
+        forceNewWindow,
+      });
+      if (result.status === 'failed') {
+        throw new Error(
+          result.detail
+          || `Mac CDP helper failed to launch or reuse Chrome for ${this.cdpEndpoint}.`,
+        );
+      }
+      return result;
+    } catch (error) {
+      const detail = this._stringifyError(error);
+      throw new Error(
+        `Mac CDP helper is not installed/running at ${helperUrl}, or it could not launch Chrome successfully. ${detail}`.trim(),
+      );
+    }
   }
 
   protected async _launchCdpBrowser(forceNewWindow: boolean = false): Promise<void> {
@@ -328,7 +444,7 @@ export class WhatsAppWebSession {
         }
         settled = true;
         if (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
+          reject(this._normalizeBrowserLaunchError(error, executable));
           return;
         }
         resolve();
@@ -340,6 +456,34 @@ export class WhatsAppWebSession {
     });
 
     child.unref();
+  }
+
+  protected _effectiveHostProfileDir(): string {
+    const raw = (this.hostProfileDir || this.userDataDir).trim();
+    return String(this._expandHome(raw));
+  }
+
+  protected async _effectiveCdpEndpoint(): Promise<string> {
+    if (this.resolvedCdpEndpoint) {
+      return this.resolvedCdpEndpoint;
+    }
+
+    try {
+      const parsed = new URL(this.cdpEndpoint);
+      const hostname = String(parsed.hostname || '').trim();
+      if (!hostname || this._isLocalOrIpHost(hostname)) {
+        return this.cdpEndpoint;
+      }
+      const resolvedHost = await this.cdpHostResolver(hostname);
+      if (!resolvedHost) {
+        return this.cdpEndpoint;
+      }
+      parsed.hostname = resolvedHost;
+      this.resolvedCdpEndpoint = parsed.toString();
+      return this.resolvedCdpEndpoint;
+    } catch {
+      return this.cdpEndpoint;
+    }
   }
 
   protected _parseCdpEndpoint(): { hostname: string; port: string } {
@@ -409,6 +553,44 @@ export class WhatsAppWebSession {
 
   protected _looksLikePath(value: string): boolean {
     return value.includes('/') || value.includes('\\');
+  }
+
+  protected _isLocalOrIpHost(hostname: string): boolean {
+    return hostname === 'localhost'
+      || hostname === '127.0.0.1'
+      || hostname === '::1'
+      || /^[0-9.]+$/.test(hostname)
+      || hostname.includes(':');
+  }
+
+  protected _normalizeBrowserLaunchError(error: unknown, executable: string): Error {
+    const detail = this._stringifyError(error);
+    if (detail.includes('ENOENT')) {
+      return new Error(
+        `No Chrome/Chromium executable was found for CDP launch. Tried ${executable}.`,
+      );
+    }
+    return new Error(`Failed to launch the CDP browser: ${detail}`);
+  }
+
+  protected _stringifyError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message || String(error);
+    }
+    return String(error || '');
+  }
+
+  protected _cdpLoginRequiredDetail(): string {
+    switch (this.lastCdpAcquisition) {
+      case 'helper_launched':
+      case 'local_launch':
+        return 'Chrome window opened. Scan the WhatsApp Web QR code in that window, wait for login to finish, then retry sync.';
+      case 'helper_reused':
+      case 'attached':
+        return 'WhatsApp Web is not logged in or not ready in the reusable CDP browser. Finish login there and retry sync.';
+      default:
+        return 'WhatsApp Web is not logged in or not ready for history parsing.';
+    }
   }
 
   protected _pickAttachedContext(browser: BrowserDriver, preferNewest: boolean = false): BrowserContextDriver | null {

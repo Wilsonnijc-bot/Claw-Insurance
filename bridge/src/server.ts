@@ -55,6 +55,8 @@ export class BridgeServer {
     private webBrowserMode: 'cdp' | 'launch' = 'cdp',
     private webCdpUrl: string = 'http://127.0.0.1:9222',
     private webCdpChromePath: string = '',
+    private webCdpHelperUrl: string = '',
+    private webHostProfileDir: string = '',
   ) {}
 
   async start(): Promise<void> {
@@ -78,6 +80,9 @@ export class BridgeServer {
       this.webBrowserMode,
       this.webCdpUrl,
       this.webCdpChromePath,
+      undefined,
+      this.webCdpHelperUrl,
+      this.webHostProfileDir,
     );
     this.historyParser = new HistoryParser(
       this.webProfileDir,
@@ -85,6 +90,9 @@ export class BridgeServer {
       this.webBrowserMode,
       this.webCdpUrl,
       this.webCdpChromePath,
+      undefined,
+      this.webCdpHelperUrl,
+      this.webHostProfileDir,
     );
 
     // Handle WebSocket connections

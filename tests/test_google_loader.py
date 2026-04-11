@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from nanobot.config.google_loader import GoogleConfigError, load_google_config
+from nanobot.config.google_loader import (
+    GoogleConfigError,
+    _default_google_config_path,
+    load_google_config,
+)
 
 
 def _write_valid_credential(path: Path) -> None:
@@ -26,6 +30,18 @@ def _write_valid_credential(path: Path) -> None:
 def test_load_google_config_requires_file(tmp_path: Path) -> None:
     with pytest.raises(GoogleConfigError, match="googleconfig.json not found"):
         load_google_config(tmp_path / "googleconfig.json")
+
+
+def test_default_google_config_path_prefers_google_json(tmp_path: Path) -> None:
+    (tmp_path / "google.json").write_text("{}", encoding="utf-8")
+
+    assert _default_google_config_path(tmp_path) == (tmp_path / "google.json")
+
+
+def test_default_google_config_path_falls_back_to_legacy_name(tmp_path: Path) -> None:
+    (tmp_path / "googleconfig.json").write_text("{}", encoding="utf-8")
+
+    assert _default_google_config_path(tmp_path) == (tmp_path / "googleconfig.json")
 
 
 def test_load_google_config_requires_credential_path(tmp_path: Path) -> None:

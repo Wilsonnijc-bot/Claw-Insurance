@@ -8,6 +8,8 @@ x-backend-common: &backend-common
     NANOBOT_PROJECT_ROOT: /workspace
     WEB_BROWSER_MODE: cdp
     WEB_CDP_URL: http://host.docker.internal:9222
+    WEB_CDP_HELPER_URL: http://host.docker.internal:9230
+    WEB_HOST_PROFILE_DIR: ${PWD}/whatsapp-web
   volumes:
     - .:/workspace
   extra_hosts:

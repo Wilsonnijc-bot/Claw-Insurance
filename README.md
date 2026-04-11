@@ -1,5 +1,58 @@
 # Nanobot WhatsApp
 
+## Docker Compose Current Flow
+
+The exact current Docker flow is:
+
+```bash
+git clone https://github.com/Wilsonnijc-bot/Claw-Insurance.git
+cd Claw-Insurance
+cp config.example.json config.json
+cp google.example.json google.json
+cp supabase.example.json supabase.json
+# edit config.json and put your real apiKey
+# edit supabase.json and put your real Supabase service key if you use catalog features
+docker compose up -d --build
+```
+
+Then:
+
+- open `http://localhost:8080`
+- log in in the browser
+- scan QR in the UI if needed
+- if you use Google STT, place your Google service-account JSON under `secrets/` and keep `google.json` pointing to that file
+
+To stop everything:
+
+```bash
+docker compose down
+```
+
+### macOS WhatsApp History Sync
+
+For Docker on macOS, history sync now uses a small host-side CDP helper so the container can reuse an existing Chrome CDP session or open a new host Chrome window automatically.
+
+Install it once on each Mac:
+
+```bash
+python3 -m nanobot install-macos-cdp-helper
+```
+
+After that, the normal operator flow stays the same:
+
+- run `docker compose up -d --build`
+- open `http://localhost:8080`
+- log in
+- click WhatsApp sync in the UI
+
+Sync behavior is now:
+
+- if a reusable host CDP browser already exists on `9222`, Nanobot reuses it
+- if not, Nanobot asks the helper to open a host Chrome window with the repo-local `whatsapp-web/` profile
+- if WhatsApp Web is not logged in yet, scan the QR code in that window and retry sync
+
+No Docker-only browser fields are written into `config.json`. Compose provides the runtime-only CDP settings.
+
 Nanobot is currently a project-local WhatsApp operator system with:
 
 - a React/Vite operator UI in `Insurance frontend/`
@@ -199,8 +252,8 @@ The system is intentionally project-local. Runtime state lives under this reposi
 | Path | What it stores | Source-of-truth status |
 | --- | --- | --- |
 | `config.json` | core runtime configuration | canonical app config |
-| `googleconfig.json` | Google STT feature settings only | canonical Google STT config |
-| `supabaseconfig.json` | Supabase catalog settings only | canonical catalog config |
+| `google.json` | Google STT feature settings only | canonical Google STT config |
+| `supabase.json` | Supabase catalog settings only | canonical catalog config |
 | `secrets/double-scholar-487115-b1-075776a1689b.json` | Google service-account credential loaded at runtime from disk | canonical Google credential path |
 | `data/whatsapp_reply_targets.json` | direct/group reply targets, auto-draft flags, observed IDs, and migration markers | canonical operator target registry and inbound routing registry, but project-local and not intended for git |
 | `sessions/whatsapp__{phone}/session.jsonl` | append-only persisted conversation history and saved `offline_meeting_note` records | canonical chat and note history |
@@ -231,16 +284,16 @@ The setup command keeps the internal split-config architecture but hides that co
 | File | What it stores | When to edit manually |
 | --- | --- | --- |
 | `config.json` | core runtime config such as the LiteLLM model, LiteLLM base URL, and WhatsApp runtime settings | edit when you want to change the main model or other core runtime behavior |
-| `supabaseconfig.json` | optional Supabase catalog settings only | edit when catalog URL, keys, tables, or restore behavior change |
-| `googleconfig.json` | optional Google STT settings only | edit when project ID, location, language, or credential path changes |
+| `supabase.json` | optional Supabase catalog settings only | edit when catalog URL, keys, tables, or restore behavior change |
+| `google.json` | optional Google STT settings only | edit when project ID, location, language, or credential path changes |
 
 Important notes:
 
 - `python -m nanobot setup` writes these files separately on purpose. It does not collapse them back into one file.
 - The primary onboarding path is `./bootstrap` followed by `python -m nanobot setup`. The example files are references, not the recommended first-run editing path.
-- Google credentials stay outside the config payload itself. `googleconfig.json` stores only `credentialJsonPath`, and that path should point to a project-local JSON file under `secrets/`.
+- Google credentials stay outside the config payload itself. `google.json` stores only `credentialJsonPath`, and that path should point to a project-local JSON file under `secrets/`.
 - Despite the field name `supabaseAnonKey`, Nanobot normally needs a backend-capable Supabase key here, typically a `service_role` key, not a publishable browser `anon` key.
-- Supabase remains backward compatible with legacy `config.json -> catalog`, but the preferred productized layout is the separate `supabaseconfig.json`.
+- Supabase remains backward compatible with legacy `config.json -> catalog`, and the app also still reads legacy `supabaseconfig.json`, but the preferred productized layout is the separate `supabase.json`.
 - Manual edits are still supported. If you rerun `python -m nanobot setup`, it will detect existing files and offer update, overwrite, skip, keep, or remove behavior instead of overwriting silently.
 
 ## Manual Dependency Install
@@ -621,7 +674,7 @@ Current packaged behavior:
 - the frontend container serves Nginx on container port `80` and is published on host `8080`
 - the frontend proxies same-origin `/api` and `/ws` to `nanobot-gateway:3456`
 - compose builds the backend image locally from this checkout and bind-mounts the whole repo into `/workspace`
-- compose sets `NANOBOT_PROJECT_ROOT=/workspace`, so the live Docker runtime uses repo-local `config.json`, `googleconfig.json`, `supabaseconfig.json`, `whatsapp-auth/`, `whatsapp-web/`, `sessions/`, `memory/`, `state/`, `data/`, and `.bridge-build/`
+- compose sets `NANOBOT_PROJECT_ROOT=/workspace`, so the live Docker runtime uses repo-local `config.json`, `google.json`, `supabase.json`, `whatsapp-auth/`, `whatsapp-web/`, `sessions/`, `memory/`, `state/`, `data/`, and `.bridge-build/`
 - compose supplies Docker-only CDP browser settings through environment variables instead of writing them into `config.json`
 
 This keeps the containerized package aligned with the live local runtime instead of inventing a separate port model.
@@ -634,9 +687,15 @@ The exact current Docker run flow is:
 git clone https://github.com/Wilsonnijc-bot/Claw-Insurance.git
 cd Claw-Insurance
 cp config.example.json config.json
+cp google.example.json google.json
+cp supabase.example.json supabase.json
 ```
 
-Then edit `config.json` and put your real `apiKey`.
+Then:
+
+- edit `config.json` and put your real `apiKey`
+- edit `supabase.json` and put your real Supabase service key if you use catalog features
+- place your Google service-account JSON under `secrets/` if you use Google STT
 
 Start the stack with:
 
@@ -699,8 +758,10 @@ Keep that browser logged into WhatsApp Web before using sync in the UI. In Docke
 | Command | What it really does today |
 | --- | --- |
 | `./bootstrap` | creates or reuses `.venv`, installs backend and frontend dependencies, and installs wrapper commands |
-| `python3 -m nanobot setup` | guided onboarding that writes `config.json`, optional `supabaseconfig.json`, and optional `googleconfig.json` |
+| `python3 -m nanobot setup` | guided onboarding that writes `config.json`, optional `supabase.json`, and optional `google.json` |
 | `cp config.example.json config.json` | creates the repo-local Docker config from the minimal Moonshot-style template |
+| `cp google.example.json google.json` | creates the optional Google STT config template at the repo root |
+| `cp supabase.example.json supabase.json` | creates the optional Supabase catalog config template at the repo root |
 | `docker compose run --rm nanobot-cli status` | shows Docker runtime status using the mounted repo root as the project root |
 | `docker compose up -d --build` | builds the local backend image, starts the launcher-first backend on `3456`, and serves the frontend on `8080` |
 | `docker compose up -d` | restarts the existing Docker stack without rebuilding |
@@ -723,14 +784,18 @@ Keep that browser logged into WhatsApp Web before using sync in the UI. In Docke
 For Docker-first operator use, the real flow is:
 
 1. run `cp config.example.json config.json`
-2. edit `config.json` and fill your real key
-3. run `docker compose up -d --build`
-4. open `http://localhost:8080`
-5. log in through the launcher screen in the browser
-6. wait for the gateway to start
-7. if needed, scan the Baileys QR shown by the UI
-8. if sync is needed, start a host Chrome/Chromium CDP browser on port `9222` and keep WhatsApp Web logged in there
-9. work from the UI, where inbound messages are persisted first, drafts are generated on demand or automatically, and only approved sends are written and delivered
+2. run `cp supabase.example.json supabase.json` if you use catalog features
+3. run `cp google.example.json google.json` if you use Google STT
+4. edit `config.json` and fill your real API key
+5. edit `supabase.json` and fill your real Supabase service key if needed
+6. place your Google service-account JSON file under `secrets/` if needed
+7. run `docker compose up -d --build` for the first boot or after code changes
+8. open `http://localhost:8080`
+9. log in through the launcher screen in the browser
+10. wait for the gateway to start
+11. if needed, scan the Baileys QR shown by the UI
+12. if sync is needed, start a host Chrome/Chromium CDP browser on port `9222` and keep WhatsApp Web logged in there
+13. work from the UI, where inbound messages are persisted first, drafts are generated on demand or automatically, and only approved sends are written and delivered
 
 For normal operator use, the real flow is:
 

@@ -60,7 +60,7 @@ class TestProjectRoot:
     def test_project_root_can_use_runtime_cwd_for_packaged_install(self, monkeypatch, tmp_path):
         runtime_root = tmp_path / "runtime-root"
         (runtime_root / "nanobot").mkdir(parents=True)
-        (runtime_root / "googleconfig.json").write_text("{}", encoding="utf-8")
+        (runtime_root / "config.json").write_text("{}", encoding="utf-8")
         monkeypatch.delenv("NANOBOT_PROJECT_ROOT", raising=False)
         old_root = _set_project_root(tmp_path / "installed-root")
         try:
@@ -309,9 +309,10 @@ class TestSourceCodeAudit:
         return sources
 
     def test_no_path_home_in_non_install_code(self):
-        """Path.home() should only appear in install-ui-command code."""
+        """Path.home() should only appear in install/helper code."""
         allowed_files = {
             "nanobot/cli/commands.py",  # install-ui-command (intentional)
+            "nanobot/macos_cdp_helper.py",  # macOS host helper installer/runtime
             "nanobot/utils/paths.py",   # is_inside_project uses it in tests only
         }
         for rel, source in self._read_python_sources().items():
@@ -378,6 +379,22 @@ class TestDockerConfinement:
         content = compose.read_text(encoding="utf-8")
         assert "NANOBOT_PROJECT_ROOT: /workspace" in content
         assert "- .:/workspace" in content
+
+    def test_compose_sets_host_cdp_helper_env(self):
+        compose = project_root() / "docker-compose.yml"
+        if not compose.exists():
+            pytest.skip("docker-compose.yml not found")
+        content = compose.read_text(encoding="utf-8")
+        assert "WEB_CDP_HELPER_URL: http://host.docker.internal:9230" in content
+        assert "WEB_HOST_PROFILE_DIR: ${PWD}/whatsapp-web" in content
+
+    def test_compose_uses_launcher_not_gateway(self):
+        compose = project_root() / "docker-compose.yml"
+        if not compose.exists():
+            pytest.skip("docker-compose.yml not found")
+        content = compose.read_text(encoding="utf-8")
+        assert 'command: ["launcher", "--api-port", "3456"]' in content
+        assert "pull_policy: always" not in content
         assert "~/.nanobot" not in content
 
     def test_compose_backend_runs_launcher(self):
@@ -402,6 +419,8 @@ class TestDockerConfinement:
             pytest.skip("docker-compose.yml not found")
         content = compose.read_text(encoding="utf-8")
         assert "./config.example.json:/app/config.json" not in content
+        assert "./google.example.json:/app/google.json" not in content
+        assert "./supabase.example.json:/app/supabase.json" not in content
         assert "./googleconfig.example.json:/app/googleconfig.json" not in content
         assert "./supabaseconfig.example.json:/app/supabaseconfig.json" not in content
 

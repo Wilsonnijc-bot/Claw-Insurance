@@ -282,6 +282,17 @@ class ApiServer:
                 logger.exception("Failed to read WhatsApp bridge status")
         return {"error": False, "message": ""}
 
+    async def _broadcast_current_whatsapp_bridge_status(self) -> None:
+        """Push the latest WhatsApp bridge status to connected UI clients."""
+        bridge_status = self._get_whatsapp_bridge_status()
+        await self._broadcast_ws(
+            {
+                "type": "whatsapp_bridge_status",
+                "bridgeError": bridge_status.get("error"),
+                "message": bridge_status.get("message"),
+            }
+        )
+
     def _get_whatsapp_auth_status(self) -> dict[str, Any]:
         """Return the latest WhatsApp Baileys auth status."""
         whatsapp = self.channel_manager.get_channel("whatsapp") if self.channel_manager else None
@@ -1666,17 +1677,25 @@ class ApiServer:
             if whatsapp and hasattr(whatsapp, "sync_direct_history"):
                 result = await whatsapp.sync_direct_history([phone])
                 status = str(result.get("status") or "login_required")
+                detail = str(result.get("detail") or "WhatsApp 历史同步失败。")
+                if hasattr(whatsapp, "_set_bridge_status"):
+                    bridge_error = status in {"bridge_unreachable", "window_launch_failed"}
+                    whatsapp._set_bridge_status(bridge_error, detail if bridge_error else "")
+                    await self._broadcast_current_whatsapp_bridge_status()
                 if status != "history_scraped":
                     response_status = 503 if status in {"bridge_unreachable", "window_launch_failed"} else 409
                     return web.json_response(
                         {
-                            "error": result.get("detail") or "WhatsApp 历史同步失败。",
+                            "error": detail,
                             "code": status,
                         },
                         status=response_status,
                     )
 
                 backend_success = bool(result.get("backend_success"))
+                if hasattr(whatsapp, "_set_bridge_status"):
+                    whatsapp._set_bridge_status(False, "")
+                    await self._broadcast_current_whatsapp_bridge_status()
                 response_payload = {
                     "status": "history_scraped",
                     "phone": phone,

@@ -35,6 +35,8 @@ media/
 state/
 cron/
 config.json
+google.json
+supabase.json
 googleconfig.json
 supabaseconfig.json
 data/whatsapp_reply_targets.json
@@ -47,4 +49,3 @@ test_words/*
 .nanobot-bin/
 .nanobot-legacy/
 HEARTBEAT.md
-

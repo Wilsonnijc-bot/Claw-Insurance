@@ -9,14 +9,26 @@ from typing import Any
 
 from nanobot.utils.paths import project_root
 
+GOOGLE_CONFIG_FILENAME = "google.json"
+LEGACY_GOOGLE_CONFIG_FILENAME = "googleconfig.json"
+
+
+def _default_google_config_path(root: Path) -> Path:
+    """Return the preferred Google config path, with legacy fallback."""
+    preferred = root / GOOGLE_CONFIG_FILENAME
+    legacy = root / LEGACY_GOOGLE_CONFIG_FILENAME
+    if preferred.exists() or not legacy.exists():
+        return preferred
+    return legacy
+
 
 class GoogleConfigError(RuntimeError):
-    """Raised when googleconfig.json or its credential file is invalid."""
+    """Raised when the Google config file or its credential file is invalid."""
 
 
 @dataclass(frozen=True)
 class GoogleSpeechConfig:
-    """Validated Google STT settings loaded from googleconfig.json."""
+    """Validated Google STT settings loaded from the project Google config."""
 
     project_id: str
     location: str
@@ -38,7 +50,7 @@ class GoogleSpeechConfig:
 
 def get_google_config_path() -> Path:
     """Return the project-local Google STT config path."""
-    return project_root() / "googleconfig.json"
+    return _default_google_config_path(project_root())
 
 
 def _read_json_file(path: Path, *, label: str) -> dict[str, Any]:
@@ -77,7 +89,7 @@ def _validate_project_local_path(path: Path) -> None:
     except ValueError as exc:
         raise GoogleConfigError(
             "Google credential file must stay inside this project root: "
-            f"{root}. Update googleconfig.json credentialJsonPath."
+            f"{root}. Update {GOOGLE_CONFIG_FILENAME} credentialJsonPath."
         ) from exc
 
 
@@ -93,23 +105,24 @@ def _validate_credential_file(path: Path) -> None:
 
 
 def load_google_config(config_path: Path | None = None) -> GoogleSpeechConfig:
-    """Load and validate googleconfig.json plus the credential file path it references."""
+    """Load and validate the Google config plus its credential file path."""
     path = (config_path or get_google_config_path()).resolve()
-    payload = _read_json_file(path, label="googleconfig.json")
+    label = path.name
+    payload = _read_json_file(path, label=label)
 
-    project_id = _require_text(payload, "projectId", label="googleconfig.json")
-    location = _require_text(payload, "location", label="googleconfig.json")
-    language_code = _require_text(payload, "languageCode", label="googleconfig.json")
-    model = _require_text(payload, "model", label="googleconfig.json")
+    project_id = _require_text(payload, "projectId", label=label)
+    location = _require_text(payload, "location", label=label)
+    language_code = _require_text(payload, "languageCode", label=label)
+    model = _require_text(payload, "model", label=label)
     credential_json_path = _require_text(
         payload,
         "credentialJsonPath",
-        label="googleconfig.json",
+        label=label,
     )
 
     if model != "chirp_3":
         raise GoogleConfigError(
-            "googleconfig.json field 'model' must be exactly 'chirp_3'"
+            f"{label} field 'model' must be exactly 'chirp_3'"
         )
 
     credential_path = _resolve_credential_path(path, credential_json_path)
@@ -117,7 +130,7 @@ def load_google_config(config_path: Path | None = None) -> GoogleSpeechConfig:
     if not credential_path.exists():
         raise GoogleConfigError(
             "Google credential file not found at "
-            f"{credential_path}. Update googleconfig.json credentialJsonPath."
+            f"{credential_path}. Update {label} credentialJsonPath."
         )
 
     _validate_credential_file(credential_path)

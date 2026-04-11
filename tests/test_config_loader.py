@@ -128,6 +128,32 @@ def test_save_config_writes_split_supabase_file_when_externalized(monkeypatch, t
     assert "catalog" not in saved_main
     assert saved_split["supabaseUrl"] == "https://split.supabase.co"
     assert saved_split["supabaseCatalogTables"] == ["insurance_products"]
+
+
+def test_load_config_reads_legacy_supabaseconfig_fallback(monkeypatch, tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_config = app_dir / "nanobot.json"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    app_config.write_text("{}", encoding="utf-8")
+    (app_dir / "supabaseconfig.json").write_text(
+        json.dumps(
+            {
+                "supabaseUrl": "https://legacy.supabase.co",
+                "supabaseCatalogTables": ["legacy_table"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("NANOBOT_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("NANOBOT_APP_CONFIG_PATH", str(app_config))
+
+    config = load_config()
+
+    assert config.catalog.supabase_url == "https://legacy.supabase.co"
+    assert config.catalog.supabase_catalog_tables == ["legacy_table"]
+
+
 def test_config_example_uses_canonical_litellm_shape() -> None:
     payload = json.loads(Path("config.example.json").read_text(encoding="utf-8"))
 
@@ -137,4 +163,14 @@ def test_config_example_uses_canonical_litellm_shape() -> None:
     assert config.agents.defaults.model == "moonshot-v1-8k"
     assert config.gateway.port == 3456
     assert config.providers.litellm.base_url == "https://api.moonshot.cn/v1"
-    assert config.channels.whatsapp.delivery_mode == "draft"
+    assert config.channels.whatsapp.delivery_mode == "send"
+
+
+def test_google_and_supabase_example_files_are_valid_json_objects() -> None:
+    google_payload = json.loads(Path("google.example.json").read_text(encoding="utf-8"))
+    supabase_payload = json.loads(Path("supabase.example.json").read_text(encoding="utf-8"))
+
+    assert isinstance(google_payload, dict)
+    assert google_payload["model"] == "chirp_3"
+    assert isinstance(supabase_payload, dict)
+    assert isinstance(supabase_payload["supabaseCatalogTables"], list)

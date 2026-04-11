@@ -1,11 +1,14 @@
 import {
   type BrowserConnector,
+  type CdpHelperClient,
+  type CdpHostResolver,
   type BrowserLauncher,
   type BrowserMode,
   type ChatTarget,
   COMPOSE_BOX_SELECTORS,
   DEFAULT_BROWSER_CONNECTOR,
   DEFAULT_BROWSER_LAUNCHER,
+  DEFAULT_CDP_HELPER_CLIENT,
   HISTORY_SCROLL_LIMIT,
   HISTORY_SCROLL_WAIT_MS,
   ParseSessionUnavailableError,
@@ -63,6 +66,10 @@ export class HistoryParser extends WhatsAppWebSession {
     cdpEndpoint: string = 'http://127.0.0.1:9222',
     cdpChromePath: string = process.env.WEB_CDP_CHROME_PATH || '',
     browserLauncher: BrowserLauncher = DEFAULT_BROWSER_LAUNCHER,
+    cdpHelperUrl: string = process.env.WEB_CDP_HELPER_URL || '',
+    hostProfileDir: string = process.env.WEB_HOST_PROFILE_DIR || '',
+    cdpHelperClient: CdpHelperClient = DEFAULT_CDP_HELPER_CLIENT,
+    cdpHostResolver?: CdpHostResolver,
   ) {
     super(
       userDataDir,
@@ -71,6 +78,10 @@ export class HistoryParser extends WhatsAppWebSession {
       cdpEndpoint,
       cdpChromePath,
       browserLauncher,
+      cdpHelperUrl,
+      hostProfileDir,
+      cdpHelperClient,
+      cdpHostResolver,
     );
   }
 
@@ -95,7 +106,7 @@ export class HistoryParser extends WhatsAppWebSession {
       if (!await this._ensureWhatsAppReady(page)) {
         return {
           status: 'login_required',
-          detail: 'WhatsApp Web is not logged in or not ready for history parsing.',
+          detail: this._cdpLoginRequiredDetail(),
         };
       }
 
@@ -134,7 +145,7 @@ export class HistoryParser extends WhatsAppWebSession {
       if (!await this._ensureWhatsAppReady(page)) {
         return {
           status: 'login_required',
-          detail: 'WhatsApp Web is not logged in or not ready for history parsing.',
+          detail: this._cdpLoginRequiredDetail(),
           results: [],
         };
       }
@@ -173,6 +184,9 @@ export class HistoryParser extends WhatsAppWebSession {
       || detail.includes('No Chrome/Chromium executable was found')
       || detail.includes('Configured Chrome executable does not exist')
       || detail.includes('Failed to launch the CDP browser')
+      || detail.includes('Mac CDP helper')
+      || detail.includes('Host Chrome CDP is not reachable')
+      || (detail.includes('spawn ') && detail.includes(' ENOENT'))
     ) {
       return {
         status: 'window_launch_failed',
@@ -238,15 +252,36 @@ export class HistoryParser extends WhatsAppWebSession {
     this.context = null;
     this.browser = null;
     this.preferNewestAttachedPage = true;
-    await this._launchCdpBrowser(true);
-    this.browser = await this._waitForCDPBrowser();
+    const helperResult = await this._ensureCdpBrowserViaHelper(true);
+    if (helperResult) {
+      this.browser = await this._waitForCDPBrowser();
+      if (this.browser) {
+        this.lastCdpAcquisition = helperResult.status === 'launched' ? 'helper_launched' : 'helper_reused';
+      }
+    } else {
+      await this._launchCdpBrowser(true);
+      this.browser = await this._waitForCDPBrowser();
+      if (this.browser) {
+        this.lastCdpAcquisition = 'local_launch';
+      }
+    }
     if (!this.browser) {
       throw new Error(
         `CDP browser is not available at ${this.cdpEndpoint}. Start Chrome with --remote-debugging-port or set webCdpChromePath so nanobot can launch it.`,
       );
     }
-    this.context = null;
+
+    const attached = await this._findAttachedWhatsAppPage(this.browser, false, true);
+    if (attached) {
+      this.context = attached.context;
+      this.page = attached.page;
+      this.preferNewestAttachedPage = false;
+      return;
+    }
+
+    this.context = this._pickAttachedContext(this.browser, true);
     this.page = null;
+    this.preferNewestAttachedPage = false;
   }
 
   private async _openTargetForParse(

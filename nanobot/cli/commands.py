@@ -634,6 +634,28 @@ def install_ui_command(
     console.print("  [cyan]whatsapp-web-nanobot-gateway[/cyan]")
 
 
+@app.command("install-macos-cdp-helper")
+def install_macos_cdp_helper():
+    """Install the macOS host-side CDP helper used by Docker/local WhatsApp sync."""
+    if sys.platform != "darwin":
+        console.print("[red]The macOS CDP helper can only be installed on macOS.[/red]")
+        raise typer.Exit(1)
+
+    from nanobot.macos_cdp_helper import install_launchd_helper
+
+    try:
+        result = install_launchd_helper()
+    except Exception as exc:
+        console.print(f"[red]Failed to install the macOS CDP helper: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    console.print("[green]✓[/green] Installed macOS CDP helper")
+    console.print(f"  Helper URL: [cyan]{result['helper_url']}[/cyan]")
+    console.print(f"  LaunchAgent: [cyan]{result['launch_agent']}[/cyan]")
+    console.print(f"  Helper script: [cyan]{result['helper_script']}[/cyan]")
+    console.print(f"  Launcher script: [cyan]{result['launcher_script']}[/cyan]")
+
+
 # ============================================================================
 # Onboard / Setup
 # ============================================================================
@@ -1388,7 +1410,20 @@ def _build_whatsapp_bridge_env(config: Config) -> dict[str, str]:
     _set_runtime_value("WEB_CDP_URL", wa.web_cdp_url)
     _set_runtime_value("WEB_CDP_CHROME_PATH", wa.web_cdp_chrome_path)
     _set_runtime_value("WEB_PROFILE_DIR", wa.web_profile_dir)
+    _set_runtime_value("WEB_HOST_PROFILE_DIR", str(_project_root / "whatsapp-web"))
     _set_runtime_value("AUTH_DIR", str(_project_root / "whatsapp-auth"))
+
+    runtime_helper_url = str(os.environ.get("WEB_CDP_HELPER_URL") or "").strip()
+    if runtime_helper_url:
+        env["WEB_CDP_HELPER_URL"] = runtime_helper_url
+    elif sys.platform == "darwin":
+        try:
+            from nanobot.macos_cdp_helper import DEFAULT_HELPER_URL, request_helper_health
+
+            if request_helper_health(DEFAULT_HELPER_URL, timeout_s=0.2):
+                env["WEB_CDP_HELPER_URL"] = DEFAULT_HELPER_URL
+        except Exception:
+            pass
 
     parsed = urlparse(wa.bridge_url)
     if parsed.port:
@@ -1689,12 +1724,77 @@ def channels_login():
 
 
 @channels_app.command("whatsapp-web")
-def channels_whatsapp_web():
-    """Explain that standalone WhatsApp Web CDP launch is disabled."""
-    console.print(
-        "[red]Standalone WhatsApp Web CDP launch is disabled. "
-        "CDP is managed only during WhatsApp history parsing.[/red]"
+def channels_whatsapp_web(
+    new_window: bool = typer.Option(
+        False,
+        "--new-window",
+        help="Open a fresh Chrome window even if a reusable CDP browser already exists.",
+    ),
+):
+    """Ensure a reusable macOS WhatsApp Web CDP browser exists."""
+    if sys.platform != "darwin":
+        console.print("[red]Standalone WhatsApp Web browser management is currently supported only on macOS.[/red]")
+        raise typer.Exit(1)
+
+    from nanobot.config.loader import load_config
+    from nanobot.macos_cdp_helper import (
+        DEFAULT_HELPER_URL,
+        DEFAULT_START_URL,
+        ensure_cdp_browser,
+        request_helper_ensure,
+        request_helper_health,
     )
+    from nanobot.utils.paths import project_root
+
+    config = load_config()
+    env = _build_whatsapp_bridge_env(config)
+    endpoint_url = str(env.get("WEB_CDP_URL") or "http://127.0.0.1:9222")
+    profile_dir = str(
+        env.get("WEB_HOST_PROFILE_DIR")
+        or env.get("WEB_PROFILE_DIR")
+        or (project_root() / "whatsapp-web")
+    )
+    chrome_path = str(env.get("WEB_CDP_CHROME_PATH") or "")
+    helper_url = str(env.get("WEB_CDP_HELPER_URL") or DEFAULT_HELPER_URL)
+
+    try:
+        if request_helper_health(helper_url, timeout_s=0.5):
+            result = request_helper_ensure(
+                helper_url,
+                endpoint_url=endpoint_url,
+                profile_dir=profile_dir,
+                start_url=DEFAULT_START_URL,
+                chrome_path=chrome_path,
+                force_new_window=new_window,
+            )
+        else:
+            result = ensure_cdp_browser(
+                endpoint_url=endpoint_url,
+                profile_dir=profile_dir,
+                start_url=DEFAULT_START_URL,
+                chrome_path=chrome_path,
+                force_new_window=new_window,
+            )
+    except Exception as exc:
+        console.print(f"[red]Failed to ensure the WhatsApp Web CDP browser: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    status = str(result.get("status") or "failed")
+    detail = str(result.get("detail") or "").strip()
+
+    if status == "reused":
+        console.print(f"[green]✓[/green] Reused an existing CDP browser at [cyan]{endpoint_url}[/cyan]")
+        if detail:
+            console.print(f"[dim]{detail}[/dim]")
+        return
+
+    if status == "launched":
+        console.print(f"[green]✓[/green] Opened a Chrome CDP window at [cyan]{endpoint_url}[/cyan]")
+        if detail:
+            console.print(f"[dim]{detail}[/dim]")
+        return
+
+    console.print(f"[red]{detail or 'Failed to launch or reuse the WhatsApp Web CDP browser.'}[/red]")
     raise typer.Exit(1)
 
 
