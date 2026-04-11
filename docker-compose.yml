@@ -1,5 +1,5 @@
 x-backend-common: &backend-common
-  image: hendrickyan/claw-insurance:v1.0.0
+  image: hendrickyan/claw-insurance:v1.0.1
   pull_policy: always
   volumes:
     - ./config.example.json:/app/config.json
