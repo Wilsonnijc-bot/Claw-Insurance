@@ -370,3 +370,45 @@ class TestDockerConfinement:
         assert "~/.nanobot" not in content, (
             "docker-compose.yml still mounts ~/.nanobot"
         )
+
+    def test_compose_uses_workspace_runtime_root(self):
+        compose = project_root() / "docker-compose.yml"
+        if not compose.exists():
+            pytest.skip("docker-compose.yml not found")
+        content = compose.read_text(encoding="utf-8")
+        assert "NANOBOT_PROJECT_ROOT: /workspace" in content
+        assert "- .:/workspace" in content
+        assert "~/.nanobot" not in content
+
+    def test_compose_backend_runs_launcher(self):
+        compose = project_root() / "docker-compose.yml"
+        if not compose.exists():
+            pytest.skip("docker-compose.yml not found")
+        content = compose.read_text(encoding="utf-8")
+        assert 'command: ["launcher", "--api-port", "3456"]' in content
+
+    def test_compose_builds_backend_locally(self):
+        compose = project_root() / "docker-compose.yml"
+        if not compose.exists():
+            pytest.skip("docker-compose.yml not found")
+        content = compose.read_text(encoding="utf-8")
+        assert "build:" in content
+        assert "dockerfile: Dockerfile" in content
+        assert "pull_policy: always" not in content
+
+    def test_compose_does_not_mount_example_config_as_live_runtime(self):
+        compose = project_root() / "docker-compose.yml"
+        if not compose.exists():
+            pytest.skip("docker-compose.yml not found")
+        content = compose.read_text(encoding="utf-8")
+        assert "./config.example.json:/app/config.json" not in content
+        assert "./googleconfig.example.json:/app/googleconfig.json" not in content
+        assert "./supabaseconfig.example.json:/app/supabaseconfig.json" not in content
+
+    def test_compose_provides_host_cdp_env(self):
+        compose = project_root() / "docker-compose.yml"
+        if not compose.exists():
+            pytest.skip("docker-compose.yml not found")
+        content = compose.read_text(encoding="utf-8")
+        assert "WEB_BROWSER_MODE: cdp" in content
+        assert "WEB_CDP_URL: http://host.docker.internal:9222" in content

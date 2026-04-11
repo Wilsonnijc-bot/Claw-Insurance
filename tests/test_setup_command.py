@@ -208,7 +208,6 @@ def test_setup_both_enabled(monkeypatch, tmp_path: Path) -> None:
     google = load_google_config(tmp_path / "googleconfig.json")
     assert google.project_id == "double-scholar-487115-b1"
 
-
 def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Path) -> None:
     _use_temp_project(monkeypatch, tmp_path)
     _write_google_credential(tmp_path / "secrets" / "old-google.json")

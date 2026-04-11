@@ -1,5 +1,6 @@
 import os
 import signal
+import inspect
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,16 @@ def test_build_whatsapp_bridge_env_uses_configured_values() -> None:
     assert env["WEB_CDP_CHROME_PATH"] == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     assert env["WEB_PROFILE_DIR"] == "~/wa-profile"
     assert env["PATH"] == os.environ["PATH"]
+
+
+def test_build_whatsapp_bridge_env_prefers_runtime_env_in_source() -> None:
+    source = inspect.getsource(commands._build_whatsapp_bridge_env)
+
+    assert "runtime_value = os.environ.get(name)" in source
+    assert '_set_runtime_value("WEB_BROWSER_MODE", wa.web_browser_mode)' in source
+    assert '_set_runtime_value("WEB_CDP_URL", wa.web_cdp_url)' in source
+    assert '_set_runtime_value("WEB_CDP_CHROME_PATH", wa.web_cdp_chrome_path)' in source
+    assert '_set_runtime_value("WEB_PROFILE_DIR", wa.web_profile_dir)' in source
 
 
 def test_whatsapp_web_gateway_entry_routes_to_gateway(monkeypatch) -> None:

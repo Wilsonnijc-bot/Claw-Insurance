@@ -1,27 +1,23 @@
 x-backend-common: &backend-common
-  image: hendrickyan/claw-insurance:v1.0.1
-  pull_policy: always
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: claw-insurance-local
+  working_dir: /workspace
+  environment:
+    NANOBOT_PROJECT_ROOT: /workspace
+    WEB_BROWSER_MODE: cdp
+    WEB_CDP_URL: http://host.docker.internal:9222
   volumes:
-    - ./config.example.json:/app/config.json
-    - ./googleconfig.example.json:/app/googleconfig.json
-    - ./supabaseconfig.example.json:/app/supabaseconfig.json
-    - ./data:/app/data
-    - ./sessions:/app/sessions
-    - ./state:/app/state
-    - ./memory:/app/memory
-    - ./secrets:/app/secrets
-    - ./whatsapp-auth:/app/whatsapp-auth
-    - ./whatsapp-web:/app/whatsapp-web
-    - ./whatsapp-web-debug:/app/whatsapp-web-debug
-    - ./skills:/app/skills
-    - ./media:/app/media
-    - ./cron:/app/cron
+    - .:/workspace
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
 
 services:
   nanobot-gateway:
     container_name: nanobot-gateway
     <<: *backend-common
-    command: ["gateway", "--api-port", "3456"]
+    command: ["launcher", "--api-port", "3456"]
     restart: unless-stopped
     ports:
       - "3456:3456"

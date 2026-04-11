@@ -134,7 +134,7 @@ def test_config_example_uses_canonical_litellm_shape() -> None:
     config = Config.model_validate(payload)
 
     assert config.agents.defaults.provider == "litellm"
-    assert config.agents.defaults.model == "litellm/kimi-k2.5"
+    assert config.agents.defaults.model == "moonshot-v1-8k"
     assert config.gateway.port == 3456
-    assert config.providers.litellm.base_url == "http://43.129.246.127:4000"
+    assert config.providers.litellm.base_url == "https://api.moonshot.cn/v1"
     assert config.channels.whatsapp.delivery_mode == "draft"

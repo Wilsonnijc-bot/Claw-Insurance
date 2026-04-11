@@ -1375,21 +1375,24 @@ def _build_whatsapp_bridge_env(config: Config) -> dict[str, str]:
     wa = config.channels.whatsapp
     from nanobot.utils.paths import project_root
     _project_root = project_root()
-    if wa.bridge_token:
-        env["BRIDGE_TOKEN"] = wa.bridge_token
-    if wa.web_browser_mode:
-        env["WEB_BROWSER_MODE"] = wa.web_browser_mode
-    if wa.web_cdp_url:
-        env["WEB_CDP_URL"] = wa.web_cdp_url
-    if wa.web_cdp_chrome_path:
-        env["WEB_CDP_CHROME_PATH"] = wa.web_cdp_chrome_path
-    if wa.web_profile_dir:
-        env["WEB_PROFILE_DIR"] = wa.web_profile_dir
-    env["AUTH_DIR"] = str(_project_root / "whatsapp-auth")
+
+    def _set_runtime_value(name: str, config_value: str) -> None:
+        runtime_value = os.environ.get(name)
+        if runtime_value:
+            env[name] = runtime_value
+        elif config_value:
+            env[name] = config_value
+
+    _set_runtime_value("BRIDGE_TOKEN", wa.bridge_token)
+    _set_runtime_value("WEB_BROWSER_MODE", wa.web_browser_mode)
+    _set_runtime_value("WEB_CDP_URL", wa.web_cdp_url)
+    _set_runtime_value("WEB_CDP_CHROME_PATH", wa.web_cdp_chrome_path)
+    _set_runtime_value("WEB_PROFILE_DIR", wa.web_profile_dir)
+    _set_runtime_value("AUTH_DIR", str(_project_root / "whatsapp-auth"))
 
     parsed = urlparse(wa.bridge_url)
     if parsed.port:
-        env["BRIDGE_PORT"] = str(parsed.port)
+        _set_runtime_value("BRIDGE_PORT", str(parsed.port))
     return env
 
 
