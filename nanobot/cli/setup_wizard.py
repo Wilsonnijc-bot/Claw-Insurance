@@ -30,7 +30,11 @@ console = Console()
 
 _DEFAULT_LITELLM_MODEL = "litellm/kimi-k2.5"
 _DEFAULT_LITELLM_BASE_URL = "http://43.129.246.127:4000"
+_DEFAULT_SUPABASE_URL = "https://znhoybdxcwlatsoqmbnt.supabase.co"
+_DEFAULT_SUPABASE_PROJECT_REF = "znhoybdxcwlatsoqmbnt"
 _DEFAULT_SUPABASE_TABLES = ["insurance_products", "dental_insurance"]
+_DEFAULT_GOOGLE_PROJECT_ID = "double-scholar-487115-b1"
+_DEFAULT_GOOGLE_CREDENTIAL_PATH = "secrets/double-scholar-487115-b1-075776a1689b.json"
 
 
 def run_setup_wizard() -> None:
@@ -58,6 +62,13 @@ def run_setup_wizard() -> None:
     console.print(f"  [cyan]{config_path.name}[/cyan] for core runtime settings")
     console.print(f"  [cyan]{supabase_path.name}[/cyan] for Supabase catalog settings")
     console.print(f"  [cyan]{google_path.name}[/cyan] for Google STT settings")
+    console.print(
+        "\nFor a normal local install, keep the prefilled defaults and just paste your keys."
+    )
+    console.print(
+        "If you want Google STT, put your credential JSON at "
+        f"[cyan]{_DEFAULT_GOOGLE_CREDENTIAL_PATH}[/cyan] first."
+    )
     console.print("\nNothing will be overwritten silently.\n")
 
     core_answers = _prompt_core_config(
@@ -207,8 +218,10 @@ def run_setup_wizard() -> None:
 
     console.print("\nNext steps:")
     console.print("  1. [cyan]python -m nanobot status[/cyan]")
-    console.print("  2. [cyan]python -m nanobot install-ui-command[/cyan]  [dim](optional, once per checkout)[/dim]")
-    console.print("  3. [cyan]whatsapp-web-nanobot-ui[/cyan]  [dim]or[/dim]  [cyan]python -m nanobot ui[/cyan]")
+    console.print("  2. [cyan]whatsapp-web-nanobot-ui[/cyan]  [dim]or[/dim]  [cyan]python -m nanobot ui[/cyan]")
+    console.print(
+        "  3. [cyan]python -m nanobot install-ui-command[/cyan]  [dim](only if you skipped ./bootstrap or moved this repo)[/dim]"
+    )
 
 
 def _prompt_core_config(
@@ -255,7 +268,7 @@ def _prompt_supabase_config(existing_payload: dict[str, Any]) -> dict[str, Any]:
 
     supabase_url = _prompt_url(
         "Supabase URL",
-        default=str(existing_payload.get("supabaseUrl") or ""),
+        default=str(existing_payload.get("supabaseUrl") or _DEFAULT_SUPABASE_URL),
     )
     supabase_anon_key = _prompt_secret(
         "Supabase API key (service_role recommended)",
@@ -263,7 +276,7 @@ def _prompt_supabase_config(existing_payload: dict[str, Any]) -> dict[str, Any]:
     )
     project_ref = _prompt_optional_text(
         "Supabase project ref",
-        default=str(existing_payload.get("supabaseProjectRef") or ""),
+        default=str(existing_payload.get("supabaseProjectRef") or _DEFAULT_SUPABASE_PROJECT_REF),
     )
     table_list = _prompt_csv_list(
         "Catalog tables (comma-separated)",
@@ -290,7 +303,7 @@ def _prompt_supabase_config(existing_payload: dict[str, Any]) -> dict[str, Any]:
 def _prompt_google_config(existing_payload: dict[str, Any]) -> dict[str, Any]:
     project_id = _prompt_required_text(
         "Google project ID",
-        default=str(existing_payload.get("projectId") or ""),
+        default=str(existing_payload.get("projectId") or _DEFAULT_GOOGLE_PROJECT_ID),
     )
     location = _prompt_required_text(
         "Google location",
@@ -309,7 +322,7 @@ def _prompt_google_config(existing_payload: dict[str, Any]) -> dict[str, Any]:
     )
     credential_path = _prompt_google_credential_path(
         "Google credential JSON path",
-        default=str(existing_payload.get("credentialJsonPath") or "secrets/google-credentials.json"),
+        default=str(existing_payload.get("credentialJsonPath") or _DEFAULT_GOOGLE_CREDENTIAL_PATH),
     )
 
     return {

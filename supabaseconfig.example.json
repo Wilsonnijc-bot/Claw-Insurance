@@ -6,8 +6,7 @@
     "insurance_products",
     "dental_insurance"
   ],
-  
-  "autoRestorePausedProject": true,
+  "autoRestorePausedProject": false,
   "restoreTimeoutSeconds": 300,
   "cacheTtlSeconds": 300
 }

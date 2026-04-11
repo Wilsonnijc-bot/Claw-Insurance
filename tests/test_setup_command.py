@@ -98,10 +98,10 @@ def test_setup_supabase_only(monkeypatch, tmp_path: Path) -> None:
                 "http://43.129.246.127:4000",
                 "sk-test-supabase",
                 "y",
-                "https://example.supabase.co",
+                "",
                 "service-role-key",
-                "example-ref",
-                "insurance_products,dental_insurance",
+                "",
+                "",
                 "",
                 "n",
             ]
@@ -117,19 +117,19 @@ def test_setup_supabase_only(monkeypatch, tmp_path: Path) -> None:
     assert not google_path.exists()
 
     payload = json.loads(supabase_path.read_text(encoding="utf-8"))
-    assert payload["supabaseUrl"] == "https://example.supabase.co"
+    assert payload["supabaseUrl"] == "https://znhoybdxcwlatsoqmbnt.supabase.co"
     assert payload["supabaseAnonKey"] == "service-role-key"
-    assert payload["supabaseProjectRef"] == "example-ref"
+    assert payload["supabaseProjectRef"] == "znhoybdxcwlatsoqmbnt"
     assert payload["supabaseCatalogTables"] == ["insurance_products", "dental_insurance"]
     assert payload["autoRestorePausedProject"] is False
 
     config = load_config()
-    assert config.catalog.supabase_url == "https://example.supabase.co"
+    assert config.catalog.supabase_url == "https://znhoybdxcwlatsoqmbnt.supabase.co"
 
 
 def test_setup_google_only(monkeypatch, tmp_path: Path) -> None:
     _use_temp_project(monkeypatch, tmp_path)
-    credential_path = tmp_path / "secrets" / "google-credentials.json"
+    credential_path = tmp_path / "secrets" / "double-scholar-487115-b1-075776a1689b.json"
     _write_google_credential(credential_path)
 
     result = runner.invoke(
@@ -143,11 +143,11 @@ def test_setup_google_only(monkeypatch, tmp_path: Path) -> None:
                 "sk-litellm-test",
                 "n",
                 "y",
-                "demo-project",
-                "us",
-                "yue-Hant-HK",
-                "chirp_3",
-                "secrets/google-credentials.json",
+                "",
+                "",
+                "",
+                "",
+                "",
             ]
         )
         + "\n",
@@ -161,14 +161,14 @@ def test_setup_google_only(monkeypatch, tmp_path: Path) -> None:
     assert not supabase_path.exists()
 
     google = load_google_config(google_path)
-    assert google.project_id == "demo-project"
+    assert google.project_id == "double-scholar-487115-b1"
     assert google.model == "chirp_3"
     assert google.credential_json_path == credential_path.resolve()
 
 
 def test_setup_both_enabled(monkeypatch, tmp_path: Path) -> None:
     _use_temp_project(monkeypatch, tmp_path)
-    _write_google_credential(tmp_path / "secrets" / "google-credentials.json")
+    _write_google_credential(tmp_path / "secrets" / "double-scholar-487115-b1-075776a1689b.json")
 
     result = runner.invoke(
         app,
@@ -180,17 +180,17 @@ def test_setup_both_enabled(monkeypatch, tmp_path: Path) -> None:
                 "http://43.129.246.127:4000",
                 "sk-litellm-test",
                 "y",
-                "https://example.supabase.co",
+                "",
                 "service-role-key",
-                "example-ref",
-                "insurance_products,dental_insurance",
-                "sbp-token",
+                "",
+                "",
+                "",
                 "y",
-                "demo-project",
-                "us",
-                "yue-Hant-HK",
-                "chirp_3",
-                "secrets/google-credentials.json",
+                "",
+                "",
+                "",
+                "",
+                "",
             ]
         )
         + "\n",
@@ -203,10 +203,10 @@ def test_setup_both_enabled(monkeypatch, tmp_path: Path) -> None:
 
     config = load_config()
     assert config.agents.defaults.provider == "litellm"
-    assert config.catalog.supabase_project_ref == "example-ref"
+    assert config.catalog.supabase_project_ref == "znhoybdxcwlatsoqmbnt"
 
     google = load_google_config(tmp_path / "googleconfig.json")
-    assert google.project_id == "demo-project"
+    assert google.project_id == "double-scholar-487115-b1"
 
 
 def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Path) -> None:

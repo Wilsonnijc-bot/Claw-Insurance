@@ -48,67 +48,74 @@ This command:
 - leaves config setup as a separate next step
 
 The bootstrap flow is intended for macOS/Linux with a project-local `.venv`.
+After `./bootstrap`, the wrapper commands are already installed for this checkout.
 
 ### 3. Activate The Project Venv
 
 ```bash
-cd /path/to/Nanobot-Whatsapp
 source .venv/bin/activate
 ```
 
-### 4. Run The Guided Setup
+### 4. Put The Google Credential File In Place If You Need STT
+
+If you plan to use Google STT, put the real service-account JSON inside this checkout before running setup:
+
+```bash
+mkdir -p secrets
+# place your real credential file at:
+#   secrets/double-scholar-487115-b1-075776a1689b.json
+```
+
+If you do not need Google STT right now, skip this step.
+
+### 5. Run The Guided Setup
 
 The primary onboarding path is now a single guided command:
 
 ```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
 python -m nanobot setup
 ```
 
 The setup flow:
 
-- asks for the core runtime settings Nanobot needs for a normal local run
+- pre-fills the normal local defaults
+- asks for the small set of values Nanobot cannot guess for you
 - optionally asks for Supabase catalog settings
 - optionally asks for Google STT settings
 - validates obvious mistakes before writing files
 - writes split config files automatically
 - prints the next commands to run
 
-If you plan to enable Google STT, put the real service-account JSON inside this checkout first, for example:
+For a normal local install, you usually just:
 
-```bash
-cd /path/to/Nanobot-Whatsapp
-mkdir -p secrets
-# place your real credential file at:
-#   /path/to/Nanobot-Whatsapp/secrets/google-credentials.json
-```
+- press Enter to keep `3456`
+- press Enter to keep the default LiteLLM model
+- press Enter to keep the default LiteLLM base URL
+- paste your LiteLLM API key
+- optionally enable Supabase and paste its backend-capable key
+- optionally enable Google STT after placing `secrets/double-scholar-487115-b1-075776a1689b.json`
 
 The guided setup does not install Python, Node, Chrome, Supabase resources, or Google credentials for you. It only validates inputs and writes Nanobot's local config files.
 
-### 5. Sanity Check The Local Install
+### 6. Sanity Check The Local Install
 
 ```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
 python -m nanobot status
 ```
 
 Use this to confirm the config, workspace, sessions, memory, auth, and browser paths all resolve inside the repo.
 
-### 6. Launch The App With The Wrapper
+### 7. Launch The App With The Wrapper
 
 ```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
 whatsapp-web-nanobot-ui
 ```
 
-### 7. Stop The Local UI And Backend Processes
+You do not need to rerun `python -m nanobot install-ui-command` here if you already used `./bootstrap`.
+
+### 8. Stop The Local UI And Backend Processes
 
 ```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
 python -m nanobot stop-dev
 ```
 
@@ -194,7 +201,7 @@ The system is intentionally project-local. Runtime state lives under this reposi
 | `config.json` | core runtime configuration | canonical app config |
 | `googleconfig.json` | Google STT feature settings only | canonical Google STT config |
 | `supabaseconfig.json` | Supabase catalog settings only | canonical catalog config |
-| `secrets/google-credentials.json` | Google service-account credential loaded at runtime from disk | canonical Google credential path |
+| `secrets/double-scholar-487115-b1-075776a1689b.json` | Google service-account credential loaded at runtime from disk | canonical Google credential path |
 | `data/whatsapp_reply_targets.json` | direct/group reply targets, auto-draft flags, observed IDs, and migration markers | canonical operator target registry and inbound routing registry, but project-local and not intended for git |
 | `sessions/whatsapp__{phone}/session.jsonl` | append-only persisted conversation history and saved `offline_meeting_note` records | canonical chat and note history |
 | `sessions/whatsapp__{phone}/meta.json` | derived session metadata, pointers, and offline-meeting note index entries | derived from `session.jsonl` |
@@ -230,6 +237,7 @@ The setup command keeps the internal split-config architecture but hides that co
 Important notes:
 
 - `python -m nanobot setup` writes these files separately on purpose. It does not collapse them back into one file.
+- The primary onboarding path is `./bootstrap` followed by `python -m nanobot setup`. The example files are references, not the recommended first-run editing path.
 - Google credentials stay outside the config payload itself. `googleconfig.json` stores only `credentialJsonPath`, and that path should point to a project-local JSON file under `secrets/`.
 - Despite the field name `supabaseAnonKey`, Nanobot normally needs a backend-capable Supabase key here, typically a `service_role` key, not a publishable browser `anon` key.
 - Supabase remains backward compatible with legacy `config.json -> catalog`, but the preferred productized layout is the separate `supabaseconfig.json`.
