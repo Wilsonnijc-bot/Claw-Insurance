@@ -1,13 +1,13 @@
 {
   "providers": {
     "litellm": {
-      "baseUrl": "http://43.129.246.127:4000",
-      "apiKey": ""
+      "baseUrl": "https://api.moonshot.cn/v1/chat/completions",
+      "apiKey": "sk-REPLACE_WITH_YOUR_VIRTUAL_KEY"
     }
   },
   "agents": {
     "defaults": {
-      "model": "litellm/kimi-k2.5",
+      "model": "litellm/moonshot-v1-8k",
       "provider": "litellm"
     }
   },

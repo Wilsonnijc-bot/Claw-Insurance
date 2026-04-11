@@ -24,12 +24,15 @@ RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
 # Copy the full source and install
 COPY nanobot/ nanobot/
 COPY bridge/ bridge/
+COPY config.example.json /app/config.json
+COPY googleconfig.example.json /app/googleconfig.json
+COPY supabaseconfig.example.json /app/supabaseconfig.json
 RUN uv pip install --system --no-cache . && \
     python3 -c "import google.cloud.speech_v2"
 
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
-RUN npm install && npm run build
+RUN npm ci && npm run build
 WORKDIR /app
 
 # Create project-local runtime directories
