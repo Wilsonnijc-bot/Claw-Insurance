@@ -650,10 +650,14 @@ class ApiServer:
         return reply_targets_path(wa_cfg.reply_targets_file, Path(__file__).resolve().parents[2])
 
     def _load_reply_targets(self) -> dict:
-        p = self._reply_targets_path()
-        if not p.exists():
-            return {"direct_reply_targets": [], "group_reply_targets": []}
-        return json.loads(p.read_text(encoding="utf-8"))
+        from nanobot.channels.whatsapp_reply_targets import load_reply_targets
+
+        wa_cfg = self.config.channels.whatsapp
+        return load_reply_targets(
+            self._reply_targets_path(),
+            project_root=Path(__file__).resolve().parents[2],
+            group_members_file=str(getattr(wa_cfg, "group_members_file", "") or ""),
+        )
 
     def _save_reply_targets(self, data: dict) -> None:
         p = self._reply_targets_path()

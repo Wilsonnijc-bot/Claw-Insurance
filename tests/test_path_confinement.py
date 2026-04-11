@@ -20,6 +20,7 @@ import pytest
 
 from nanobot.utils.paths import (
     PathEscapeError,
+    _set_project_root,
     confine_path,
     is_inside_project,
     project_path,
@@ -48,6 +49,25 @@ class TestProjectRoot:
     def test_project_path_joins_correctly(self):
         assert project_path("data") == project_root() / "data"
         assert project_path("sessions", "test") == project_root() / "sessions" / "test"
+
+    def test_project_root_prefers_env_override(self, monkeypatch, tmp_path):
+        runtime_root = tmp_path / "runtime-root"
+        (runtime_root / "nanobot").mkdir(parents=True)
+        (runtime_root / "config.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("NANOBOT_PROJECT_ROOT", str(runtime_root))
+        assert project_root() == runtime_root.resolve()
+
+    def test_project_root_can_use_runtime_cwd_for_packaged_install(self, monkeypatch, tmp_path):
+        runtime_root = tmp_path / "runtime-root"
+        (runtime_root / "nanobot").mkdir(parents=True)
+        (runtime_root / "googleconfig.json").write_text("{}", encoding="utf-8")
+        monkeypatch.delenv("NANOBOT_PROJECT_ROOT", raising=False)
+        old_root = _set_project_root(tmp_path / "installed-root")
+        try:
+            monkeypatch.chdir(runtime_root)
+            assert project_root() == runtime_root.resolve()
+        finally:
+            _set_project_root(old_root)
 
 
 class TestConfinePath:
@@ -223,13 +243,6 @@ class TestConfigSchemaConfinement:
 
 class TestWhatsAppPathConfinement:
     """Tests that WhatsApp file path functions stay project-local."""
-
-    def test_contacts_path_default_is_project_local(self):
-        from nanobot.config.schema import Config
-        from nanobot.channels.whatsapp_contacts import contacts_path
-        config = Config()
-        result = contacts_path(config.channels.whatsapp.contacts_file)
-        assert is_inside_project(result), f"contacts_path outside project: {result}"
 
     def test_group_members_path_default_is_project_local(self):
         from nanobot.config.schema import Config

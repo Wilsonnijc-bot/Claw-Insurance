@@ -35,6 +35,7 @@ media/
 state/
 cron/
 config.json
+supabaseconfig.json
 secrets/*.json
 !secrets/.gitkeep
 test_words/*

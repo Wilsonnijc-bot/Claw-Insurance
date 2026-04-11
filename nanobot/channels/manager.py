@@ -154,9 +154,7 @@ class ChannelManager:
 
     def _validate_allow_from(self) -> None:
         for name, ch in self.channels.items():
-            if name == "whatsapp" and (
-                getattr(ch.config, "contacts_file", "") or getattr(ch.config, "group_members_file", "")
-            ):
+            if name == "whatsapp":
                 continue
             if getattr(ch.config, "allow_from", None) == []:
                 raise SystemExit(

@@ -11,8 +11,14 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from nanobot.config.schema import Config
+from nanobot.config.supabase_loader import (
+    has_external_supabase_config,
+    load_supabase_config,
+    save_supabase_config,
+)
 from nanobot.utils.paths import confine_path, project_root
 
 logger = logging.getLogger(__name__)
@@ -101,14 +107,15 @@ def load_config(config_path: Path | None = None) -> Config:
     the project-local ``config.json`` or an explicit env-var override.
     """
     for path in get_config_search_paths(config_path):
-        if not path.exists():
-            continue
         try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            data = _migrate_config(data)
+            data = _read_optional_json_object(path, label="config.json")
+            split_catalog = load_supabase_config(path)
+            if data is None and not split_catalog:
+                continue
+            data = _migrate_config(data or {})
+            data = _merge_split_configs(data, catalog=split_catalog)
             return Config.model_validate(data)
-        except (json.JSONDecodeError, ValueError) as e:
+        except ValueError as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
             break
@@ -128,9 +135,36 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = config.model_dump(by_alias=True)
+    externalized_catalog = has_external_supabase_config(path)
+    catalog_data = data.pop("catalog", None) if externalized_catalog else None
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    if externalized_catalog:
+        save_supabase_config(catalog_data or {}, path)
+
+
+def _read_optional_json_object(path: Path, *, label: str) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is not valid JSON: {path}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must contain a JSON object: {path}")
+    return payload
+
+
+def _merge_split_configs(data: dict[str, Any], *, catalog: dict[str, Any]) -> dict[str, Any]:
+    if not catalog:
+        return data
+    merged = dict(data)
+    current_catalog = merged.get("catalog")
+    base_catalog = dict(current_catalog) if isinstance(current_catalog, dict) else {}
+    base_catalog.update(catalog)
+    merged["catalog"] = base_catalog
+    return merged
 
 
 def _migrate_config(data: dict) -> dict:

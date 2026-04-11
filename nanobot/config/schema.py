@@ -32,8 +32,7 @@ class WhatsAppConfig(Base):
     web_cdp_url: str = "http://127.0.0.1:9222"
     web_cdp_chrome_path: str = ""
     web_profile_dir: str = Field(default_factory=lambda: _project_path_str("whatsapp-web"))
-    contacts_file: str = Field(default_factory=lambda: _project_path_str("data", "contacts", "whatsapp.json"))
-    group_members_file: str = Field(default_factory=lambda: _project_path_str("data", "whatsapp_groups.csv"))
+    group_members_file: str = ""
     reply_targets_file: str = Field(default_factory=lambda: _project_path_str("data", "whatsapp_reply_targets.json"))
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
@@ -313,7 +312,7 @@ class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
-    port: int = 18790
+    port: int = 3456
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
@@ -366,8 +365,12 @@ class CatalogConfig(Base):
 
     supabase_url: str = ""
     supabase_anon_key: str = ""
+    supabase_project_ref: str = ""
+    supabase_management_token: str = ""
     supabase_catalog_table: str = ""
     supabase_catalog_tables: list[str] = Field(default_factory=list)
+    auto_restore_paused_project: bool = True
+    restore_timeout_seconds: int = 300
     cache_ttl_seconds: int = 300
 
 

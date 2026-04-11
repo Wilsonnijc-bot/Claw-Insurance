@@ -1,10 +1,11 @@
-x-common-config: &common-config
+x-backend-common: &backend-common
   build:
     context: .
     dockerfile: Dockerfile
   volumes:
     - ./config.json:/app/config.json
     - ./googleconfig.json:/app/googleconfig.json
+    - ./supabaseconfig.json:/app/supabaseconfig.json
     - ./data:/app/data
     - ./sessions:/app/sessions
     - ./state:/app/state
@@ -14,15 +15,17 @@ x-common-config: &common-config
     - ./whatsapp-web:/app/whatsapp-web
     - ./whatsapp-web-debug:/app/whatsapp-web-debug
     - ./skills:/app/skills
+    - ./media:/app/media
+    - ./cron:/app/cron
 
 services:
   nanobot-gateway:
     container_name: nanobot-gateway
-    <<: *common-config
-    command: ["gateway"]
+    <<: *backend-common
+    command: ["gateway", "--api-port", "3456"]
     restart: unless-stopped
     ports:
-      - 18790:18790
+      - "3456:3456"
     deploy:
       resources:
         limits:
@@ -31,9 +34,20 @@ services:
         reservations:
           cpus: '0.25'
           memory: 256M
+
+  nanobot-frontend:
+    container_name: nanobot-frontend
+    build:
+      context: "./Insurance frontend"
+      dockerfile: Dockerfile
+    depends_on:
+      - nanobot-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:80"
   
   nanobot-cli:
-    <<: *common-config
+    <<: *backend-common
     profiles:
       - cli
     command: ["status"]

@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -31,6 +31,9 @@ _CANONICAL_FIELDS = (
 
 _DEFAULT_CACHE_TTL_SECONDS = 300
 _DEFAULT_PAGE_SIZE = 1000
+_DEFAULT_RESTORE_TIMEOUT_SECONDS = 300
+_DEFAULT_RESTORE_POLL_SECONDS = 5
+_SUPABASE_MANAGEMENT_API_BASE = "https://api.supabase.com/v1"
 
 
 def normalize_header(value: str) -> str:
@@ -56,8 +59,12 @@ def _normalize_row(mapping: dict[str, Any], *, source_file: str) -> dict[str, An
 class CatalogSettings:
     supabase_url: str = ""
     supabase_anon_key: str = ""
+    supabase_project_ref: str = ""
+    supabase_management_token: str = ""
     supabase_catalog_table: str = ""
     supabase_catalog_tables: tuple[str, ...] = ()
+    auto_restore_paused_project: bool = True
+    restore_timeout_seconds: int = _DEFAULT_RESTORE_TIMEOUT_SECONDS
     cache_ttl_seconds: int = _DEFAULT_CACHE_TTL_SECONDS
 
 
@@ -94,6 +101,18 @@ def load_catalog_settings() -> CatalogSettings:
                 return value.strip()
         return str(configured.get(default, "")).strip() if default else ""
 
+    def _pick_bool(*keys: str, default: str = "", fallback: bool = False) -> bool:
+        for key in keys:
+            raw = os.environ.get(key)
+            if raw is not None:
+                return str(raw).strip().casefold() not in {"", "0", "false", "no", "off"}
+        raw = configured.get(default, fallback) if default else fallback
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return fallback
+        return str(raw).strip().casefold() not in {"", "0", "false", "no", "off"}
+
     raw_ttl = (
         os.environ.get("CATALOG__CACHE_TTL_SECONDS")
         or os.environ.get("SUPABASE_CACHE_TTL_SECONDS")
@@ -103,6 +122,16 @@ def load_catalog_settings() -> CatalogSettings:
         ttl = max(int(raw_ttl), 0)
     except (TypeError, ValueError):
         ttl = _DEFAULT_CACHE_TTL_SECONDS
+
+    raw_restore_timeout = (
+        os.environ.get("CATALOG__RESTORE_TIMEOUT_SECONDS")
+        or os.environ.get("SUPABASE_RESTORE_TIMEOUT_SECONDS")
+        or configured.get("restore_timeout_seconds", _DEFAULT_RESTORE_TIMEOUT_SECONDS)
+    )
+    try:
+        restore_timeout = max(int(raw_restore_timeout), 0)
+    except (TypeError, ValueError):
+        restore_timeout = _DEFAULT_RESTORE_TIMEOUT_SECONDS
 
     raw_tables = (
         os.environ.get("CATALOG__SUPABASE_CATALOG_TABLES")
@@ -135,8 +164,26 @@ def load_catalog_settings() -> CatalogSettings:
             "SUPABASE_KEY",
             default="supabase_anon_key",
         ),
+        supabase_project_ref=_pick(
+            "CATALOG__SUPABASE_PROJECT_REF",
+            "SUPABASE_PROJECT_REF",
+            default="supabase_project_ref",
+        ),
+        supabase_management_token=_pick(
+            "CATALOG__SUPABASE_MANAGEMENT_TOKEN",
+            "SUPABASE_MANAGEMENT_TOKEN",
+            "SUPABASE_ACCESS_TOKEN",
+            default="supabase_management_token",
+        ),
         supabase_catalog_table=single_table,
         supabase_catalog_tables=tuple(tables),
+        auto_restore_paused_project=_pick_bool(
+            "CATALOG__AUTO_RESTORE_PAUSED_PROJECT",
+            "SUPABASE_AUTO_RESTORE_PAUSED_PROJECT",
+            default="auto_restore_paused_project",
+            fallback=True,
+        ),
+        restore_timeout_seconds=restore_timeout,
         cache_ttl_seconds=ttl,
     )
 
@@ -229,14 +276,149 @@ class SupabaseCatalogRepository:
         rows: list[dict[str, Any]] = []
         try:
             with self._client_factory(timeout=10.0) as client:
-                for table_name in table_names:
-                    rows.extend(self._fetch_table_rows(client, settings.supabase_url, table_name, headers))
+                attempted_recovery = False
+                while True:
+                    rows = []
+                    try:
+                        for table_name in table_names:
+                            rows.extend(self._fetch_table_rows(client, settings.supabase_url, table_name, headers))
+                        break
+                    except CatalogUnavailableError as exc:
+                        if attempted_recovery or not self._should_attempt_restore(str(exc)):
+                            raise
+                        if not self._reactivate_project_if_needed(client, str(exc)):
+                            raise
+                        attempted_recovery = True
         except CatalogUnavailableError:
             raise
         except Exception as exc:
             raise CatalogUnavailableError(f"Supabase catalog request failed: {exc}") from exc
 
         return rows
+
+    def _project_ref(self) -> str:
+        explicit = self._settings.supabase_project_ref.strip()
+        if explicit:
+            return explicit
+        hostname = (urlparse(self._settings.supabase_url).hostname or "").strip().lower()
+        match = re.match(r"^([a-z0-9-]+)\.supabase\.[a-z.]+$", hostname)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _project_status_kind(status: str | None) -> str:
+        lowered = normalize_text(status).casefold()
+        if not lowered:
+            return "unknown"
+        if any(token in lowered for token in ("inactive", "paused", "suspended", "retired")):
+            return "inactive"
+        if any(token in lowered for token in ("restore", "starting", "resum", "provision", "pending")):
+            return "restoring"
+        if "active" in lowered or "healthy" in lowered or "running" in lowered:
+            return "active"
+        return "unknown"
+
+    @staticmethod
+    def _should_attempt_restore(detail: str) -> bool:
+        lowered = normalize_text(detail).casefold()
+        return any(
+            token in lowered
+            for token in (
+                " 540",
+                "(540)",
+                "inactive",
+                "paused",
+                "restore project",
+                "temporarily retired",
+                "retired",
+            )
+        )
+
+    def _management_headers(self) -> dict[str, str]:
+        token = self._settings.supabase_management_token.strip()
+        if not token:
+            raise CatalogUnavailableError(
+                "Supabase project appears inactive, but automatic restore is unavailable: "
+                "missing supabase_management_token."
+            )
+        return {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+    def _project_management_url(self) -> str:
+        project_ref = self._project_ref()
+        if not project_ref:
+            raise CatalogUnavailableError(
+                "Supabase project appears inactive, but automatic restore is unavailable: "
+                "missing supabase_project_ref and it could not be inferred from supabase_url."
+            )
+        return f"{_SUPABASE_MANAGEMENT_API_BASE}/projects/{quote(project_ref, safe='')}"
+
+    def _reactivate_project_if_needed(self, client: httpx.Client, detail: str) -> bool:
+        if not self._settings.auto_restore_paused_project:
+            raise CatalogUnavailableError(
+                f"{detail} Automatic restore is disabled for this catalog configuration."
+            )
+
+        headers = self._management_headers()
+        project_url = self._project_management_url()
+        status = self._get_project_status(client, project_url, headers)
+        status_kind = self._project_status_kind(status)
+
+        if status_kind == "active":
+            return False
+
+        if status_kind == "inactive":
+            restore_response = client.post(f"{project_url}/restore", headers=headers)
+            if restore_response.status_code >= 400:
+                detail = restore_response.text.strip()[:300]
+                raise CatalogUnavailableError(
+                    f"Supabase project restore failed ({restore_response.status_code}): {detail}"
+                )
+
+        if status_kind in {"inactive", "restoring"}:
+            self._wait_for_project_active(client, project_url, headers)
+            return True
+
+        return False
+
+    def _get_project_status(
+        self,
+        client: httpx.Client,
+        project_url: str,
+        headers: dict[str, str],
+    ) -> str:
+        response = client.get(project_url, headers=headers)
+        if response.status_code >= 400:
+            detail = response.text.strip()[:300]
+            raise CatalogUnavailableError(
+                f"Supabase project status request failed ({response.status_code}): {detail}"
+            )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise CatalogUnavailableError("Supabase project status request returned a non-object payload.")
+        return normalize_text(payload.get("status", ""))
+
+    def _wait_for_project_active(
+        self,
+        client: httpx.Client,
+        project_url: str,
+        headers: dict[str, str],
+    ) -> None:
+        timeout_seconds = max(int(self._settings.restore_timeout_seconds), 0)
+        deadline = time.monotonic() + timeout_seconds
+        last_status = ""
+
+        while True:
+            last_status = self._get_project_status(client, project_url, headers)
+            if self._project_status_kind(last_status) == "active":
+                return
+            if timeout_seconds == 0 or time.monotonic() >= deadline:
+                raise CatalogUnavailableError(
+                    "Supabase project restore did not become active before timeout. "
+                    f"Last known status: {last_status or 'unknown'}."
+                )
+            time.sleep(_DEFAULT_RESTORE_POLL_SECONDS)
 
     def _table_names(self) -> tuple[str, ...]:
         if self._settings.supabase_catalog_tables:

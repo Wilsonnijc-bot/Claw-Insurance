@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+case "$SCRIPT_PATH" in
+  */*) SCRIPT_DIR="${SCRIPT_PATH%/*}" ;;
+  *) SCRIPT_DIR="." ;;
+esac
+ROOT_DIR="$(cd -- "$SCRIPT_DIR" && pwd -P)"
+VENV_DIR="$ROOT_DIR/.venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
+FRONTEND_DIR="$ROOT_DIR/Insurance frontend"
+
+print_step() {
+  printf '\n[%s] %s\n' "$1" "$2"
+}
+
+fail() {
+  printf 'bootstrap: %s\n' "$1" >&2
+  exit 1
+}
+
+need_command() {
+  local name="$1"
+  local guidance="$2"
+  if ! command -v "$name" >/dev/null 2>&1; then
+    fail "$name not found. $guidance"
+  fi
+}
+
+case "$(uname -s)" in
+  Darwin|Linux) ;;
+  *)
+    fail "this bootstrap flow currently supports macOS/Linux with a project-local .venv."
+    ;;
+esac
+
+need_command "python3" "Install Python 3.11+ and rerun ./bootstrap."
+need_command "npm" "Install Node.js 20+ with npm and rerun ./bootstrap."
+
+if [ ! -d "$FRONTEND_DIR" ] || [ ! -f "$FRONTEND_DIR/package.json" ]; then
+  fail "frontend project not found at '$FRONTEND_DIR'."
+fi
+
+cd "$ROOT_DIR"
+
+print_step "1/4" "Preparing repo-local Python environment"
+if [ ! -d "$VENV_DIR" ]; then
+  python3 -m venv "$VENV_DIR"
+  printf 'Created %s\n' "$VENV_DIR"
+fi
+
+if [ ! -x "$VENV_PYTHON" ]; then
+  fail "existing .venv is missing '$VENV_PYTHON'. Remove .venv and rerun ./bootstrap."
+fi
+
+"$VENV_PYTHON" -m pip install --upgrade pip
+"$VENV_PYTHON" -m pip install -e .
+
+print_step "2/4" "Installing frontend dependencies"
+if [ -f "$FRONTEND_DIR/package-lock.json" ]; then
+  npm ci --prefix "$FRONTEND_DIR"
+else
+  npm install --prefix "$FRONTEND_DIR"
+fi
+
+print_step "3/4" "Installing wrapper commands"
+"$VENV_PYTHON" -m nanobot install-ui-command
+
+print_step "4/4" "Bootstrap complete"
+printf 'Backend dependencies installed in %s\n' "$VENV_DIR"
+printf 'Frontend dependencies installed in %s\n' "$FRONTEND_DIR"
+printf 'Wrapper commands installed via nanobot install-ui-command\n'
+
+printf '\nNext steps:\n'
+printf '  1. source .venv/bin/activate\n'
+printf '  2. python -m nanobot setup\n'
+printf '  3. python -m nanobot status\n'
+printf '  4. whatsapp-web-nanobot-ui\n'

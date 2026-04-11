@@ -11,3 +11,17 @@ build/
 node_modules/
 bridge/dist/
 workspace/
+config.json
+googleconfig.json
+supabaseconfig.json
+secrets/
+data/
+sessions/
+state/
+memory/
+media/
+cron/
+whatsapp-auth/
+whatsapp-web/
+whatsapp-web-debug/
+.bridge-build/

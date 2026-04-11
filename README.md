@@ -12,12 +12,112 @@ Nanobot is currently a project-local WhatsApp operator system with:
 
 This README describes the code that exists today, not the intended architecture from older revisions.
 
+## Install And Setup
+
+### Prerequisites
+
+- Python `>= 3.11`
+- Node.js `>= 20`
+- `npm`
+- Chrome or Chromium available if you use CDP mode or history scraping
+
+### Recommended Local Runtime
+
+Use a project-local virtualenv in this checkout. Do not rely on random system Python installs.
+
+### 1. Clone The Repo
+
+```bash
+git clone <your-repo-url> Nanobot-Whatsapp
+cd Nanobot-Whatsapp
+```
+
+### 2. Run The Bootstrap Command
+
+```bash
+./bootstrap
+```
+
+This command:
+
+- creates or reuses the repo-local `.venv`
+- upgrades `pip` inside that `.venv`
+- installs backend dependencies with `pip install -e .`
+- installs frontend dependencies in `Insurance frontend/`
+- installs the wrapper commands with `python -m nanobot install-ui-command`
+- leaves config setup as a separate next step
+
+The bootstrap flow is intended for macOS/Linux with a project-local `.venv`.
+
+### 3. Activate The Project Venv
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+```
+
+### 4. Run The Guided Setup
+
+The primary onboarding path is now a single guided command:
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+python -m nanobot setup
+```
+
+The setup flow:
+
+- asks for the core runtime settings Nanobot needs for a normal local run
+- optionally asks for Supabase catalog settings
+- optionally asks for Google STT settings
+- validates obvious mistakes before writing files
+- writes split config files automatically
+- prints the next commands to run
+
+If you plan to enable Google STT, put the real service-account JSON inside this checkout first, for example:
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+mkdir -p secrets
+# place your real credential file at:
+#   /path/to/Nanobot-Whatsapp/secrets/google-credentials.json
+```
+
+The guided setup does not install Python, Node, Chrome, Supabase resources, or Google credentials for you. It only validates inputs and writes Nanobot's local config files.
+
+### 5. Sanity Check The Local Install
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+python -m nanobot status
+```
+
+Use this to confirm the config, workspace, sessions, memory, auth, and browser paths all resolve inside the repo.
+
+### 6. Launch The App With The Wrapper
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+whatsapp-web-nanobot-ui
+```
+
+### 7. Stop The Local UI And Backend Processes
+
+```bash
+cd /path/to/Nanobot-Whatsapp
+source .venv/bin/activate
+python -m nanobot stop-dev
+```
+
 ## Current Reality
 
 These are the most important implementation facts right now:
 
 - The checked-in `config.json` enables WhatsApp, uses the repo root as the workspace, and sets `channels.whatsapp.deliveryMode` to `"send"`.
-- The active UI/API port is `3456`. The `gateway --port` flag and `18790` references are currently vestigial; the gateway code does not bind a public server on `18790`.
+- The active UI/API port is `3456`, and the packaged Docker/compose assets now follow that same backend port.
 - The UI login page is not real credential enforcement. `POST /api/login` uses the username for journaling and ignores the password.
 - The frontend does not persist chat history in browser storage. The rendered transcript always comes from backend session JSONL files.
 - With the UI connected, inbound WhatsApp DMs are forced into capture-only mode so the system saves them and optionally generates drafts, but does not auto-send replies.
@@ -91,12 +191,13 @@ The system is intentionally project-local. Runtime state lives under this reposi
 
 | Path | What it stores | Source-of-truth status |
 | --- | --- | --- |
-| `config.json` | runtime configuration | canonical config |
+| `config.json` | core runtime configuration | canonical app config |
 | `googleconfig.json` | Google STT feature settings only | canonical Google STT config |
+| `supabaseconfig.json` | Supabase catalog settings only | canonical catalog config |
 | `secrets/google-credentials.json` | Google service-account credential loaded at runtime from disk | canonical Google credential path |
-| `data/contacts/whatsapp.json` | direct-contact allowlist | canonical direct inbound allowlist |
-| `data/whatsapp_groups.csv` | group-member allowlist | canonical group inbound allowlist |
-| `data/whatsapp_reply_targets.json` | direct/group reply targets, auto-draft flags, observed IDs | canonical operator target registry |
+| `data/contacts/whatsapp.json` | legacy direct-contact source used only for one-time migration into reply targets | legacy compatibility only |
+| `data/whatsapp_groups.csv` | optional legacy group-member compatibility store | legacy compatibility only |
+| `data/whatsapp_reply_targets.json` | direct/group reply targets, auto-draft flags, observed IDs, and migration markers | canonical operator target registry and inbound routing registry |
 | `sessions/whatsapp__{phone}/session.jsonl` | append-only persisted conversation history and saved `offline_meeting_note` records | canonical chat and note history |
 | `sessions/whatsapp__{phone}/meta.json` | derived session metadata, pointers, and offline-meeting note index entries | derived from `session.jsonl` |
 | `memory/{phone}/MEMORY.md` | per-client long-term memory | canonical per-client memory |
@@ -118,79 +219,51 @@ Important source-of-truth rules:
 - AI drafts are not persisted when they are only drafts. Only approved/sent content is written to session history.
 - Offline meeting voice notes do not persist audio. Draft transcription persists nothing; only user-saved transcript text is appended as `offline_meeting_note` rows in the matching client's `session.jsonl`, while `meta.json` keeps only a lightweight `offline_meeting_note_index` with `note_id` and `created_at`.
 
-## Install And Setup
+## Advanced Config Files
 
-### Prerequisites
+The setup command keeps the internal split-config architecture but hides that complexity during onboarding.
 
-- Python `>= 3.11`
-- Node.js `>= 20`
-- `npm`
-- Chrome or Chromium available if you use CDP mode or history scraping
+| File | What it stores | When to edit manually |
+| --- | --- | --- |
+| `config.json` | core runtime config such as provider choice, model, API base, and WhatsApp runtime settings | edit when you want to change the main model/provider or other core runtime behavior |
+| `supabaseconfig.json` | optional Supabase catalog settings only | edit when catalog URL, keys, tables, or restore behavior change |
+| `googleconfig.json` | optional Google STT settings only | edit when project ID, location, language, or credential path changes |
 
-### Recommended Local Runtime
+Important notes:
 
-Use a project-local virtualenv in this checkout. Do not rely on random system Python installs.
+- `python -m nanobot setup` writes these files separately on purpose. It does not collapse them back into one file.
+- Google credentials stay outside the config payload itself. `googleconfig.json` stores only `credentialJsonPath`, and that path should point to a project-local JSON file under `secrets/`.
+- Despite the field name `supabaseAnonKey`, Nanobot normally needs a backend-capable Supabase key here, typically a `service_role` key, not a publishable browser `anon` key.
+- Supabase remains backward compatible with legacy `config.json -> catalog`, but the preferred productized layout is the separate `supabaseconfig.json`.
+- Manual edits are still supported. If you rerun `python -m nanobot setup`, it will detect existing files and offer update, overwrite, skip, keep, or remove behavior instead of overwriting silently.
 
-### 1. Create And Activate The Project Venv
+## Manual Dependency Install
+
+If you do not want the bootstrap command, the equivalent manual install flow is:
 
 ```bash
-cd /path/to/Nanobot-Whatsapp
+git clone <your-repo-url> Nanobot-Whatsapp
+cd Nanobot-Whatsapp
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-```
-
-### 2. Install Backend Dependencies Into That Venv
-
-```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
 python -m pip install -e .
+cd "Insurance frontend"
+npm ci
+cd ..
+python -m nanobot install-ui-command
 ```
 
-For normal local runs, `pip install -e .` is enough.
-Only install `pip install -e ".[dev]"` if you specifically need the repo's test and lint tooling.
+Use `npm install` instead of `npm ci` only when `Insurance frontend/package-lock.json` is absent.
+Use `pip install -e ".[dev]"` only if you specifically need the repo's test and lint tooling.
 
-### 3. Install Frontend Dependencies
+The wrapper installer creates:
 
-```bash
-cd "/path/to/Nanobot-Whatsapp/Insurance frontend"
-npm install
-```
+- `whatsapp-web-nanobot-ui`
+- `whatsapp-web-nanobot-gateway`
 
-### 4. Put The Google STT Files In Place
-
-For the existing `线下会面录音` feature, keep Google files separate from the main app config:
-
-- `config.json` remains the normal app config.
-- `googleconfig.json` contains only Google STT settings such as `projectId`, `location`, `languageCode`, `model`, and `credentialJsonPath`.
-- `secrets/google-credentials.json` is the real Google service-account JSON file.
-
-The backend loads the credential only from `googleconfig.json -> credentialJsonPath` at runtime. The credential is never bundled into the frontend, never merged into `config.json`, and never written into session history.
-
-Place the files like this:
-
-```bash
-cd /path/to/Nanobot-Whatsapp
-mkdir -p secrets
-# put your real service-account JSON at:
-#   /path/to/Nanobot-Whatsapp/secrets/google-credentials.json
-# or update googleconfig.json to match the exact filename you shipped
-```
-
-A minimal `googleconfig.json` looks like:
-
-```json
-{
-  "projectId": "your-project-id",
-  "location": "us",
-  "languageCode": "yue-Hant-HK",
-  "model": "chirp_3",
-  "credentialJsonPath": "secrets/google-credentials.json"
-}
-```
-
-The offline meeting flow stays on the existing client-profile card labeled `线下会面录音`. It records one short note up to 60 seconds, uploads the final blob once, transcribes it with Google Speech-to-Text V2, shows an editable draft in the UI, and discards the audio immediately after transcription. Nothing is stored until the user presses `保存`. Saved note bodies stay only in appended `offline_meeting_note` rows in `session.jsonl`; the note browser loads its chronological note list from `meta.json` and fetches full transcript content lazily per note.
+Those wrapper scripts point back to this checkout, export `NANOBOT_CONFIG_PATH` for this repo's `config.json`, and prefer this repo's `.venv/bin/python`.
+If the repo moves on disk, rerun `python -m nanobot install-ui-command` so the wrapper paths are refreshed.
 
 ### Chirp Transcript Meeting Notes
 
@@ -206,51 +279,6 @@ This system is the real implementation behind the existing `线下会面录音` 
 - `GET /api/clients/{phone}/offline-meeting-notes` reads the chronological note index from `meta.json`.
 - `GET /api/clients/{phone}/offline-meeting-notes/{noteId}` resolves the selected note by scanning that client's canonical JSONL note rows and returns the actual transcript text.
 - Nanobot context uses saved note transcripts from canonical JSONL note rows only. Unsaved drafts never enter context.
-
-### 5. Sanity Check The Local Install
-
-```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
-python -m nanobot status
-```
-
-Use this to confirm the config, workspace, sessions, memory, auth, and browser paths all resolve inside the repo.
-
-### 6. Install The Wrapper Commands
-
-Run this once per checkout:
-
-```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
-python -m nanobot install-ui-command
-```
-
-That installs:
-
-- `whatsapp-web-nanobot-ui`
-- `whatsapp-web-nanobot-gateway`
-
-Those wrapper scripts point back to this checkout, export `NANOBOT_CONFIG_PATH` for this repo's `config.json`, and prefer this repo's `.venv/bin/python`.
-
-If the repo moves on disk, run the installer again so the wrapper paths are refreshed.
-
-### 7. Launch The App With The Wrapper
-
-```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
-whatsapp-web-nanobot-ui
-```
-
-### 8. Stop The Local UI And Backend Processes
-
-```bash
-cd /path/to/Nanobot-Whatsapp
-source .venv/bin/activate
-python -m nanobot stop-dev
-```
 
 ## Real End-To-End Operator Flow
 
@@ -331,8 +359,8 @@ This is the current DM path when the UI is connected:
 
 1. The bridge receives a WhatsApp event through Baileys.
 2. `WhatsAppChannel` normalizes the sender and checks allowlists.
-   Direct DMs use `data/contacts/whatsapp.json` or `allowFrom`.
-   Group messages use `data/whatsapp_groups.csv` and `group_reply_targets`.
+   Direct DMs use enabled `direct_reply_targets` in `data/whatsapp_reply_targets.json`, with `allowFrom` only as an explicit fallback.
+   Group messages use `group_reply_targets` in `data/whatsapp_reply_targets.json`.
 3. For direct DMs, the channel publishes an `InboundMessage` to the bus.
 4. Because the UI is connected, `MessageBus.publish_inbound()` forces that WhatsApp DM into:
    - `capture_only = true`
@@ -344,7 +372,7 @@ This is the current DM path when the UI is connected:
 Important consequences:
 
 - UI-connected mode is save-and-draft mode, not auto-send mode.
-- A DM from an allowed contact is still persisted even if it is not an enabled reply target.
+- A DM is accepted when the sender is an enabled direct reply target, or when the sender is explicitly listed in `allowFrom`.
 - The UI client list only shows phones present in `data/whatsapp_reply_targets.json`, so non-target sessions can exist on disk without appearing in the sidebar.
 
 ### 6. Session JSONL Persistence
@@ -575,17 +603,20 @@ Effects:
 - history imports reject mismatched or missing client phones
 - direct-target matching cross-checks phone and chat identifiers to avoid cross-client leakage
 
-### Docker And Compose Caveat
+### Docker And Compose
 
-The checked-in Docker assets are not the recommended operator path today.
+Project-local `.venv` plus `pip install -e .` remains the primary runtime.
+Docker support is optional packaging on top of that same runtime contract.
 
-Current mismatch:
+Current packaged behavior:
 
 - `nanobot gateway` still exposes the UI/API on `3456`
-- `Dockerfile` and `docker-compose.yml` still revolve around `18790`
-- the compose file publishes `18790` but not `3456`
+- the backend container exposes and publishes `3456`
+- the frontend container serves Nginx on container port `80` and is published on host `8080`
+- the frontend proxies same-origin `/api` and `/ws` to `nanobot-gateway:3456`
+- compose bind-mounts project-local `config.json`, `googleconfig.json`, `supabaseconfig.json`, `secrets/`, and runtime state directories into `/app`
 
-So the checked-in compose file does not expose the port the current frontend expects.
+This keeps the containerized package aligned with the live local runtime instead of inventing a separate port model.
 
 ### `whatsapp-web-debug/`
 
@@ -595,6 +626,8 @@ So the checked-in compose file does not expose the port the current frontend exp
 
 | Command | What it really does today |
 | --- | --- |
+| `./bootstrap` | creates or reuses `.venv`, installs backend and frontend dependencies, and installs wrapper commands |
+| `python3 -m nanobot setup` | guided onboarding that writes `config.json`, optional `supabaseconfig.json`, and optional `googleconfig.json` |
 | `python3 -m nanobot install-ui-command` | installs per-checkout wrapper scripts |
 | `whatsapp-web-nanobot-ui` | starts launcher if needed, then runs Vite |
 | `whatsapp-web-nanobot-gateway` | starts the full backend immediately |

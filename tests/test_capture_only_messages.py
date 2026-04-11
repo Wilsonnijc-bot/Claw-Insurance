@@ -11,7 +11,6 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import HistoryImportResult, InboundHistoryBatch, InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.whatsapp import WhatsAppChannel
-from nanobot.channels.whatsapp_contacts import load_contacts
 from nanobot.channels.whatsapp_group_members import load_group_members
 from nanobot.channels.whatsapp_reply_targets import load_reply_targets, rewrite_from_self_instruction
 from nanobot.config.schema import ChannelsConfig, WhatsAppConfig
@@ -60,13 +59,11 @@ async def test_capture_only_message_is_saved_without_reply_or_llm_call(tmp_path:
 
 @pytest.mark.asyncio
 async def test_capture_only_self_command_updates_whatsapp_routing_files(tmp_path: Path) -> None:
-    contacts_file = str(tmp_path / "contacts.json")
     groups_file = str(tmp_path / "groups.csv")
     targets_file = str(tmp_path / "data" / "whatsapp_reply_targets.json")
     channels_config = ChannelsConfig(
         whatsapp=WhatsAppConfig(
             enabled=True,
-            contacts_file=contacts_file,
             group_members_file=groups_file,
             reply_targets_file=targets_file,
         )
@@ -96,10 +93,8 @@ async def test_capture_only_self_command_updates_whatsapp_routing_files(tmp_path
     loop.provider.chat.assert_not_called()
     assert loop.bus.outbound_size == 0
 
-    contacts = load_contacts(contacts_file)
     rows = load_group_members(groups_file)
     targets = load_reply_targets(Path(targets_file))
-    assert [c.phone for c in contacts] == ["85212345678"]
     assert len(rows) == 1
     assert rows[0].group_name == "Insurance sales"
     assert rows[0].member_pn == "85269432591"

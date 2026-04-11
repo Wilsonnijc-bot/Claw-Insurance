@@ -62,3 +62,69 @@ def test_save_config_uses_app_config_path(monkeypatch, tmp_path: Path) -> None:
 
     saved = json.loads(app_config.read_text(encoding="utf-8"))
     assert saved["catalog"]["supabaseCatalogTable"] == "app_table"
+
+
+def test_load_config_merges_split_supabase_file_over_legacy_catalog(monkeypatch, tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_config = app_dir / "nanobot.json"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    app_config.write_text(
+        json.dumps(
+            {
+                "catalog": {
+                    "supabaseUrl": "https://legacy.supabase.co",
+                    "supabaseCatalogTable": "legacy_table",
+                    "cacheTtlSeconds": 30,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (app_dir / "supabaseconfig.json").write_text(
+        json.dumps(
+            {
+                "supabaseUrl": "https://split.supabase.co",
+                "supabaseCatalogTables": ["insurance_products", "dental_insurance"],
+                "cacheTtlSeconds": 120,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("NANOBOT_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("NANOBOT_APP_CONFIG_PATH", str(app_config))
+
+    config = load_config()
+
+    assert config.catalog.supabase_url == "https://split.supabase.co"
+    assert config.catalog.supabase_catalog_table == "legacy_table"
+    assert config.catalog.supabase_catalog_tables == ["insurance_products", "dental_insurance"]
+    assert config.catalog.cache_ttl_seconds == 120
+
+
+def test_save_config_writes_split_supabase_file_when_externalized(monkeypatch, tmp_path: Path) -> None:
+    app_dir = tmp_path / "app"
+    app_config = app_dir / "nanobot.json"
+    supabase_config = app_dir / "supabaseconfig.json"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    supabase_config.write_text("{}", encoding="utf-8")
+
+    monkeypatch.delenv("NANOBOT_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("NANOBOT_APP_CONFIG_PATH", str(app_config))
+
+    config = Config.model_validate(
+        {
+            "catalog": {
+                "supabaseUrl": "https://split.supabase.co",
+                "supabaseCatalogTables": ["insurance_products"],
+            }
+        }
+    )
+    save_config(config)
+
+    saved_main = json.loads(app_config.read_text(encoding="utf-8"))
+    saved_split = json.loads(supabase_config.read_text(encoding="utf-8"))
+
+    assert "catalog" not in saved_main
+    assert saved_split["supabaseUrl"] == "https://split.supabase.co"
+    assert saved_split["supabaseCatalogTables"] == ["insurance_products"]

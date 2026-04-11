@@ -8,10 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from nanobot.channels.whatsapp_contacts import normalize_contact_id
-from nanobot.channels.whatsapp_group_members import normalize_group_name
+from nanobot.channels.whatsapp_contacts import load_contacts, normalize_contact_id
+from nanobot.channels.whatsapp_group_members import load_group_members, normalize_group_name
 
 _DEFAULT_REL_PATH = "data/whatsapp_reply_targets.json"
+_LEGACY_CONTACTS_REL_PATH = Path("data") / "contacts" / "whatsapp.json"
 
 
 @dataclass(frozen=True)
@@ -59,32 +60,38 @@ def init_reply_targets_store(path: Path) -> Path:
     """Create reply-target store file with an empty payload."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        save_reply_targets(
-            path,
-            {
-                "version": 1,
-                "updated_at": "",
-                "source": "",
-                "direct_reply_targets": [],
-                "group_reply_targets": [],
-            },
-        )
+        save_reply_targets(path, _default_payload())
     return path
 
 
-def load_reply_targets(path: Path) -> dict[str, Any]:
+def load_reply_targets(
+    path: Path,
+    *,
+    project_root: Path | None = None,
+    group_members_file: str = "",
+) -> dict[str, Any]:
     """Load reply-target store with schema defaults."""
     init_reply_targets_store(path)
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
 
-    if not isinstance(payload, dict):
-        payload = {}
-    payload.setdefault("version", 1)
-    payload.setdefault("updated_at", "")
-    payload.setdefault("source", "")
-    payload.setdefault("direct_reply_targets", [])
-    payload.setdefault("group_reply_targets", [])
+    payload, changed = _normalize_payload(payload)
+    effective_project_root: Path | None = None
+    if project_root is not None:
+        try:
+            path.resolve().relative_to(Path(project_root).resolve())
+        except ValueError:
+            effective_project_root = None
+        else:
+            effective_project_root = Path(project_root)
+    changed = _migrate_legacy_contacts(payload, project_root=effective_project_root) or changed
+    changed = _migrate_legacy_group_members(
+        payload,
+        group_members_file=group_members_file,
+    ) or changed
+    if changed:
+        payload["updated_at"] = _now_iso()
+        save_reply_targets(path, payload)
     return payload
 
 
@@ -276,6 +283,13 @@ def rewrite_from_self_instruction(
     changed = False
 
     if individuals is not None:
+        existing_by_phone: dict[str, dict[str, Any]] = {}
+        for raw in payload.get("direct_reply_targets", []):
+            if not isinstance(raw, dict):
+                continue
+            phone = normalize_contact_id(str(raw.get("phone", "")))
+            if phone and phone not in existing_by_phone:
+                existing_by_phone[phone] = dict(raw)
         seen: set[str] = set()
         direct_rows: list[dict[str, Any]] = []
         for raw_phone in individuals:
@@ -283,21 +297,21 @@ def rewrite_from_self_instruction(
             if not phone or phone in seen:
                 continue
             seen.add(phone)
-            direct_rows.append(
-                {
-                    "phone": phone,
-                    "enabled": True,
-                    "label": "",
-                    "chat_id": "",
-                    "sender_id": "",
-                    "push_name": "",
-                    "last_seen_at": "",
-                }
-            )
+            direct_rows.append(_direct_row(existing_by_phone.get(phone), phone=phone, enabled=True))
         payload["direct_reply_targets"] = direct_rows
         changed = True
 
     if groups is not None:
+        existing_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for raw in payload.get("group_reply_targets", []):
+            if not isinstance(raw, dict):
+                continue
+            key = (
+                normalize_group_name(str(raw.get("group_name", ""))),
+                normalize_contact_id(str(raw.get("member_phone", ""))),
+            )
+            if key[0] and key[1] and key not in existing_by_key:
+                existing_by_key[key] = dict(raw)
         seen_group_members: set[tuple[str, str]] = set()
         group_rows: list[dict[str, Any]] = []
         for raw_group_name, raw_phone in groups:
@@ -311,16 +325,12 @@ def rewrite_from_self_instruction(
                 continue
             seen_group_members.add(key)
             group_rows.append(
-                {
-                    "group_name": group_name,
-                    "group_name_normalized": group_name_norm,
-                    "group_id": "",
-                    "member_phone": member_phone,
-                    "member_id": "",
-                    "member_label": "",
-                    "enabled": True,
-                    "last_seen_at": "",
-                }
+                _group_row(
+                    existing_by_key.get(key),
+                    group_name=group_name,
+                    member_phone=member_phone,
+                    enabled=True,
+                )
             )
         payload["group_reply_targets"] = group_rows
         changed = True
@@ -375,6 +385,176 @@ def observe_direct_identification(
     return changed
 
 
+def upsert_direct_reply_target(
+    path: Path,
+    *,
+    phone: str,
+    label: str = "",
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """Upsert one direct reply target while preserving discovered metadata."""
+    normalized_phone = normalize_contact_id(phone)
+    if not normalized_phone:
+        raise ValueError("Invalid phone number")
+
+    payload = load_reply_targets(path)
+    rows = payload.setdefault("direct_reply_targets", [])
+    match_index = -1
+    existing: dict[str, Any] | None = None
+    for index, raw in enumerate(rows):
+        if not isinstance(raw, dict):
+            continue
+        if normalize_contact_id(str(raw.get("phone", ""))) != normalized_phone:
+            continue
+        match_index = index
+        existing = dict(raw)
+        break
+
+    row = _direct_row(existing, phone=normalized_phone, enabled=enabled, label=label)
+    if match_index >= 0:
+        rows[match_index] = row
+    else:
+        rows.append(row)
+        rows.sort(key=lambda item: normalize_contact_id(str(item.get("phone", ""))))
+
+    payload["updated_at"] = _now_iso()
+    save_reply_targets(path, payload)
+    return row
+
+
+def remove_direct_reply_target(path: Path, *, phone: str) -> bool:
+    """Remove one direct reply target by phone."""
+    normalized_phone = normalize_contact_id(phone)
+    if not normalized_phone:
+        return False
+
+    payload = load_reply_targets(path)
+    rows = payload.get("direct_reply_targets", [])
+    kept = [
+        row
+        for row in rows
+        if not isinstance(row, dict) or normalize_contact_id(str(row.get("phone", ""))) != normalized_phone
+    ]
+    if len(kept) == len(rows):
+        return False
+
+    payload["direct_reply_targets"] = kept
+    payload["updated_at"] = _now_iso()
+    save_reply_targets(path, payload)
+    return True
+
+
+def upsert_group_reply_target(
+    path: Path,
+    *,
+    group_id: str = "",
+    group_name: str = "",
+    member_id: str = "",
+    member_phone: str = "",
+    member_label: str = "",
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """Upsert one group reply target while preserving discovered metadata."""
+    normalized_group_name = " ".join(str(group_name or "").split())
+    normalized_group_name_key = normalize_group_name(normalized_group_name)
+    normalized_member_phone = normalize_contact_id(member_phone)
+    normalized_group_id = str(group_id or "").strip().lower()
+    normalized_member_id = str(member_id or "").strip().lower()
+    if not normalized_group_id and not normalized_group_name_key:
+        raise ValueError("Provide at least one group identifier")
+    if not normalized_member_id and not normalized_member_phone:
+        raise ValueError("Provide at least one member identifier")
+
+    payload = load_reply_targets(path)
+    rows = payload.setdefault("group_reply_targets", [])
+    match_index = -1
+    existing: dict[str, Any] | None = None
+    for index, raw in enumerate(rows):
+        if not isinstance(raw, dict):
+            continue
+        if normalized_group_id and str(raw.get("group_id", "")).strip().lower() != normalized_group_id:
+            continue
+        if normalized_group_name_key and normalize_group_name(str(raw.get("group_name", ""))) != normalized_group_name_key:
+            continue
+        if normalized_member_id and str(raw.get("member_id", "")).strip().lower() != normalized_member_id:
+            continue
+        if normalized_member_phone and normalize_contact_id(str(raw.get("member_phone", ""))) != normalized_member_phone:
+            continue
+        match_index = index
+        existing = dict(raw)
+        break
+
+    row = _group_row(
+        existing,
+        group_name=normalized_group_name or str(existing.get("group_name", "") if existing else ""),
+        member_phone=normalized_member_phone or str(existing.get("member_phone", "") if existing else ""),
+        enabled=enabled,
+        group_id=group_id,
+        member_id=member_id,
+        member_label=member_label,
+    )
+    if match_index >= 0:
+        rows[match_index] = row
+    else:
+        rows.append(row)
+        rows.sort(
+            key=lambda item: (
+                normalize_group_name(str(item.get("group_name", ""))),
+                normalize_contact_id(str(item.get("member_phone", ""))),
+                str(item.get("group_id", "")).strip().lower(),
+                str(item.get("member_id", "")).strip().lower(),
+            )
+        )
+
+    payload["updated_at"] = _now_iso()
+    save_reply_targets(path, payload)
+    return row
+
+
+def remove_group_reply_target(
+    path: Path,
+    *,
+    group_id: str = "",
+    group_name: str = "",
+    member_id: str = "",
+    member_phone: str = "",
+) -> bool:
+    """Remove one group reply target row."""
+    normalized_group_id = str(group_id or "").strip().lower()
+    normalized_group_name = normalize_group_name(group_name)
+    normalized_member_id = str(member_id or "").strip().lower()
+    normalized_member_phone = normalize_contact_id(member_phone)
+    if not normalized_group_id and not normalized_group_name:
+        return False
+    if not normalized_member_id and not normalized_member_phone:
+        return False
+
+    def _keep(raw: Any) -> bool:
+        if not isinstance(raw, dict):
+            return True
+        if normalized_group_id and str(raw.get("group_id", "")).strip().lower() != normalized_group_id:
+            return True
+        if normalized_group_name and normalize_group_name(str(raw.get("group_name", ""))) != normalized_group_name:
+            return True
+        member_matches = False
+        if normalized_member_id and str(raw.get("member_id", "")).strip().lower() == normalized_member_id:
+            member_matches = True
+        if normalized_member_phone and normalize_contact_id(str(raw.get("member_phone", ""))) == normalized_member_phone:
+            member_matches = True
+        return not member_matches
+
+    payload = load_reply_targets(path)
+    rows = payload.get("group_reply_targets", [])
+    kept = [row for row in rows if _keep(row)]
+    if len(kept) == len(rows):
+        return False
+
+    payload["group_reply_targets"] = kept
+    payload["updated_at"] = _now_iso()
+    save_reply_targets(path, payload)
+    return True
+
+
 def observe_group_identification(
     path: Path,
     *,
@@ -424,3 +604,177 @@ def _now_iso() -> str:
 
 def _normalize_chat_identifier(value: str) -> str:
     return str(value or "").strip().casefold()
+
+
+def _default_payload() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "updated_at": "",
+        "source": "",
+        "migrations": {
+            "contacts_file_imported": False,
+            "group_members_file_imported": False,
+        },
+        "direct_reply_targets": [],
+        "group_reply_targets": [],
+    }
+
+
+def _normalize_payload(payload: Any) -> tuple[dict[str, Any], bool]:
+    changed = False
+    if not isinstance(payload, dict):
+        payload = {}
+        changed = True
+    payload.setdefault("version", 1)
+    payload.setdefault("updated_at", "")
+    payload.setdefault("source", "")
+    if not isinstance(payload.get("migrations"), dict):
+        payload["migrations"] = {}
+        changed = True
+    migrations = payload["migrations"]
+    if "contacts_file_imported" not in migrations:
+        migrations["contacts_file_imported"] = False
+        changed = True
+    if "group_members_file_imported" not in migrations:
+        migrations["group_members_file_imported"] = False
+        changed = True
+    if not isinstance(payload.get("direct_reply_targets"), list):
+        payload["direct_reply_targets"] = []
+        changed = True
+    if not isinstance(payload.get("group_reply_targets"), list):
+        payload["group_reply_targets"] = []
+        changed = True
+    return payload, changed
+
+
+def _migrate_legacy_contacts(payload: dict[str, Any], *, project_root: Path | None) -> bool:
+    migrations = payload.setdefault("migrations", {})
+    if migrations.get("contacts_file_imported"):
+        return False
+
+    migrations["contacts_file_imported"] = True
+    changed = True
+    if project_root is None:
+        return changed
+
+    legacy_contacts_file = Path(project_root) / _LEGACY_CONTACTS_REL_PATH
+    if not legacy_contacts_file.exists():
+        return changed
+
+    existing_by_phone: dict[str, dict[str, Any]] = {}
+    for raw in payload.get("direct_reply_targets", []):
+        if not isinstance(raw, dict):
+            continue
+        phone = normalize_contact_id(str(raw.get("phone", "")))
+        if phone and phone not in existing_by_phone:
+            existing_by_phone[phone] = raw
+
+    for contact in load_contacts(str(legacy_contacts_file)):
+        if not contact.enabled:
+            continue
+        phone = normalize_contact_id(contact.phone)
+        if not phone:
+            continue
+        row = existing_by_phone.get(phone)
+        if row is None:
+            row = _direct_row(None, phone=phone, enabled=True, label=contact.label)
+            payload.setdefault("direct_reply_targets", []).append(row)
+            existing_by_phone[phone] = row
+            changed = True
+            continue
+        if not bool(row.get("enabled", True)):
+            row["enabled"] = True
+            changed = True
+        label = str(contact.label or "").strip()
+        if label and not str(row.get("label", "")).strip():
+            row["label"] = label
+            changed = True
+
+    payload["direct_reply_targets"] = sorted(
+        payload.get("direct_reply_targets", []),
+        key=lambda item: normalize_contact_id(str(item.get("phone", ""))),
+    )
+    return changed
+
+
+def _migrate_legacy_group_members(payload: dict[str, Any], *, group_members_file: str) -> bool:
+    if not str(group_members_file or "").strip():
+        return False
+
+    migrations = payload.setdefault("migrations", {})
+    if migrations.get("group_members_file_imported"):
+        return False
+
+    migrations["group_members_file_imported"] = True
+    changed = True
+    if payload.get("group_reply_targets"):
+        return changed
+
+    imported_rows: list[dict[str, Any]] = []
+    for row in load_group_members(group_members_file):
+        if not row.enabled:
+            continue
+        group_name = " ".join(str(row.group_name or "").split())
+        member_phone = normalize_contact_id(row.member_pn)
+        if not group_name or not member_phone:
+            continue
+        imported_rows.append(
+            _group_row(
+                None,
+                group_name=group_name,
+                member_phone=member_phone,
+                enabled=True,
+                group_id=row.group_id,
+                member_id=row.member_id,
+                member_label=row.member_label,
+            )
+        )
+
+    if imported_rows:
+        payload["group_reply_targets"] = imported_rows
+        changed = True
+    return changed
+
+
+def _direct_row(
+    existing: dict[str, Any] | None,
+    *,
+    phone: str,
+    enabled: bool,
+    label: str | None = None,
+) -> dict[str, Any]:
+    row = dict(existing or {})
+    row["phone"] = normalize_contact_id(phone)
+    row["enabled"] = bool(enabled)
+    if label is not None:
+        row["label"] = str(label or "").strip()
+    else:
+        row["label"] = str(row.get("label", "") or "").strip()
+    row["chat_id"] = str(row.get("chat_id", "") or "").strip()
+    row["sender_id"] = str(row.get("sender_id", "") or "").strip()
+    row["push_name"] = str(row.get("push_name", "") or "").strip()
+    row["last_seen_at"] = str(row.get("last_seen_at", "") or "").strip()
+    return row
+
+
+def _group_row(
+    existing: dict[str, Any] | None,
+    *,
+    group_name: str,
+    member_phone: str,
+    enabled: bool,
+    group_id: str | None = None,
+    member_id: str | None = None,
+    member_label: str | None = None,
+) -> dict[str, Any]:
+    row = dict(existing or {})
+    normalized_group_name = " ".join(str(group_name or "").split())
+    row["group_name"] = normalized_group_name
+    row["group_name_normalized"] = normalize_group_name(normalized_group_name)
+    row["group_id"] = str(group_id if group_id is not None else row.get("group_id", "") or "").strip()
+    row["member_phone"] = normalize_contact_id(member_phone)
+    row["member_id"] = str(member_id if member_id is not None else row.get("member_id", "") or "").strip()
+    row["member_label"] = str(member_label if member_label is not None else row.get("member_label", "") or "").strip()
+    row["enabled"] = bool(enabled)
+    row["last_seen_at"] = str(row.get("last_seen_at", "") or "").strip()
+    return row

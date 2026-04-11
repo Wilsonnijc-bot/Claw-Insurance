@@ -4,12 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nanobot.channels.whatsapp_contacts import (
-    WhatsAppContact,
-    load_contacts,
-    normalize_contact_id,
-    save_contacts,
-)
+from nanobot.channels.whatsapp_contacts import normalize_contact_id
 from nanobot.channels.whatsapp_group_members import (
     WhatsAppGroupMember,
     load_group_members,
@@ -42,35 +37,20 @@ def parse_self_routing_instruction(text: str) -> SelfRoutingInstruction | None:
 
 def apply_self_routing_instruction(
     *,
-    contacts_file: str,
     group_members_file: str,
     instruction: SelfRoutingInstruction,
 ) -> dict[str, int]:
-    """Apply parsed self-chat routing to local stores used by WhatsApp routing."""
+    """Apply parsed self-chat routing to legacy compatibility stores."""
     stats: dict[str, int] = {}
 
     if instruction.individuals is not None:
-        existing_contacts = load_contacts(contacts_file) if contacts_file else []
-        existing_by_phone = {normalize_contact_id(c.phone): c for c in existing_contacts if normalize_contact_id(c.phone)}
-        contacts: list[WhatsAppContact] = []
         seen: set[str] = set()
         for raw_phone in instruction.individuals:
             phone = normalize_contact_id(raw_phone)
             if not phone or phone in seen:
                 continue
             seen.add(phone)
-            prev = existing_by_phone.get(phone)
-            contacts.append(
-                WhatsAppContact(
-                    phone=phone,
-                    label=prev.label if prev else "",
-                    enabled=True,
-                )
-            )
-
-        if contacts_file:
-            save_contacts(contacts_file, contacts)
-        stats["individual_count"] = len(contacts)
+        stats["individual_count"] = len(seen)
 
     if instruction.groups is not None:
         existing_rows = load_group_members(group_members_file) if group_members_file else []

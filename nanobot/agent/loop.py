@@ -491,7 +491,6 @@ class AgentLoop:
 
         try:
             stats = apply_self_routing_instruction(
-                contacts_file=wa_cfg.contacts_file,
                 group_members_file=wa_cfg.group_members_file,
                 instruction=instruction,
             )
@@ -502,7 +501,7 @@ class AgentLoop:
                 groups=instruction.groups,
             )
             logger.info(
-                "Updated WhatsApp routing from self-chat command: contacts_cache={}, group_cache={}, direct_json={}, group_json={}",
+                "Updated WhatsApp routing from self-chat command: direct_count={}, legacy_group_cache={}, direct_json={}, group_json={}",
                 stats.get("individual_count", -1),
                 stats.get("group_member_count", -1),
                 target_stats.get("direct_reply_target_count", -1),

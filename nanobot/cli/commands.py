@@ -639,6 +639,14 @@ def install_ui_command(
 # ============================================================================
 
 
+@app.command("setup")
+def setup():
+    """Run guided setup and write split config files."""
+    from nanobot.cli.setup_wizard import run_setup_wizard
+
+    run_setup_wizard()
+
+
 @app.command()
 def onboard():
     """Initialize nanobot configuration and workspace."""
@@ -761,7 +769,7 @@ def _maybe_enable_privacy_gateway(config: Config):
 
 @app.command()
 def gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    port: int = typer.Option(3456, "--port", "-p", help="Legacy gateway port placeholder (API uses --api-port)."),
     api_port: int = typer.Option(3456, "--api-port", help="API server port for the frontend UI"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
@@ -789,7 +797,7 @@ def gateway(
     bridge_proc = _start_whatsapp_bridge(config)
     privacy_proc = _maybe_enable_privacy_gateway(config)
 
-    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
+    console.print(f"{__logo__} Starting nanobot gateway (API on port {api_port})...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
@@ -1191,9 +1199,9 @@ def agent(
 
 channels_app = typer.Typer(help="Manage channels")
 app.add_typer(channels_app, name="channels")
-whatsapp_contacts_app = typer.Typer(help="Manage WhatsApp local contacts")
+whatsapp_contacts_app = typer.Typer(help="Manage WhatsApp direct reply targets (compatibility alias)")
 channels_app.add_typer(whatsapp_contacts_app, name="whatsapp-contacts")
-whatsapp_groups_app = typer.Typer(help="Manage WhatsApp group-member allowlist")
+whatsapp_groups_app = typer.Typer(help="Manage WhatsApp group reply targets")
 channels_app.add_typer(whatsapp_groups_app, name="whatsapp-groups")
 
 
@@ -1608,18 +1616,59 @@ def _stop_background_process(proc) -> None:
             pass
 
 
-def _get_whatsapp_contacts_file(config: Config) -> Path:
-    """Return the local WhatsApp contacts file path."""
-    from nanobot.channels.whatsapp_contacts import contacts_path
+def _get_whatsapp_reply_targets_file(config: Config) -> Path:
+    """Return the WhatsApp reply-target registry path."""
+    from nanobot.channels.whatsapp_reply_targets import reply_targets_path
+    from nanobot.utils.paths import project_root
 
-    return contacts_path(config.channels.whatsapp.contacts_file)
+    return reply_targets_path(config.channels.whatsapp.reply_targets_file, project_root())
 
 
-def _get_whatsapp_group_members_file(config: Config) -> Path:
-    """Return the local WhatsApp group-members CSV path."""
+def _load_whatsapp_reply_targets_payload(config: Config) -> dict:
+    """Load WhatsApp reply targets with legacy migrations applied once."""
+    from nanobot.channels.whatsapp_reply_targets import load_reply_targets
+    from nanobot.utils.paths import project_root
+
+    return load_reply_targets(
+        _get_whatsapp_reply_targets_file(config),
+        project_root=project_root(),
+        group_members_file=str(config.channels.whatsapp.group_members_file or ""),
+    )
+
+
+def _get_whatsapp_group_members_file(config: Config) -> Path | None:
+    """Return the optional legacy WhatsApp group-members CSV path."""
     from nanobot.channels.whatsapp_group_members import group_members_path
 
+    if not str(config.channels.whatsapp.group_members_file or "").strip():
+        return None
     return group_members_path(config.channels.whatsapp.group_members_file)
+
+
+def _sync_legacy_whatsapp_group_members(config: Config, payload: dict) -> Path | None:
+    """Keep the optional legacy CSV in sync when explicitly configured."""
+    from nanobot.channels.whatsapp_group_members import WhatsAppGroupMember, save_group_members
+
+    legacy_path = _get_whatsapp_group_members_file(config)
+    if legacy_path is None:
+        return None
+
+    rows: list[WhatsAppGroupMember] = []
+    for raw in payload.get("group_reply_targets", []):
+        if not isinstance(raw, dict):
+            continue
+        rows.append(
+            WhatsAppGroupMember(
+                group_id=str(raw.get("group_id", "") or "").strip(),
+                group_name=str(raw.get("group_name", "") or "").strip(),
+                member_id=str(raw.get("member_id", "") or "").strip(),
+                member_pn=str(raw.get("member_phone", "") or "").strip(),
+                member_label=str(raw.get("member_label", "") or "").strip(),
+                enabled=bool(raw.get("enabled", True)),
+            )
+        )
+    save_group_members(config.channels.whatsapp.group_members_file, rows)
+    return legacy_path
 
 
 @channels_app.command("login")
@@ -1658,38 +1707,51 @@ def channels_whatsapp_web():
 
 @whatsapp_contacts_app.command("init")
 def whatsapp_contacts_init():
-    """Create the local WhatsApp contacts store."""
-    from nanobot.channels.whatsapp_contacts import init_contacts_store, load_contacts
+    """Initialize the direct reply-target registry."""
     from nanobot.config.loader import load_config
 
     config = load_config()
-    path = init_contacts_store(config.channels.whatsapp.contacts_file)
-    count = len(load_contacts(config.channels.whatsapp.contacts_file))
-    console.print(f"[green]✓[/green] WhatsApp contacts store ready at {path} ({count} contacts)")
+    path = _get_whatsapp_reply_targets_file(config)
+    payload = _load_whatsapp_reply_targets_payload(config)
+    count = len(payload.get("direct_reply_targets", []))
+    console.print(f"[green]✓[/green] WhatsApp direct reply-target store ready at {path} ({count} rows)")
 
 
 @whatsapp_contacts_app.command("list")
 def whatsapp_contacts_list():
-    """List locally allowed WhatsApp contacts."""
-    from nanobot.channels.whatsapp_contacts import load_contacts
+    """List WhatsApp direct reply targets."""
     from nanobot.config.loader import load_config
 
     config = load_config()
-    path = _get_whatsapp_contacts_file(config)
-    contacts = load_contacts(config.channels.whatsapp.contacts_file)
+    path = _get_whatsapp_reply_targets_file(config)
+    payload = _load_whatsapp_reply_targets_payload(config)
+    contacts = sorted(
+        [
+            row
+            for row in payload.get("direct_reply_targets", [])
+            if isinstance(row, dict)
+        ],
+        key=lambda row: str(row.get("phone", "")),
+    )
 
-    console.print(f"{__logo__} WhatsApp Contacts\n")
+    console.print(f"{__logo__} WhatsApp Direct Reply Targets\n")
     console.print(f"Store: {path}")
     if not contacts:
-        console.print("[yellow]No local WhatsApp contacts configured[/yellow]")
+        console.print("[yellow]No WhatsApp direct reply targets configured[/yellow]")
         return
 
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Phone")
     table.add_column("Label")
+    table.add_column("Push Name")
     table.add_column("Enabled")
     for contact in contacts:
-        table.add_row(contact.phone, contact.label or "-", "✓" if contact.enabled else "✗")
+        table.add_row(
+            str(contact.get("phone", "") or "-"),
+            str(contact.get("label", "") or "-"),
+            str(contact.get("push_name", "") or "-"),
+            "✓" if bool(contact.get("enabled", True)) else "✗",
+        )
     console.print(table)
 
 
@@ -1698,78 +1760,71 @@ def whatsapp_contacts_add(
     phone: str = typer.Argument(..., help="Phone number to allow, e.g. +85212345678"),
     label: str = typer.Option("", "--label", "-l", help="Optional local label"),
 ):
-    """Add one WhatsApp contact to the local allowlist."""
-    from nanobot.channels.whatsapp_contacts import (
-        WhatsAppContact,
-        init_contacts_store,
-        load_contacts,
-        normalize_contact_id,
-        save_contacts,
-    )
+    """Add one WhatsApp direct reply target."""
+    from nanobot.channels.whatsapp_reply_targets import upsert_direct_reply_target
     from nanobot.config.loader import load_config
 
     config = load_config()
-    init_contacts_store(config.channels.whatsapp.contacts_file)
-    contacts = load_contacts(config.channels.whatsapp.contacts_file)
-    target = normalize_contact_id(phone)
-    if not target:
+    path = _get_whatsapp_reply_targets_file(config)
+    try:
+        row = upsert_direct_reply_target(path, phone=phone, label=label, enabled=True)
+    except ValueError:
         console.print("[red]Invalid phone number[/red]")
-        raise typer.Exit(1)
-
-    updated = [c for c in contacts if normalize_contact_id(c.phone) != target]
-    updated.append(WhatsAppContact(phone=phone, label=label, enabled=True))
-    updated.sort(key=lambda c: normalize_contact_id(c.phone))
-    path = save_contacts(config.channels.whatsapp.contacts_file, updated)
-    console.print(f"[green]✓[/green] Added WhatsApp contact {phone} to {path}")
+        raise typer.Exit(1) from None
+    console.print(
+        f"[green]✓[/green] Added WhatsApp direct reply target {row['phone']} to {path}"
+    )
 
 
 @whatsapp_contacts_app.command("remove")
 def whatsapp_contacts_remove(
     phone: str = typer.Argument(..., help="Phone number to remove"),
 ):
-    """Remove one WhatsApp contact from the local allowlist."""
-    from nanobot.channels.whatsapp_contacts import load_contacts, normalize_contact_id, save_contacts
+    """Remove one WhatsApp direct reply target."""
+    from nanobot.channels.whatsapp_reply_targets import remove_direct_reply_target
     from nanobot.config.loader import load_config
 
     config = load_config()
-    contacts = load_contacts(config.channels.whatsapp.contacts_file)
-    target = normalize_contact_id(phone)
-    updated = [c for c in contacts if normalize_contact_id(c.phone) != target]
-
-    if len(updated) == len(contacts):
-        console.print(f"[yellow]Contact not found: {phone}[/yellow]")
+    path = _get_whatsapp_reply_targets_file(config)
+    if not remove_direct_reply_target(path, phone=phone):
+        console.print(f"[yellow]Direct reply target not found: {phone}[/yellow]")
         raise typer.Exit(1)
-
-    path = save_contacts(config.channels.whatsapp.contacts_file, updated)
-    console.print(f"[green]✓[/green] Removed WhatsApp contact {phone} from {path}")
+    console.print(f"[green]✓[/green] Removed WhatsApp direct reply target {phone} from {path}")
 
 
 @whatsapp_groups_app.command("init")
 def whatsapp_groups_init():
-    """Create the local WhatsApp group-member CSV store."""
-    from nanobot.channels.whatsapp_group_members import init_group_members_store, load_group_members
+    """Initialize the group reply-target registry."""
     from nanobot.config.loader import load_config
 
     config = load_config()
-    path = init_group_members_store(config.channels.whatsapp.group_members_file)
-    count = len(load_group_members(config.channels.whatsapp.group_members_file))
-    console.print(f"[green]✓[/green] WhatsApp group-member store ready at {path} ({count} rows)")
+    path = _get_whatsapp_reply_targets_file(config)
+    payload = _load_whatsapp_reply_targets_payload(config)
+    count = len(payload.get("group_reply_targets", []))
+    legacy_path = _sync_legacy_whatsapp_group_members(config, payload)
+    console.print(f"[green]✓[/green] WhatsApp group reply-target store ready at {path} ({count} rows)")
+    if legacy_path is not None:
+        console.print(f"[dim]Legacy CSV compatibility store synced at {legacy_path}[/dim]")
 
 
 @whatsapp_groups_app.command("list")
 def whatsapp_groups_list():
-    """List locally allowed WhatsApp group-member rules."""
-    from nanobot.channels.whatsapp_group_members import load_group_members
+    """List WhatsApp group reply targets."""
     from nanobot.config.loader import load_config
 
     config = load_config()
-    path = _get_whatsapp_group_members_file(config)
-    rows = load_group_members(config.channels.whatsapp.group_members_file)
+    path = _get_whatsapp_reply_targets_file(config)
+    payload = _load_whatsapp_reply_targets_payload(config)
+    rows = [
+        row
+        for row in payload.get("group_reply_targets", [])
+        if isinstance(row, dict)
+    ]
 
-    console.print(f"{__logo__} WhatsApp Groups\n")
+    console.print(f"{__logo__} WhatsApp Group Reply Targets\n")
     console.print(f"Store: {path}")
     if not rows:
-        console.print("[yellow]No local WhatsApp group-member rules configured[/yellow]")
+        console.print("[yellow]No WhatsApp group reply targets configured[/yellow]")
         return
 
     table = Table(show_header=True, header_style="bold magenta")
@@ -1781,12 +1836,12 @@ def whatsapp_groups_list():
     table.add_column("Enabled")
     for row in rows:
         table.add_row(
-            row.group_id,
-            row.group_name or "-",
-            row.member_id or "-",
-            row.member_pn or "-",
-            row.member_label or "-",
-            "✓" if row.enabled else "✗",
+            str(row.get("group_id", "") or "-"),
+            str(row.get("group_name", "") or "-"),
+            str(row.get("member_id", "") or "-"),
+            str(row.get("member_phone", "") or "-"),
+            str(row.get("member_label", "") or "-"),
+            "✓" if bool(row.get("enabled", True)) else "✗",
         )
     console.print(table)
 
@@ -1799,95 +1854,57 @@ def whatsapp_groups_add(
     member_pn: str = typer.Option("", "--member-pn", help="Member phone number, e.g. +85212345678"),
     label: str = typer.Option("", "--label", "-l", help="Optional local label"),
 ):
-    """Add one allowed group-member rule."""
-    from nanobot.channels.whatsapp_contacts import normalize_contact_id
-    from nanobot.channels.whatsapp_group_members import (
-        WhatsAppGroupMember,
-        init_group_members_store,
-        load_group_members,
-        normalize_group_id,
-        normalize_group_name,
-        normalize_member_id,
-        save_group_members,
-    )
+    """Add one WhatsApp group reply target."""
+    from nanobot.channels.whatsapp_reply_targets import upsert_group_reply_target
     from nanobot.config.loader import load_config
 
     config = load_config()
-    if not normalize_group_id(group_id) and not normalize_group_name(group_name):
-        console.print("[red]Provide at least one of --group-id or --group-name[/red]")
-        raise typer.Exit(1)
-    if not normalize_member_id(member_id) and not normalize_contact_id(member_pn):
-        console.print("[red]Provide at least one of --member-id or --member-pn[/red]")
-        raise typer.Exit(1)
-
-    init_group_members_store(config.channels.whatsapp.group_members_file)
-    rows = load_group_members(config.channels.whatsapp.group_members_file)
-    updated = [
-        row for row in rows
-        if not (
-            normalize_group_id(row.group_id) == normalize_group_id(group_id)
-            and normalize_group_name(row.group_name) == normalize_group_name(group_name)
-            and normalize_member_id(row.member_id) == normalize_member_id(member_id)
-            and normalize_contact_id(row.member_pn) == normalize_contact_id(member_pn)
-        )
-    ]
-    updated.append(
-        WhatsAppGroupMember(
+    path = _get_whatsapp_reply_targets_file(config)
+    try:
+        upsert_group_reply_target(
+            path,
             group_id=group_id,
             group_name=group_name,
             member_id=member_id,
-            member_pn=member_pn,
+            member_phone=member_pn,
             member_label=label,
             enabled=True,
         )
-    )
-    updated.sort(key=lambda row: (row.group_id, row.member_id, row.member_pn))
-    path = save_group_members(config.channels.whatsapp.group_members_file, updated)
-    console.print(f"[green]✓[/green] Added WhatsApp group-member rule to {path}")
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
+    legacy_path = _sync_legacy_whatsapp_group_members(config, _load_whatsapp_reply_targets_payload(config))
+    console.print(f"[green]✓[/green] Added WhatsApp group reply target to {path}")
+    if legacy_path is not None:
+        console.print(f"[dim]Legacy CSV compatibility store synced at {legacy_path}[/dim]")
 
 
 @whatsapp_groups_app.command("remove")
 def whatsapp_groups_remove(
-    group_id: str = typer.Argument(..., help="WhatsApp group ID"),
+    group_id: str = typer.Argument("", help="WhatsApp group ID"),
+    group_name: str = typer.Option("", "--group-name", help="Group name for bootstrap rows"),
     member_id: str = typer.Option("", "--member-id", help="Exact group member ID to remove"),
     member_pn: str = typer.Option("", "--member-pn", help="Member phone number to remove"),
 ):
-    """Remove one allowed group-member rule."""
-    from nanobot.channels.whatsapp_contacts import normalize_contact_id
-    from nanobot.channels.whatsapp_group_members import (
-        load_group_members,
-        normalize_group_id,
-        normalize_member_id,
-        save_group_members,
-    )
+    """Remove one WhatsApp group reply target."""
+    from nanobot.channels.whatsapp_reply_targets import remove_group_reply_target
     from nanobot.config.loader import load_config
 
     config = load_config()
-    if not normalize_member_id(member_id) and not normalize_contact_id(member_pn):
-        console.print("[red]Provide at least one of --member-id or --member-pn[/red]")
+    path = _get_whatsapp_reply_targets_file(config)
+    if not remove_group_reply_target(
+        path,
+        group_id=group_id,
+        group_name=group_name,
+        member_id=member_id,
+        member_phone=member_pn,
+    ):
+        console.print("[yellow]Group reply target not found[/yellow]")
         raise typer.Exit(1)
-
-    rows = load_group_members(config.channels.whatsapp.group_members_file)
-    updated = [
-        row for row in rows
-        if not (
-            normalize_group_id(row.group_id) == normalize_group_id(group_id)
-            and (
-                (normalize_member_id(member_id) and normalize_member_id(row.member_id) == normalize_member_id(member_id))
-                or (
-                    normalize_contact_id(member_pn)
-                    and normalize_contact_id(row.member_pn) == normalize_contact_id(member_pn)
-                )
-            )
-        )
-    ]
-
-    if len(updated) == len(rows):
-        console.print("[yellow]Group-member rule not found[/yellow]")
-        raise typer.Exit(1)
-
-    path = save_group_members(config.channels.whatsapp.group_members_file, updated)
-    console.print(f"[green]✓[/green] Removed WhatsApp group-member rule from {path}")
+    legacy_path = _sync_legacy_whatsapp_group_members(config, _load_whatsapp_reply_targets_payload(config))
+    console.print(f"[green]✓[/green] Removed WhatsApp group reply target from {path}")
+    if legacy_path is not None:
+        console.print(f"[dim]Legacy CSV compatibility store synced at {legacy_path}[/dim]")
 
 
 # ============================================================================

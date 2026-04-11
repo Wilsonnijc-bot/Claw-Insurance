@@ -40,14 +40,40 @@ def _set_project_root(root: Path) -> Path:
     return old
 
 
+def _looks_like_runtime_root(path: Path) -> bool:
+    """Return True when *path* looks like a project/runtime root."""
+    return (
+        (path / "nanobot").is_dir()
+        and (
+            (path / "pyproject.toml").exists()
+            or (path / "config.json").exists()
+            or (path / "googleconfig.json").exists()
+            or (path / "supabaseconfig.json").exists()
+        )
+    )
+
+
+def _runtime_project_root() -> Path:
+    """Resolve the effective project root for the active runtime."""
+    override = os.environ.get("NANOBOT_PROJECT_ROOT")
+    if override:
+        return Path(override).resolve()
+
+    cwd = Path.cwd().resolve()
+    if _looks_like_runtime_root(cwd):
+        return cwd
+
+    return _PROJECT_ROOT
+
+
 def project_root() -> Path:
     """Return the absolute path to this project's root directory."""
-    return _PROJECT_ROOT
+    return _runtime_project_root()
 
 
 def project_path(*parts: str) -> Path:
     """Join *parts* onto the project root and return the result."""
-    return _PROJECT_ROOT.joinpath(*parts)
+    return project_root().joinpath(*parts)
 
 
 def project_path_str(*parts: str) -> str:
@@ -94,8 +120,9 @@ def confine_path(candidate: Path | str, *, allow_override: bool = False) -> Path
     resolved = Path(candidate).resolve()
     if _CONFINEMENT_DISABLED:
         return resolved
+    root = project_root()
     try:
-        resolved.relative_to(_PROJECT_ROOT)
+        resolved.relative_to(root)
     except ValueError:
         if allow_override:
             logger.warning(
@@ -104,7 +131,7 @@ def confine_path(candidate: Path | str, *, allow_override: bool = False) -> Path
             return resolved
         raise PathEscapeError(
             f"Path escapes project root: {resolved}  "
-            f"(project root: {_PROJECT_ROOT})"
+            f"(project root: {root})"
         )
     return resolved
 
@@ -120,14 +147,15 @@ def resolve_project_relative(raw: str | Path) -> Path:
     """
     p = Path(raw) if isinstance(raw, str) else raw
     if not p.is_absolute():
-        return (_PROJECT_ROOT / p).resolve()
+        return (project_root() / p).resolve()
     return p.resolve()
 
 
 def is_inside_project(path: Path | str) -> bool:
     """Return ``True`` when the resolved *path* is inside the project root."""
+    root = project_root()
     try:
-        Path(path).resolve().relative_to(_PROJECT_ROOT)
+        Path(path).resolve().relative_to(root)
         return True
     except ValueError:
         return False
@@ -153,5 +181,6 @@ _RUNTIME_DIRS = (
 
 def ensure_runtime_dirs() -> None:
     """Create all expected project-local runtime directories."""
+    root = project_root()
     for name in _RUNTIME_DIRS:
-        (_PROJECT_ROOT / name).mkdir(parents=True, exist_ok=True)
+        (root / name).mkdir(parents=True, exist_ok=True)

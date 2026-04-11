@@ -121,7 +121,11 @@ def test_gateway_endpoint_sanitizes_and_forwards_exact_cloud_payload(
     debug_file = tmp_path / "test_words" / "privacy_00001.json"
     assert debug_file.exists()
     debug_payload = json.loads(debug_file.read_text(encoding="utf-8"))
+    assert debug_payload["raw_request"] == payload
     assert debug_payload["sanitized_request"] == forwarded
+    assert debug_payload["raw_prompt"] == payload["messages"]
+    assert debug_payload["sanitized_prompt"] == forwarded["messages"]
+    assert debug_payload["placeholder_map"]
     assert debug_payload["sanitized_response"]["choices"][0]["message"]["content"] == "Hi Unknown Sender Name"
 
 
@@ -143,11 +147,13 @@ def test_gateway_fail_closed_returns_local_safe_message_and_skips_upstream(
         lambda payload, placeholder_map: ["phone number still present"],
     )
 
-    response = service.handle_chat_completions(
-        {"model": "gpt-5.1-chat", "messages": [{"role": "user", "content": "hello"}]}
-    )
+    payload = {"model": "gpt-5.1-chat", "messages": [{"role": "user", "content": "hello"}]}
+    response = service.handle_chat_completions(payload)
     body = json.loads(response.body.decode("utf-8"))
 
     assert response.status_code == 200
     assert "can't send this request to the cloud model" in body["choices"][0]["message"]["content"]
-    assert (tmp_path / "test_words" / "privacy_00001.json").exists()
+    debug_payload = json.loads((tmp_path / "test_words" / "privacy_00001.json").read_text(encoding="utf-8"))
+    assert debug_payload["raw_request"] == payload
+    assert debug_payload["raw_prompt"] == payload["messages"]
+    assert debug_payload["sanitized_prompt"] == payload["messages"]

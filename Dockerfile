@@ -13,6 +13,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+ENV NANOBOT_PROJECT_ROOT=/app
 
 # Install Python dependencies first (cached layer)
 COPY pyproject.toml README.md LICENSE ./
@@ -37,8 +38,8 @@ RUN mkdir -p /app/data /app/sessions /app/state /app/memory \
     /app/skills /app/media /app/cron \
     /app/secrets
 
-# Gateway default port
-EXPOSE 18790
+# Gateway API port used by frontend and external clients
+EXPOSE 3456
 
 ENTRYPOINT ["nanobot"]
 CMD ["status"]

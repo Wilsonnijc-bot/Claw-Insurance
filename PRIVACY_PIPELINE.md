@@ -338,7 +338,11 @@ Gateway-generated sanitized request/response record. Fields include:
 - `blocked`
 - `reasons`
 - `upstream_url`
+- `placeholder_map`
+- `raw_request`
 - `sanitized_request`
+- `raw_prompt`
+- `sanitized_prompt`
 - `response_status`
 - `sanitized_response`
 

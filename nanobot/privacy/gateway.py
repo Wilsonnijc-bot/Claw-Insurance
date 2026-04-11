@@ -24,11 +24,12 @@ class GatewayResponse:
 
 
 class PrivacyDebugStore:
-    """Persist sanitized request and response payloads locally.
+    """Persist raw and sanitized request/response payloads locally.
 
     Privacy pipeline step 4 side effect: write gateway-facing artifacts into
-    ``test_words/privacy_XXXXX.json`` so sanitized requests and responses can
-    be audited without exposing the raw outbound payload to the cloud.
+    ``test_words/privacy_XXXXX.json`` so the exact raw-vs-sanitized prompt
+    diff can be audited locally without exposing the raw outbound payload to
+    the cloud.
     """
 
     def __init__(self, workspace: Path):
@@ -41,6 +42,7 @@ class PrivacyDebugStore:
     def write(
         self,
         *,
+        raw_request: dict[str, Any],
         result: SanitizationResult,
         upstream_url: str,
         response_status: int,
@@ -61,7 +63,11 @@ class PrivacyDebugStore:
             "blocked": result.blocked,
             "reasons": result.reasons,
             "upstream_url": upstream_url,
+            "placeholder_map": result.placeholder_map,
+            "raw_request": raw_request,
             "sanitized_request": result.sanitized_payload,
+            "raw_prompt": raw_request.get("messages"),
+            "sanitized_prompt": result.sanitized_payload.get("messages"),
             "response_status": response_status,
             "sanitized_response": response_body,
         }
@@ -108,6 +114,7 @@ class PrivacyGatewayService:
             blocked = TextPrivacySanitizer.build_blocked_response(model=model)
             if self.config.save_redacted_debug:
                 self.debug_store.write(
+                    raw_request=payload,
                     result=result,
                     upstream_url=f"{self.upstream_base}/chat/completions",
                     response_status=200,
@@ -136,6 +143,7 @@ class PrivacyGatewayService:
         if self.config.save_redacted_debug:
             # Persist the sanitized request/response pair for inspection.
             self.debug_store.write(
+                raw_request=payload,
                 result=result,
                 upstream_url=f"{self.upstream_base}/chat/completions",
                 response_status=response.status_code,

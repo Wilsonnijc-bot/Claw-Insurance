@@ -9,7 +9,6 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import HistoryImportResult, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.whatsapp import WhatsAppChannel
-from nanobot.channels.whatsapp_contacts import WhatsAppContact, save_contacts
 from nanobot.channels.whatsapp_reply_targets import (
     load_reply_targets,
     observe_direct_identification,
@@ -90,7 +89,6 @@ def test_whatsapp_config_accepts_draft_fields() -> None:
                     "webBrowserMode": "cdp",
                     "webCdpUrl": "http://127.0.0.1:9333",
                     "webProfileDir": "~/custom-whatsapp-web",
-                    "contactsFile": "~/contacts.json",
                     "groupMembersFile": "~/groups.csv",
                     "replyTargetsFile": "~/data/reply_targets.json",
                     "allowFrom": ["+1234567890"],
@@ -103,7 +101,7 @@ def test_whatsapp_config_accepts_draft_fields() -> None:
     assert config.channels.whatsapp.web_browser_mode == "cdp"
     assert config.channels.whatsapp.web_cdp_url == "http://127.0.0.1:9333"
     assert config.channels.whatsapp.web_profile_dir == "~/custom-whatsapp-web"
-    assert config.channels.whatsapp.contacts_file == "~/contacts.json"
+    assert not hasattr(config.channels.whatsapp, "contacts_file")
     assert config.channels.whatsapp.group_members_file == "~/groups.csv"
     assert config.channels.whatsapp.reply_targets_file == "~/data/reply_targets.json"
 
@@ -199,7 +197,7 @@ async def test_whatsapp_launch_draft_mode_emits_prepare_draft_command_with_reply
             "target": {
                 "chatId": "123@s.whatsapp.net",
                 "phone": "1234567890",
-                "searchTerms": ["1234567890", "123", "Alice Chan"],
+                "searchTerms": ["123", "Alice Chan", "1234567890"],
             },
         }
     ]
@@ -293,25 +291,25 @@ async def test_whatsapp_launch_draft_mode_emits_prepare_draft_command_for_phone_
             "target": {
                 "chatId": "alice@lid",
                 "phone": "1234567890",
-                "searchTerms": ["1234567890", "alice"],
+                "searchTerms": ["alice", "1234567890"],
             },
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_launch_draft_mode_uses_contact_label_as_search_fallback(tmp_path: Path) -> None:
+async def test_whatsapp_launch_draft_mode_uses_reply_target_label_as_search_fallback(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
-    contacts_file = tmp_path / "contacts.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
-    save_contacts(str(contacts_file), [WhatsAppContact(phone="+1234567890", label="Alice Wong", enabled=True)])
+    payload = load_reply_targets(targets_file)
+    payload["direct_reply_targets"][0]["label"] = "Alice Wong"
+    save_reply_targets(targets_file, payload)
     channel = _make_channel(
         WhatsAppConfig(
             enabled=True,
             delivery_mode="draft",
             web_browser_mode="launch",
             allow_from=["+1234567890"],
-            contacts_file=str(contacts_file),
             group_members_file="",
             reply_targets_file=str(targets_file),
         )
@@ -329,11 +327,11 @@ async def test_whatsapp_launch_draft_mode_uses_contact_label_as_search_fallback(
         )
     )
 
-    assert json.loads(ws.sent[0])["target"]["searchTerms"] == ["1234567890", "alice", "Alice Wong"]
+    assert json.loads(ws.sent[0])["target"]["searchTerms"] == ["alice", "Alice Wong", "1234567890"]
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_launch_draft_mode_ignores_reply_target_label_in_search_terms(tmp_path: Path) -> None:
+async def test_whatsapp_launch_draft_mode_includes_reply_target_label_in_search_terms(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
     observe_direct_identification(
@@ -352,7 +350,6 @@ async def test_whatsapp_launch_draft_mode_ignores_reply_target_label_in_search_t
             delivery_mode="draft",
             web_browser_mode="launch",
             allow_from=["+1234567890"],
-            contacts_file="",
             group_members_file="",
             reply_targets_file=str(targets_file),
         )
@@ -370,13 +367,12 @@ async def test_whatsapp_launch_draft_mode_ignores_reply_target_label_in_search_t
         )
     )
 
-    assert json.loads(ws.sent[0])["target"]["searchTerms"] == ["1234567890", "123", "Alice Chan"]
+    assert json.loads(ws.sent[0])["target"]["searchTerms"] == ["123", "Alice Chan", "Billy", "1234567890"]
 
 
 @pytest.mark.asyncio
 async def test_whatsapp_parse_reply_targets_once_requests_bulk_direct_parse(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
-    contacts_file = tmp_path / "contacts.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
     observe_direct_identification(
         targets_file,
@@ -385,13 +381,14 @@ async def test_whatsapp_parse_reply_targets_once_requests_bulk_direct_parse(tmp_
         sender_id="123@s.whatsapp.net",
         push_name="Alice Chan",
     )
-    save_contacts(str(contacts_file), [WhatsAppContact(phone="+1234567890", label="Alice Wong", enabled=True)])
+    payload = load_reply_targets(targets_file)
+    payload["direct_reply_targets"][0]["label"] = "Alice Wong"
+    save_reply_targets(targets_file, payload)
     channel = _make_channel(
         WhatsAppConfig(
             enabled=True,
             delivery_mode="draft",
             allow_from=["+1234567890"],
-            contacts_file=str(contacts_file),
             group_members_file="",
             reply_targets_file=str(targets_file),
         )
@@ -413,7 +410,7 @@ async def test_whatsapp_parse_reply_targets_once_requests_bulk_direct_parse(tmp_
             {
                 "chatId": "123@s.whatsapp.net",
                 "phone": "1234567890",
-                "searchTerms": ["1234567890", "123", "Alice Chan", "Alice Wong"],
+                "searchTerms": ["123", "Alice Chan", "Alice Wong", "1234567890"],
             },
         ],
     }
@@ -560,7 +557,7 @@ def test_whatsapp_build_scoped_direct_history_targets_payload_skips_rows_without
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_sync_direct_history_ignores_reply_target_label_in_search_terms(tmp_path: Path) -> None:
+async def test_whatsapp_sync_direct_history_includes_reply_target_label_in_search_terms(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
     observe_direct_identification(
@@ -578,7 +575,6 @@ async def test_whatsapp_sync_direct_history_ignores_reply_target_label_in_search
             enabled=True,
             delivery_mode="draft",
             allow_from=["+1234567890"],
-            contacts_file="",
             group_members_file="",
             reply_targets_file=str(targets_file),
         )
@@ -599,7 +595,7 @@ async def test_whatsapp_sync_direct_history_ignores_reply_target_label_in_search
         "target": {
             "chatId": "123@s.whatsapp.net",
             "phone": "1234567890",
-            "searchTerms": ["1234567890", "123", "Alice Chan"],
+            "searchTerms": ["123", "Alice Chan", "Billy", "1234567890"],
         },
     }
 
@@ -1652,7 +1648,7 @@ async def test_whatsapp_sync_direct_history_scopes_web_scrape_to_requested_phone
         "target": {
             "chatId": "123@s.whatsapp.net",
             "phone": "1234567890",
-            "searchTerms": ["1234567890", "123", "Alice Chan"],
+            "searchTerms": ["123", "Alice Chan", "1234567890"],
         },
     }
 
@@ -1725,7 +1721,7 @@ async def test_whatsapp_draft_mode_targeted_direct_message_reaches_bus(tmp_path:
         WhatsAppConfig(
             enabled=True,
             delivery_mode="draft",
-            allow_from=["+1234567890"],
+            allow_from=[],
             contacts_file="",
             group_members_file="",
             reply_targets_file=str(targets_file),

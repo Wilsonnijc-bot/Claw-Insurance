@@ -21,9 +21,6 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.whatsapp_contacts import (
     WhatsAppContact,
-    find_contact,
-    has_local_store,
-    load_contacts,
     normalize_contact_id,
 )
 from nanobot.channels.whatsapp_group_members import (
@@ -37,6 +34,7 @@ from nanobot.channels.whatsapp_reply_targets import (
     init_reply_targets_store,
     load_direct_reply_targets,
     load_group_reply_targets,
+    load_reply_targets,
     match_direct_reply_target,
     match_group_reply_target,
     observe_direct_identification,
@@ -96,6 +94,11 @@ class WhatsAppChannel(BaseChannel):
         self._project_root = project_root()
         self._reply_targets_file = reply_targets_path(self.config.reply_targets_file, self._project_root)
         init_reply_targets_store(self._reply_targets_file)
+        load_reply_targets(
+            self._reply_targets_file,
+            project_root=self._project_root,
+            group_members_file=self.config.group_members_file,
+        )
         self._ws = None
         self._connected = False
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
@@ -791,12 +794,24 @@ class WhatsAppChannel(BaseChannel):
             await asyncio.sleep(0.25)
         return bool(self._connected and self._ws)
 
-    def get_allowed_contact(self, sender_id: str) -> WhatsAppContact | None:
-        """Prefer the local WhatsApp contacts store when it exists."""
-        if self.config.contacts_file and has_local_store(self.config.contacts_file):
-            return find_contact(sender_id, load_contacts(self.config.contacts_file))
-        if super().is_allowed(sender_id):
-            return WhatsAppContact(phone=sender_id)
+    def get_allowed_contact(
+        self,
+        sender_id: str,
+        *,
+        phone: str = "",
+        chat_id: str = "",
+    ) -> WhatsAppContact | None:
+        """Resolve a direct WhatsApp sender from reply targets, then allowFrom."""
+        reply_target = self._get_direct_reply_target(phone=phone, chat_id=chat_id, sender_id=sender_id)
+        if reply_target is not None and reply_target.enabled:
+            resolved_phone = self._first_phone(reply_target.phone, phone, sender_id)
+            return WhatsAppContact(
+                phone=resolved_phone or sender_id,
+                label=self._first_nonempty(reply_target.label, reply_target.push_name),
+                enabled=True,
+            )
+        if self._is_explicit_direct_allow_fallback(phone=phone, sender_id=sender_id):
+            return WhatsAppContact(phone=self._first_phone(phone, sender_id) or sender_id)
         return None
 
     def get_allowed_group_member(
@@ -882,14 +897,21 @@ class WhatsAppChannel(BaseChannel):
             logger.exception("Failed to read WhatsApp direct reply targets")
             return None
 
-    def _get_contact_label(self, phone: str) -> WhatsAppContact | None:
-        if not phone or not self.config.contacts_file or not has_local_store(self.config.contacts_file):
-            return None
-        try:
-            return find_contact(phone, load_contacts(self.config.contacts_file))
-        except Exception:
-            logger.exception("Failed to load WhatsApp contacts for draft target lookup")
-            return None
+    def _is_explicit_direct_allow_fallback(self, *, phone: str = "", sender_id: str = "") -> bool:
+        allow_list = list(getattr(self.config, "allow_from", []) or [])
+        if not allow_list:
+            return False
+        if "*" in allow_list:
+            return True
+
+        candidates = {
+            str(phone or "").strip(),
+            str(sender_id or "").strip(),
+            normalize_contact_id(str(phone or "")),
+            normalize_contact_id(str(sender_id or "")),
+        }
+        candidates.discard("")
+        return any(candidate in allow_list for candidate in candidates)
 
     def _resolve_draft_target(self, chat_id: str, metadata: dict | None = None) -> dict | None:
         """Resolve an explicit direct-chat target for Playwright draft composition."""
@@ -912,7 +934,6 @@ class WhatsAppChannel(BaseChannel):
         if reply_target is not None and not reply_target.enabled:
             reply_target = None
 
-        contact = self._get_contact_label(self._first_phone(current_phone, reply_target.phone if reply_target else ""))
         resolved_chat_id = self._first_nonempty(
             current_sender,
             reply_target.chat_id if reply_target else "",
@@ -931,7 +952,6 @@ class WhatsAppChannel(BaseChannel):
         for candidate in (
             str(meta.get("sender_name", "") or ""),
             str(meta.get("push_name", "") or ""),
-            current_phone,
             self._bare_chat_id(current_sender),
         ):
             self._append_search_term(search_terms, seen_terms, candidate)
@@ -939,16 +959,14 @@ class WhatsAppChannel(BaseChannel):
         if reply_target is not None:
             for candidate in (
                 reply_target.push_name,
+                reply_target.label,
                 reply_target.phone,
                 self._bare_chat_id(reply_target.chat_id),
                 self._bare_chat_id(reply_target.sender_id),
             ):
                 self._append_search_term(search_terms, seen_terms, candidate)
 
-        if contact is not None:
-            for candidate in (contact.label, normalize_contact_id(contact.phone)):
-                self._append_search_term(search_terms, seen_terms, candidate)
-
+        self._append_search_term(search_terms, seen_terms, current_phone)
         self._append_search_term(search_terms, seen_terms, self._bare_chat_id(outbound_chat_id))
 
         if not resolved_chat_id or (not resolved_phone and not search_terms):
@@ -971,15 +989,14 @@ class WhatsAppChannel(BaseChannel):
         if not resolved_chat_id:
             return None
 
-        contact = self._get_contact_label(resolved_phone)
         search_terms: list[str] = []
         seen_terms: set[str] = set()
         for candidate in (
-            row.phone,
             self._bare_chat_id(row.chat_id),
             self._bare_chat_id(row.sender_id),
             row.push_name,
-            contact.label if contact is not None else "",
+            row.label,
+            row.phone,
         ):
             self._append_search_term(search_terms, seen_terms, candidate)
 
@@ -1036,18 +1053,6 @@ class WhatsAppChannel(BaseChannel):
             seen_chat_ids.add(chat_id)
             targets.append(payload)
         return targets
-
-    def _direct_contact_for_history(self, phone: str, label: str = "", push_name: str = "") -> WhatsAppContact:
-        normalized_phone = normalize_contact_id(phone)
-        if self.config.contacts_file and has_local_store(self.config.contacts_file):
-            try:
-                existing = find_contact(normalized_phone, load_contacts(self.config.contacts_file))
-            except Exception:
-                logger.exception("Failed to load WhatsApp contacts while building history storage")
-            else:
-                if existing is not None:
-                    return existing
-        return WhatsAppContact(phone=normalized_phone, label=label or push_name, enabled=True)
 
     def _cache_history_messages(self, raw_messages: list[dict]) -> None:
         """Keep a bounded cache of raw direct history for allowlist replays."""
@@ -1506,12 +1511,15 @@ class WhatsAppChannel(BaseChannel):
             if is_self_chat:
                 contact = WhatsAppContact(phone=resolved_pn or sender_id, label=push_name or "self-chat", enabled=True)
             else:
-                contact = self.get_allowed_contact(sender_id)
+                contact = self.get_allowed_contact(
+                    sender_id,
+                    phone=resolved_pn or sender_id,
+                    chat_id=sender,
+                )
                 if contact is None:
                     logger.warning(
-                        "Access denied for sender {} on channel {}. Add them to allowFrom or the local contacts store.",
+                        "Access denied for WhatsApp sender {}. Add them to direct_reply_targets in whatsapp_reply_targets.json or explicitly allow them in allowFrom.",
                         sender_id,
-                        self.name,
                     )
                     return
 
@@ -1650,7 +1658,11 @@ class WhatsAppChannel(BaseChannel):
             resolved_pn = pn or self._extract_phone_from_sender(sender)
             user_id = resolved_pn if resolved_pn else sender
             sender_id = user_id.split("@")[0] if "@" in user_id else user_id
-            contact = self.get_allowed_contact(sender_id)
+            contact = self.get_allowed_contact(
+                sender_id,
+                phone=resolved_pn or sender_id,
+                chat_id=sender,
+            )
             if contact is None:
                 logger.warning("Ignoring delete event for unlisted WhatsApp sender {}", sender_id)
                 return
