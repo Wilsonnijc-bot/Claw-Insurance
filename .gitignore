@@ -37,6 +37,9 @@ cron/
 config.json
 googleconfig.json
 supabaseconfig.json
+data/whatsapp_reply_targets.json
+data/contacts/whatsapp.json
+data/whatsapp_groups.csv
 secrets/*.json
 !secrets/.gitkeep
 test_words/*
