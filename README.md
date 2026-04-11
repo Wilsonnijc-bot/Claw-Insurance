@@ -616,13 +616,79 @@ Docker support is optional packaging on top of that same runtime contract.
 
 Current packaged behavior:
 
-- `nanobot gateway` still exposes the UI/API on `3456`
+- `nanobot launcher` exposes the pre-login and post-login UI/API surface on `3456`
 - the backend container exposes and publishes `3456`
 - the frontend container serves Nginx on container port `80` and is published on host `8080`
 - the frontend proxies same-origin `/api` and `/ws` to `nanobot-gateway:3456`
-- compose bind-mounts project-local `config.json`, `googleconfig.json`, `supabaseconfig.json`, `secrets/`, and runtime state directories into `/app`
+- compose builds the backend image locally from this checkout and bind-mounts the whole repo into `/workspace`
+- compose sets `NANOBOT_PROJECT_ROOT=/workspace`, so the live Docker runtime uses repo-local `config.json`, `googleconfig.json`, `supabaseconfig.json`, `whatsapp-auth/`, `whatsapp-web/`, `sessions/`, `memory/`, `state/`, `data/`, and `.bridge-build/`
+- compose supplies Docker-only CDP browser settings through environment variables instead of writing them into `config.json`
 
 This keeps the containerized package aligned with the live local runtime instead of inventing a separate port model.
+
+### Docker-First Operator Flow
+
+The exact current Docker run flow is:
+
+```bash
+git clone https://github.com/Wilsonnijc-bot/Claw-Insurance.git
+cd Claw-Insurance
+cp config.example.json config.json
+```
+
+Then edit `config.json` and put your real `apiKey`.
+
+Start the stack with:
+
+```bash
+docker compose up -d --build
+```
+
+Then:
+
+- open `http://localhost:8080`
+- log in in the browser
+- scan the WhatsApp QR if needed
+- start host Chrome/Chromium with `--remote-debugging-port=9222` if you want history sync
+
+Stop the stack with:
+
+```bash
+docker compose down
+```
+
+Current Docker launcher behavior:
+
+- `nanobot-gateway` now runs `nanobot launcher --api-port 3456`
+- the login page still calls `POST /api/login`
+- that login request still boots the full gateway in-process, matching the current local launcher-first UX
+- the frontend remains served by Nginx on `8080`
+- `docker compose down` stops the Docker launcher/frontend stack
+
+Important runtime notes:
+
+- The Docker path uses the real repo-local config files. The normal first step is `cp config.example.json config.json`.
+- Docker does not need to expand `config.json` with `webBrowserMode` or `webCdpUrl`. Those Docker-only values come from Compose environment variables.
+- Baileys QR auth still persists in `whatsapp-auth/`.
+- Canonical sessions, memory, state, reply targets, and bridge build cache still persist in the repo checkout.
+
+### Host CDP Browser For History Sync
+
+Manual WhatsApp history sync in Docker still requires a reachable host Chrome/Chromium instance with remote debugging enabled on port `9222`.
+
+Example host startup:
+
+```bash
+google-chrome --remote-debugging-port=9222
+```
+
+On macOS, use the full Chrome binary path if needed:
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+```
+
+Keep that browser logged into WhatsApp Web before using sync in the UI. In Docker mode, the backend reaches it at `http://host.docker.internal:9222`.
 
 ### `whatsapp-web-debug/`
 
@@ -634,6 +700,13 @@ This keeps the containerized package aligned with the live local runtime instead
 | --- | --- |
 | `./bootstrap` | creates or reuses `.venv`, installs backend and frontend dependencies, and installs wrapper commands |
 | `python3 -m nanobot setup` | guided onboarding that writes `config.json`, optional `supabaseconfig.json`, and optional `googleconfig.json` |
+| `cp config.example.json config.json` | creates the repo-local Docker config from the minimal Moonshot-style template |
+| `docker compose run --rm nanobot-cli status` | shows Docker runtime status using the mounted repo root as the project root |
+| `docker compose up -d --build` | builds the local backend image, starts the launcher-first backend on `3456`, and serves the frontend on `8080` |
+| `docker compose up -d` | restarts the existing Docker stack without rebuilding |
+| `docker compose run --rm nanobot-cli agent -m "Hello!"` | runs a one-off CLI command inside the same local Docker image and mounted workspace |
+| `docker compose logs -f nanobot-gateway` | tails backend logs |
+| `docker compose down` | stops the Docker launcher/frontend stack |
 | `python3 -m nanobot install-ui-command` | installs per-checkout wrapper scripts |
 | `whatsapp-web-nanobot-ui` | starts launcher if needed, then runs Vite |
 | `whatsapp-web-nanobot-gateway` | starts the full backend immediately |
@@ -646,6 +719,18 @@ This keeps the containerized package aligned with the live local runtime instead
 | `python3 -m nanobot channels whatsapp-web` | prints that standalone CDP launch is disabled because parsing manages CDP lazily |
 
 ## Short Usage Summary
+
+For Docker-first operator use, the real flow is:
+
+1. run `cp config.example.json config.json`
+2. edit `config.json` and fill your real key
+3. run `docker compose up -d --build`
+4. open `http://localhost:8080`
+5. log in through the launcher screen in the browser
+6. wait for the gateway to start
+7. if needed, scan the Baileys QR shown by the UI
+8. if sync is needed, start a host Chrome/Chromium CDP browser on port `9222` and keep WhatsApp Web logged in there
+9. work from the UI, where inbound messages are persisted first, drafts are generated on demand or automatically, and only approved sends are written and delivered
 
 For normal operator use, the real flow is:
 
