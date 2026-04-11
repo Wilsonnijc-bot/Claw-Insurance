@@ -19,6 +19,9 @@ class _FakeSessionManager:
     def get_session_meta_path(self, _key: str) -> Path:
         return self.base_dir / "missing-meta.json"
 
+    def list_sessions(self) -> list[object]:
+        return []
+
 
 class _JSONRequest:
     def __init__(self, *, match_info: dict[str, str] | None = None, body: dict | None = None, query: dict | None = None) -> None:
@@ -203,7 +206,7 @@ async def test_api_sync_history_scraped_without_verified_session_stays_backend_u
 
 
 @pytest.mark.asyncio
-async def test_api_sync_returns_503_for_window_launch_failures_and_sets_bridge_error(tmp_path: Path) -> None:
+async def test_api_sync_reclassifies_window_launch_failures_as_sync_unavailable(tmp_path: Path) -> None:
     whatsapp = _BridgeStatusWhatsApp(
         {
             "status": "window_launch_failed",
@@ -233,11 +236,9 @@ async def test_api_sync_returns_503_for_window_launch_failures_and_sets_bridge_e
     assert response.status == 503
     assert json.loads(response.text) == {
         "error": "Mac CDP helper is not installed/running at http://host.docker.internal:9230.",
-        "code": "window_launch_failed",
+        "code": "sync_unavailable",
     }
-    assert whatsapp.bridge_status_calls == [
-        (True, "Mac CDP helper is not installed/running at http://host.docker.internal:9230.")
-    ]
+    assert whatsapp.bridge_status_calls == [(False, "")]
     server._broadcast_current_whatsapp_bridge_status.assert_awaited_once()
 
 
@@ -276,6 +277,75 @@ async def test_api_sync_returns_409_for_login_required_without_bridge_error_noti
     }
     assert whatsapp.bridge_status_calls == [(False, "")]
     server._broadcast_current_whatsapp_bridge_status.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_api_sync_returns_sync_unavailable_when_runtime_gate_is_disabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    whatsapp = _FakeWhatsApp()
+    config = SimpleNamespace(
+        channels=SimpleNamespace(
+            whatsapp=SimpleNamespace(reply_targets_file=str(tmp_path / "reply_targets.json"))
+        )
+    )
+    channel_manager = SimpleNamespace(
+        get_channel=lambda name: whatsapp if name == "whatsapp" else None,
+        enabled_channels=[],
+    )
+    server = ApiServer(
+        config=config,
+        bus=MessageBus(),
+        session_manager=_FakeSessionManager(tmp_path),
+        agent=None,
+        channel_manager=channel_manager,
+    )
+    monkeypatch.setenv("WEB_HISTORY_SYNC_ENABLED", "false")
+
+    response = await server._handle_sync(SimpleNamespace(match_info={"phone": "1234567890"}))
+
+    assert response.status == 503
+    assert json.loads(response.text) == {
+        "error": (
+            "当前 Docker 主机未准备 WhatsApp 历史同步。应用仍可正常使用；"
+            "如需历史同步，请在 macOS 主机上先运行 ./docker-up 完成预检。"
+        ),
+        "code": "sync_unavailable",
+    }
+    assert whatsapp.sync_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_status_exposes_sync_availability_without_bridge_error(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    whatsapp = _BridgeStatusWhatsApp({"status": "history_scraped"})
+    config = SimpleNamespace(
+        channels=SimpleNamespace(
+            whatsapp=SimpleNamespace(reply_targets_file=str(tmp_path / "reply_targets.json"))
+        )
+    )
+    channel_manager = SimpleNamespace(
+        get_channel=lambda name: whatsapp if name == "whatsapp" else None,
+        enabled_channels=[],
+    )
+    server = ApiServer(
+        config=config,
+        bus=MessageBus(),
+        session_manager=_FakeSessionManager(tmp_path),
+        agent=None,
+        channel_manager=channel_manager,
+    )
+    monkeypatch.setenv("WEB_HISTORY_SYNC_ENABLED", "false")
+
+    response = await server._handle_status(SimpleNamespace())
+
+    assert response.status == 200
+    assert json.loads(response.text)["whatsapp_sync_available"] is False
+    assert json.loads(response.text)["whatsapp_bridge_error"] is False
+    assert "docker-up" in json.loads(response.text)["whatsapp_sync_message"]
 
 
 @pytest.mark.asyncio

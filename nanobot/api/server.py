@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import os
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -281,6 +282,61 @@ class ApiServer:
             except Exception:
                 logger.exception("Failed to read WhatsApp bridge status")
         return {"error": False, "message": ""}
+
+    @staticmethod
+    def _env_flag(name: str, default: bool = True) -> bool:
+        raw = str(os.environ.get(name, str(default))).strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _get_whatsapp_sync_status(self) -> dict[str, Any]:
+        """Return whether WhatsApp history sync is prepared for this runtime."""
+        if not self._env_flag("WEB_HISTORY_SYNC_ENABLED", default=True):
+            return {
+                "available": False,
+                "message": (
+                    "当前 Docker 主机未准备 WhatsApp 历史同步。应用仍可正常使用；"
+                    "如需历史同步，请在 macOS 主机上先运行 ./docker-up 完成预检。"
+                ),
+            }
+
+        browser_mode = str(os.environ.get("WEB_BROWSER_MODE") or "").strip().lower()
+        helper_url = str(os.environ.get("WEB_CDP_HELPER_URL") or "").strip()
+        running_in_docker_workspace = str(os.environ.get("NANOBOT_PROJECT_ROOT") or "").strip() == "/workspace"
+
+        if browser_mode == "cdp" and running_in_docker_workspace:
+            if not helper_url:
+                return {
+                    "available": False,
+                    "message": (
+                        "Docker WhatsApp 历史同步尚未配置主机侧 CDP helper。"
+                        "请使用 ./docker-up 启动，或手动提供 WEB_CDP_HELPER_URL。"
+                    ),
+                }
+
+            try:
+                from nanobot.macos_cdp_helper import request_helper_health
+
+                if not request_helper_health(helper_url, timeout_s=0.4):
+                    return {
+                        "available": False,
+                        "message": (
+                            f"Mac CDP helper 未就绪：{helper_url}。"
+                            "请在宿主机运行 ./docker-up，或执行 "
+                            "python3 -m nanobot.macos_cdp_helper install 后重试。"
+                        ),
+                    }
+                return {"available": True, "message": ""}
+            except Exception:
+                logger.exception("Failed to probe WhatsApp sync helper health")
+                return {
+                    "available": False,
+                    "message": (
+                        f"无法检查 Mac CDP helper：{helper_url}。"
+                        "请在宿主机重新运行 ./docker-up 后重试。"
+                    ),
+                }
+
+        return {"available": True, "message": ""}
 
     async def _broadcast_current_whatsapp_bridge_status(self) -> None:
         """Push the latest WhatsApp bridge status to connected UI clients."""
@@ -1674,16 +1730,27 @@ class ApiServer:
         try:
             whatsapp = self.channel_manager.get_channel("whatsapp") if self.channel_manager else None
             chat_id = self._resolve_chat_id(phone)
+            sync_status = self._get_whatsapp_sync_status()
+            if not sync_status.get("available", True):
+                return web.json_response(
+                    {
+                        "error": str(sync_status.get("message") or "WhatsApp 历史同步当前不可用。"),
+                        "code": "sync_unavailable",
+                    },
+                    status=503,
+                )
             if whatsapp and hasattr(whatsapp, "sync_direct_history"):
                 result = await whatsapp.sync_direct_history([phone])
                 status = str(result.get("status") or "login_required")
                 detail = str(result.get("detail") or "WhatsApp 历史同步失败。")
+                if status == "window_launch_failed":
+                    status = "sync_unavailable"
                 if hasattr(whatsapp, "_set_bridge_status"):
-                    bridge_error = status in {"bridge_unreachable", "window_launch_failed"}
+                    bridge_error = status == "bridge_unreachable"
                     whatsapp._set_bridge_status(bridge_error, detail if bridge_error else "")
                     await self._broadcast_current_whatsapp_bridge_status()
                 if status != "history_scraped":
-                    response_status = 503 if status in {"bridge_unreachable", "window_launch_failed"} else 409
+                    response_status = 503 if status in {"bridge_unreachable", "sync_unavailable"} else 409
                     return web.json_response(
                         {
                             "error": detail,
@@ -1738,6 +1805,7 @@ class ApiServer:
             targets = self._load_reply_targets()
             bridge_status = self._get_whatsapp_bridge_status()
             auth_status = self._get_whatsapp_auth_status()
+            sync_status = self._get_whatsapp_sync_status()
             return web.json_response({
                 "status": "running",
                 "sessions": len(sessions),
@@ -1747,6 +1815,8 @@ class ApiServer:
                 "channels": list(self.channel_manager.enabled_channels) if self.channel_manager else [],
                 "whatsapp_bridge_error": bridge_status.get("error", False),
                 "whatsapp_bridge_message": bridge_status.get("message", ""),
+                "whatsapp_sync_available": sync_status.get("available", True),
+                "whatsapp_sync_message": sync_status.get("message", ""),
                 "whatsapp_auth_required": auth_status.get("required"),
                 "whatsapp_auth_qr": auth_status.get("qr"),
                 "whatsapp_auth_message": auth_status.get("message"),

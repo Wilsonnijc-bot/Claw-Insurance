@@ -93,6 +93,8 @@ export interface UseNanobotReturn {
   gatewayMessage: string | null;
   whatsappBridgeError: boolean;
   whatsappBridgeMessage: string | null;
+  whatsappSyncAvailable: boolean;
+  whatsappSyncMessage: string | null;
   whatsappAuthRequired: boolean;
   whatsappAuthQr: string | null;
   whatsappAuthMessage: string | null;
@@ -129,6 +131,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const [gatewayMessage, setGatewayMessage] = useState<string | null>(null);
   const [whatsappBridgeError, setWhatsappBridgeError] = useState(false);
   const [whatsappBridgeMessage, setWhatsappBridgeMessage] = useState<string | null>(null);
+  const [whatsappSyncAvailable, setWhatsappSyncAvailable] = useState(true);
+  const [whatsappSyncMessage, setWhatsappSyncMessage] = useState<string | null>(null);
   const [whatsappAuthRequired, setWhatsappAuthRequired] = useState(false);
   const [whatsappAuthQr, setWhatsappAuthQr] = useState<string | null>(null);
   const [whatsappAuthMessage, setWhatsappAuthMessage] = useState<string | null>(null);
@@ -169,6 +173,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     gateway_error?: string | null;
     whatsapp_bridge_error?: boolean | null;
     whatsapp_bridge_message?: string | null;
+    whatsapp_sync_available?: boolean | null;
+    whatsapp_sync_message?: string | null;
     whatsapp_auth_required?: boolean | null;
     whatsapp_auth_qr?: string | null;
     whatsapp_auth_message?: string | null;
@@ -182,6 +188,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     setGatewayMessage(status.gateway_error || progress.message);
     setWhatsappBridgeError(Boolean(status.whatsapp_bridge_error));
     setWhatsappBridgeMessage(status.whatsapp_bridge_message ?? null);
+    setWhatsappSyncAvailable(status.whatsapp_sync_available ?? true);
+    setWhatsappSyncMessage(status.whatsapp_sync_message ?? null);
     setWhatsappAuthRequired(Boolean(status.whatsapp_auth_required));
     setWhatsappAuthQr(status.whatsapp_auth_qr ?? null);
     setWhatsappAuthMessage(status.whatsapp_auth_message ?? null);
@@ -281,6 +289,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setGatewayMessage(null);
       setWhatsappBridgeError(false);
       setWhatsappBridgeMessage(null);
+      setWhatsappSyncAvailable(true);
+      setWhatsappSyncMessage(null);
       setWhatsappAuthRequired(false);
       setWhatsappAuthQr(null);
       setWhatsappAuthMessage(null);
@@ -594,6 +604,8 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     gatewayMessage,
     whatsappBridgeError,
     whatsappBridgeMessage,
+    whatsappSyncAvailable,
+    whatsappSyncMessage,
     whatsappAuthRequired,
     whatsappAuthQr,
     whatsappAuthMessage,

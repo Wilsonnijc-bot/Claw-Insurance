@@ -12,7 +12,7 @@ cp google.example.json google.json
 cp supabase.example.json supabase.json
 # edit config.json and put your real apiKey
 # edit supabase.json and put your real Supabase service key if you use catalog features
-docker compose up -d --build
+./docker-up
 ```
 
 Then:
@@ -32,15 +32,28 @@ docker compose down
 
 For Docker on macOS, history sync now uses a small host-side CDP helper so the container can reuse an existing Chrome CDP session or open a new host Chrome window automatically.
 
-Install it once on each Mac:
+The recommended entrypoint is now:
 
 ```bash
-python3 -m nanobot install-macos-cdp-helper
+./docker-up
 ```
 
-After that, the normal operator flow stays the same:
+`./docker-up` does the host-side preflight for you:
 
-- run `docker compose up -d --build`
+- checks Docker/Compose
+- checks that Chrome or Chromium exists on the Mac
+- installs or validates the macOS CDP helper
+- passes the absolute repo-local `whatsapp-web/` profile path into Docker
+
+If you want the helper-only command for advanced/manual use:
+
+```bash
+python3 -m nanobot.macos_cdp_helper install
+```
+
+After preflight, the normal operator flow stays the same:
+
+- run `./docker-up`
 - open `http://localhost:8080`
 - log in
 - click WhatsApp sync in the UI
@@ -728,12 +741,15 @@ Important runtime notes:
 
 - The Docker path uses the real repo-local config files. The normal first step is `cp config.example.json config.json`.
 - Docker does not need to expand `config.json` with `webBrowserMode` or `webCdpUrl`. Those Docker-only values come from Compose environment variables.
+- `./docker-up` is the canonical startup path. Raw `docker compose up -d --build` is now advanced/manual usage.
 - Baileys QR auth still persists in `whatsapp-auth/`.
 - Canonical sessions, memory, state, reply targets, and bridge build cache still persist in the repo checkout.
 
 ### Host CDP Browser For History Sync
 
 Manual WhatsApp history sync in Docker still requires a reachable host Chrome/Chromium instance with remote debugging enabled on port `9222`.
+On macOS, `./docker-up` also ensures the host-side CDP helper is installed and healthy before Docker starts.
+On non-macOS hosts, the Docker app still starts, but WhatsApp history sync is intentionally disabled until a host-preflight path exists there.
 
 Example host startup:
 
@@ -762,8 +778,9 @@ Keep that browser logged into WhatsApp Web before using sync in the UI. In Docke
 | `cp config.example.json config.json` | creates the repo-local Docker config from the minimal Moonshot-style template |
 | `cp google.example.json google.json` | creates the optional Google STT config template at the repo root |
 | `cp supabase.example.json supabase.json` | creates the optional Supabase catalog config template at the repo root |
+| `./docker-up` | runs Docker host preflight, prepares macOS WhatsApp sync dependencies when applicable, then starts the stack |
 | `docker compose run --rm nanobot-cli status` | shows Docker runtime status using the mounted repo root as the project root |
-| `docker compose up -d --build` | builds the local backend image, starts the launcher-first backend on `3456`, and serves the frontend on `8080` |
+| `docker compose up -d --build` | advanced/manual startup path that skips the host preflight wrapper |
 | `docker compose up -d` | restarts the existing Docker stack without rebuilding |
 | `docker compose run --rm nanobot-cli agent -m "Hello!"` | runs a one-off CLI command inside the same local Docker image and mounted workspace |
 | `docker compose logs -f nanobot-gateway` | tails backend logs |
@@ -789,12 +806,12 @@ For Docker-first operator use, the real flow is:
 4. edit `config.json` and fill your real API key
 5. edit `supabase.json` and fill your real Supabase service key if needed
 6. place your Google service-account JSON file under `secrets/` if needed
-7. run `docker compose up -d --build` for the first boot or after code changes
+7. run `./docker-up` for the first boot or after code changes
 8. open `http://localhost:8080`
 9. log in through the launcher screen in the browser
 10. wait for the gateway to start
 11. if needed, scan the Baileys QR shown by the UI
-12. if sync is needed, start a host Chrome/Chromium CDP browser on port `9222` and keep WhatsApp Web logged in there
+12. if sync is needed, keep the host Chrome/Chromium CDP browser logged into WhatsApp Web; `./docker-up` prepares the helper path on macOS
 13. work from the UI, where inbound messages are persisted first, drafts are generated on demand or automatically, and only approved sends are written and delivered
 
 For normal operator use, the real flow is:

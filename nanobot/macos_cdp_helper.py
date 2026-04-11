@@ -426,6 +426,20 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Nanobot macOS CDP helper")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    install_parser = subparsers.add_parser("install", help="Install and start the macOS LaunchAgent helper")
+    install_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the install result as JSON.",
+    )
+
+    health_parser = subparsers.add_parser("health", help="Check whether the helper is healthy")
+    health_parser.add_argument(
+        "--helper-url",
+        default=DEFAULT_HELPER_URL,
+        help=f"Helper base URL to probe (default: {DEFAULT_HELPER_URL}).",
+    )
+
     serve_parser = subparsers.add_parser("serve", help="Run the helper HTTP server")
     serve_parser.add_argument("--host", default=DEFAULT_HELPER_HOST)
     serve_parser.add_argument("--port", type=int, default=DEFAULT_HELPER_PORT)
@@ -437,6 +451,29 @@ def main(argv: list[str] | None = None) -> int:
     """Run the helper CLI."""
     parser = build_cli_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "install":
+        try:
+            result = install_launchd_helper()
+        except Exception as exc:
+            print(f"Failed to install the macOS CDP helper: {exc}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(f"Installed macOS CDP helper at {result['helper_url']}")
+            print(f"LaunchAgent: {result['launch_agent']}")
+            print(f"Helper script: {result['helper_script']}")
+        return 0
+
+    if args.command == "health":
+        healthy = request_helper_health(args.helper_url, timeout_s=0.5)
+        if healthy:
+            print(f"macOS CDP helper is healthy at {args.helper_url}")
+            return 0
+        print(f"macOS CDP helper is not reachable at {args.helper_url}", file=sys.stderr)
+        return 1
 
     if args.command == "serve":
         serve(host=args.host, port=args.port)

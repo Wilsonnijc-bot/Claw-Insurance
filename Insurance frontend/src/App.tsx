@@ -769,6 +769,14 @@ function App() {
         />
       )}
 
+      {!nanobot.whatsappBridgeError && !nanobot.whatsappSyncAvailable && !showBootstrapOverlay && (
+        <FloatingStatusNotice
+          title="历史同步未准备"
+          message={nanobot.whatsappSyncMessage || '当前环境尚未准备 WhatsApp 历史同步。'}
+          severity="warning"
+        />
+      )}
+
       {showBootstrapOverlay && (
         <GatewayBootstrapOverlay
           progress={nanobot.gatewayProgress}

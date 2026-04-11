@@ -385,8 +385,10 @@ class TestDockerConfinement:
         if not compose.exists():
             pytest.skip("docker-compose.yml not found")
         content = compose.read_text(encoding="utf-8")
-        assert "WEB_CDP_HELPER_URL: http://host.docker.internal:9230" in content
-        assert "WEB_HOST_PROFILE_DIR: ${PWD}/whatsapp-web" in content
+        assert "WEB_CDP_HELPER_URL: ${WEB_CDP_HELPER_URL-http://host.docker.internal:9230}" in content
+        assert "WEB_HOST_PROFILE_DIR: ${WEB_HOST_PROFILE_DIR-./whatsapp-web}" in content
+        assert "${PWD}/whatsapp-web" not in content
+        assert "WEB_HISTORY_SYNC_ENABLED: ${WEB_HISTORY_SYNC_ENABLED-true}" in content
 
     def test_compose_uses_launcher_not_gateway(self):
         compose = project_root() / "docker-compose.yml"
@@ -429,5 +431,15 @@ class TestDockerConfinement:
         if not compose.exists():
             pytest.skip("docker-compose.yml not found")
         content = compose.read_text(encoding="utf-8")
-        assert "WEB_BROWSER_MODE: cdp" in content
-        assert "WEB_CDP_URL: http://host.docker.internal:9222" in content
+        assert "WEB_BROWSER_MODE: ${WEB_BROWSER_MODE-cdp}" in content
+        assert "WEB_CDP_URL: ${WEB_CDP_URL-http://host.docker.internal:9222}" in content
+
+    def test_docker_up_script_prepares_host_helper_flow(self):
+        script = project_root() / "docker-up"
+        if not script.exists():
+            pytest.skip("docker-up not found")
+        content = script.read_text(encoding="utf-8")
+        assert 'python3 -m nanobot.macos_cdp_helper health' in content
+        assert 'python3 -m nanobot.macos_cdp_helper install' in content
+        assert 'export WEB_HISTORY_SYNC_ENABLED="false"' in content
+        assert 'docker compose up -d --build "$@"' in content

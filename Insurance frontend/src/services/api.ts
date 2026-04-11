@@ -64,6 +64,8 @@ export interface GatewayStatus {
   gateway_error?: string | null;
   whatsapp_bridge_error?: boolean | null;
   whatsapp_bridge_message?: string | null;
+  whatsapp_sync_available?: boolean | null;
+  whatsapp_sync_message?: string | null;
   whatsapp_auth_required?: boolean | null;
   whatsapp_auth_qr?: string | null;
   whatsapp_auth_message?: string | null;

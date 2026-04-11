@@ -94,3 +94,31 @@ def test_ensure_cdp_browser_checks_loopback_when_docker_requests_host_docker_int
     assert result["status"] == "launched"
     assert checked == ["http://127.0.0.1:9222"]
     assert waited == ["http://127.0.0.1:9222"]
+
+
+def test_helper_main_health_returns_success_when_helper_is_reachable(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(helper, "request_helper_health", lambda helper_url, timeout_s=0.5: True)
+
+    exit_code = helper.main(["health"])
+
+    assert exit_code == 0
+    assert "healthy" in capsys.readouterr().out
+
+
+def test_helper_main_install_calls_launchd_installer(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        helper,
+        "install_launchd_helper",
+        lambda: {
+            "helper_url": helper.DEFAULT_HELPER_URL,
+            "launch_agent": "/tmp/com.nanobot.macos-cdp-helper.plist",
+            "helper_script": "/tmp/macos_cdp_helper.py",
+        },
+    )
+
+    exit_code = helper.main(["install"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Installed macOS CDP helper" in output
+    assert helper.DEFAULT_HELPER_URL in output
