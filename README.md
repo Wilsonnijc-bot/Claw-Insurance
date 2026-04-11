@@ -195,8 +195,6 @@ The system is intentionally project-local. Runtime state lives under this reposi
 | `googleconfig.json` | Google STT feature settings only | canonical Google STT config |
 | `supabaseconfig.json` | Supabase catalog settings only | canonical catalog config |
 | `secrets/google-credentials.json` | Google service-account credential loaded at runtime from disk | canonical Google credential path |
-| `data/contacts/whatsapp.json` | legacy direct-contact source used only for one-time migration into reply targets | project-local legacy compatibility only; not intended for git |
-| `data/whatsapp_groups.csv` | optional legacy group-member compatibility store | project-local legacy compatibility only; not intended for git |
 | `data/whatsapp_reply_targets.json` | direct/group reply targets, auto-draft flags, observed IDs, and migration markers | canonical operator target registry and inbound routing registry, but project-local and not intended for git |
 | `sessions/whatsapp__{phone}/session.jsonl` | append-only persisted conversation history and saved `offline_meeting_note` records | canonical chat and note history |
 | `sessions/whatsapp__{phone}/meta.json` | derived session metadata, pointers, and offline-meeting note index entries | derived from `session.jsonl` |
