@@ -244,7 +244,7 @@ def _prompt_core_config(
     existing_base = existing_config.providers.litellm.base_url or _DEFAULT_LITELLM_BASE_URL
     base_url = _prompt_url("LiteLLM endpoint base URL", default=existing_base)
     api_key = _prompt_secret(
-        "LiteLLM API key",
+        "LiteLLM proxy API key",
         existing_value=existing_config.providers.litellm.api_key,
     )
 

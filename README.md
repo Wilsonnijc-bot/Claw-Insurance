@@ -91,7 +91,7 @@ For a normal local install, you usually just:
 - press Enter to keep `3456`
 - press Enter to keep the default LiteLLM model
 - press Enter to keep the default LiteLLM base URL
-- paste your LiteLLM API key
+- paste your LiteLLM proxy API key
 - optionally enable Supabase and paste its backend-capable key
 - optionally enable Google STT after placing `secrets/double-scholar-487115-b1-075776a1689b.json`
 
