@@ -1,13 +1,13 @@
 {
   "providers": {
     "litellm": {
-      "baseUrl": "https://api.moonshot.cn/v1/chat/completions",
-      "apiKey": "sk-REPLACE_WITH_YOUR_VIRTUAL_KEY"
+      "baseUrl": "https://api.moonshot.cn/v1",
+      "apiKey": "sk-dDyETgnDS0W4RxiS2yN4ngQeFjjoMNxwW2PCU1tf9y40oJIY"
     }
   },
   "agents": {
     "defaults": {
-      "model": "litellm/moonshot-v1-8k",
+      "model": "moonshot-v1-8k",
       "provider": "litellm"
     }
   },
