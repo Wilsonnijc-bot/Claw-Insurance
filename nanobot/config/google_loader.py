@@ -1,4 +1,4 @@
-"""Isolated Google Speech-to-Text configuration loader."""
+"""Canonical Google Speech-to-Text configuration loader."""
 
 from __future__ import annotations
 
@@ -7,19 +7,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nanobot.utils.paths import project_root
+from nanobot.config.loader import get_config_path
 
 GOOGLE_CONFIG_FILENAME = "google.json"
-LEGACY_GOOGLE_CONFIG_FILENAME = "googleconfig.json"
 
 
-def _default_google_config_path(root: Path) -> Path:
-    """Return the preferred Google config path, with legacy fallback."""
-    preferred = root / GOOGLE_CONFIG_FILENAME
-    legacy = root / LEGACY_GOOGLE_CONFIG_FILENAME
-    if preferred.exists() or not legacy.exists():
-        return preferred
-    return legacy
+def _config_base_dir(config_path: Path | None = None) -> Path:
+    anchor = config_path or get_config_path()
+    return anchor.resolve().parent
+
+
+def _legacy_google_config_path(config_path: Path | None = None) -> Path:
+    return _config_base_dir(config_path) / "googleconfig.json"
+
+
+def _resolve_google_config_path(config_path: Path | None = None) -> Path:
+    return _config_base_dir(config_path) / GOOGLE_CONFIG_FILENAME
 
 
 class GoogleConfigError(RuntimeError):
@@ -28,7 +31,7 @@ class GoogleConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class GoogleSpeechConfig:
-    """Validated Google STT settings loaded from the project Google config."""
+    """Validated Google STT settings loaded from the canonical Google config."""
 
     project_id: str
     location: str
@@ -39,18 +42,16 @@ class GoogleSpeechConfig:
 
     @property
     def recognizer(self) -> str:
-        return (
-            f"projects/{self.project_id}/locations/{self.location}/recognizers/_"
-        )
+        return f"projects/{self.project_id}/locations/{self.location}/recognizers/_"
 
     @property
     def api_endpoint(self) -> str:
         return f"{self.location}-speech.googleapis.com"
 
 
-def get_google_config_path() -> Path:
-    """Return the project-local Google STT config path."""
-    return _default_google_config_path(project_root())
+def get_google_config_path(config_path: Path | None = None) -> Path:
+    """Return the canonical Google STT config path next to the active app config."""
+    return _resolve_google_config_path(config_path)
 
 
 def _read_json_file(path: Path, *, label: str) -> dict[str, Any]:
@@ -76,20 +77,18 @@ def _require_text(payload: dict[str, Any], field: str, *, label: str) -> str:
 def _resolve_credential_path(config_path: Path, raw_path: str) -> Path:
     candidate = Path(raw_path)
     if not candidate.is_absolute():
-        candidate = (config_path.parent / candidate).resolve()
-    else:
-        candidate = candidate.resolve()
-    return candidate
+        return (config_path.parent / candidate).resolve()
+    return candidate.resolve()
 
 
-def _validate_project_local_path(path: Path) -> None:
-    root = project_root().resolve()
+def _validate_project_local_path(path: Path, *, root: Path, label: str) -> None:
+    root = root.resolve()
     try:
         path.relative_to(root)
     except ValueError as exc:
         raise GoogleConfigError(
-            "Google credential file must stay inside this project root: "
-            f"{root}. Update {GOOGLE_CONFIG_FILENAME} credentialJsonPath."
+            "Google credential file must stay inside the active config directory root: "
+            f"{root}. Update {label} credentialJsonPath."
         ) from exc
 
 
@@ -99,14 +98,25 @@ def _validate_credential_file(path: Path) -> None:
     missing = [key for key in required_keys if not str(payload.get(key) or "").strip()]
     if missing:
         joined = ", ".join(missing)
-        raise GoogleConfigError(
-            f"Google credential file missing required field(s): {joined}"
-        )
+        raise GoogleConfigError(f"Google credential file missing required field(s): {joined}")
 
 
 def load_google_config(config_path: Path | None = None) -> GoogleSpeechConfig:
-    """Load and validate the Google config plus its credential file path."""
-    path = (config_path or get_google_config_path()).resolve()
+    """Load and validate the canonical Google config plus its credential file path."""
+    path = get_google_config_path(config_path)
+    legacy_path = _legacy_google_config_path(config_path)
+
+    if legacy_path.exists():
+        raise GoogleConfigError(
+            "Unsupported legacy Google config file found: "
+            f"{legacy_path}. Rename or move it to {path} and use google.example.json as the template."
+        )
+    if not path.exists():
+        raise GoogleConfigError(
+            "Google config not found: "
+            f"{path}. Create google.json from google.example.json next to {get_config_path().resolve().name}."
+        )
+
     label = path.name
     payload = _read_json_file(path, label=label)
 
@@ -114,19 +124,13 @@ def load_google_config(config_path: Path | None = None) -> GoogleSpeechConfig:
     location = _require_text(payload, "location", label=label)
     language_code = _require_text(payload, "languageCode", label=label)
     model = _require_text(payload, "model", label=label)
-    credential_json_path = _require_text(
-        payload,
-        "credentialJsonPath",
-        label=label,
-    )
+    credential_json_path = _require_text(payload, "credentialJsonPath", label=label)
 
     if model != "chirp_3":
-        raise GoogleConfigError(
-            f"{label} field 'model' must be exactly 'chirp_3'"
-        )
+        raise GoogleConfigError(f"{label} field 'model' must be exactly 'chirp_3'")
 
     credential_path = _resolve_credential_path(path, credential_json_path)
-    _validate_project_local_path(credential_path)
+    _validate_project_local_path(credential_path, root=path.parent, label=label)
     if not credential_path.exists():
         raise GoogleConfigError(
             "Google credential file not found at "

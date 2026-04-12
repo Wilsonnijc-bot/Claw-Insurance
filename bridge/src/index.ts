@@ -28,6 +28,7 @@ const WEB_BROWSER_MODE = (process.env.WEB_BROWSER_MODE || 'cdp') as 'cdp' | 'lau
 const WEB_CDP_URL = process.env.WEB_CDP_URL || 'http://127.0.0.1:9222';
 const WEB_CDP_CHROME_PATH = process.env.WEB_CDP_CHROME_PATH || '';
 const WEB_CDP_HELPER_URL = process.env.WEB_CDP_HELPER_URL || '';
+const WEB_CDP_HELPER_PLATFORM = process.env.WEB_CDP_HELPER_PLATFORM || '';
 const WEB_HOST_PROFILE_DIR = process.env.WEB_HOST_PROFILE_DIR || '';
 const WEB_PROFILE_DIR = process.env.WEB_PROFILE_DIR || join(process.cwd(), 'whatsapp-web');
 const TOKEN = process.env.BRIDGE_TOKEN || undefined;
@@ -43,6 +44,9 @@ if (WEB_BROWSER_MODE === 'cdp') {
   }
   if (WEB_CDP_HELPER_URL) {
     console.log(`🧩 CDP helper: ${WEB_CDP_HELPER_URL}`);
+  }
+  if (WEB_CDP_HELPER_PLATFORM) {
+    console.log(`🧭 CDP helper platform: ${WEB_CDP_HELPER_PLATFORM}`);
   }
   if (WEB_HOST_PROFILE_DIR) {
     console.log(`🗂️ Host CDP profile: ${WEB_HOST_PROFILE_DIR}`);

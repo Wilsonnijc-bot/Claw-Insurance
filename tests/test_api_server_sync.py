@@ -210,7 +210,7 @@ async def test_api_sync_reclassifies_window_launch_failures_as_sync_unavailable(
     whatsapp = _BridgeStatusWhatsApp(
         {
             "status": "window_launch_failed",
-            "detail": "Mac CDP helper is not installed/running at http://host.docker.internal:9230.",
+            "detail": "Host CDP helper is not installed/running at http://host.docker.internal:9230.",
         }
     )
     config = SimpleNamespace(
@@ -235,7 +235,7 @@ async def test_api_sync_reclassifies_window_launch_failures_as_sync_unavailable(
 
     assert response.status == 503
     assert json.loads(response.text) == {
-        "error": "Mac CDP helper is not installed/running at http://host.docker.internal:9230.",
+        "error": "Host CDP helper is not installed/running at http://host.docker.internal:9230.",
         "code": "sync_unavailable",
     }
     assert whatsapp.bridge_status_calls == [(False, "")]
@@ -309,7 +309,7 @@ async def test_api_sync_returns_sync_unavailable_when_runtime_gate_is_disabled(
     assert json.loads(response.text) == {
         "error": (
             "当前 Docker 主机未准备 WhatsApp 历史同步。应用仍可正常使用；"
-            "如需历史同步，请在 macOS 主机上先运行 ./docker-up 完成预检。"
+            "如需历史同步，请在宿主机运行 python -m nanobot docker-up 完成预检。"
         ),
         "code": "sync_unavailable",
     }
@@ -345,7 +345,7 @@ async def test_status_exposes_sync_availability_without_bridge_error(
     assert response.status == 200
     assert json.loads(response.text)["whatsapp_sync_available"] is False
     assert json.loads(response.text)["whatsapp_bridge_error"] is False
-    assert "docker-up" in json.loads(response.text)["whatsapp_sync_message"]
+    assert "python -m nanobot docker-up" in json.loads(response.text)["whatsapp_sync_message"]
 
 
 @pytest.mark.asyncio

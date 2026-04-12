@@ -241,23 +241,12 @@ def test_supabase_repository_inactive_project_fails_cleanly_without_management_t
         repo.get_rows()
 
 
-def test_load_catalog_settings_prefers_env_over_split_and_legacy(monkeypatch, tmp_path) -> None:
+def test_load_catalog_settings_prefers_env_over_canonical_split(monkeypatch, tmp_path) -> None:
     app_dir = tmp_path / "app"
     app_dir.mkdir(parents=True, exist_ok=True)
     app_config = app_dir / "nanobot.json"
-    app_config.write_text(
-        """
-        {
-          "catalog": {
-            "supabaseUrl": "https://legacy.supabase.co",
-            "supabaseAnonKey": "legacy-key",
-            "supabaseCatalogTables": ["legacy_table"]
-          }
-        }
-        """.strip(),
-        encoding="utf-8",
-    )
-    (app_dir / "supabaseconfig.json").write_text(
+    app_config.write_text("{}", encoding="utf-8")
+    (app_dir / "supabase.json").write_text(
         """
         {
           "supabaseUrl": "https://split.supabase.co",

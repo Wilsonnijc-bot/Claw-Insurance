@@ -4,6 +4,7 @@ import asyncio
 import os
 import select
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -656,6 +657,251 @@ def install_macos_cdp_helper():
     console.print(f"  Launcher script: [cyan]{result['launcher_script']}[/cyan]")
 
 
+def _host_helper_platform_name() -> str:
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform.startswith("win"):
+        return "windows"
+    return sys.platform
+
+
+def _docker_up_root_dir() -> Path:
+    from nanobot.utils.paths import project_root
+
+    return project_root().resolve()
+
+
+def _require_command(name: str, guidance: str) -> None:
+    if shutil.which(name):
+        return
+    console.print(f"[red]{name} not found. {guidance}[/red]")
+    raise typer.Exit(1)
+
+
+def _check_docker_compose_available() -> None:
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        console.print(f"[red]Failed to run docker compose: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    if result.returncode != 0:
+        console.print("[red]docker compose is not available. Update Docker so Compose v2 is installed.[/red]")
+        raise typer.Exit(1)
+
+
+def _non_macos_desktop_ready(platform_name: str) -> bool:
+    if platform_name != "linux":
+        return True
+    return any(
+        str(os.environ.get(name) or "").strip()
+        for name in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE")
+    )
+
+
+def _print_helper_install_result(platform_name: str, result: dict[str, str]) -> None:
+    label = "Linux" if platform_name == "linux" else "Windows" if platform_name == "windows" else "Host"
+    console.print(f"[green]✓[/green] Installed {label} CDP helper")
+    console.print(f"  Helper URL: [cyan]{result['helper_url']}[/cyan]")
+    if result.get("service_file"):
+        console.print(f"  Service file: [cyan]{result['service_file']}[/cyan]")
+    if result.get("autostart_file"):
+        console.print(f"  Autostart file: [cyan]{result['autostart_file']}[/cyan]")
+    if result.get("task_name"):
+        console.print(f"  Task name: [cyan]{result['task_name']}[/cyan]")
+    console.print(f"  Helper script: [cyan]{result['helper_script']}[/cyan]")
+    if result.get("launcher_script"):
+        console.print(f"  Launcher script: [cyan]{result['launcher_script']}[/cyan]")
+
+
+@app.command("install-linux-cdp-helper")
+def install_linux_cdp_helper():
+    """Install the Linux host-side CDP helper used by Docker WhatsApp sync."""
+    if not sys.platform.startswith("linux"):
+        console.print("[red]The Linux CDP helper can only be installed on Linux.[/red]")
+        raise typer.Exit(1)
+
+    from nanobot.linux_cdp_helper import install_linux_helper, load_or_create_helper_token
+
+    try:
+        result = install_linux_helper(helper_token=load_or_create_helper_token())
+    except Exception as exc:
+        console.print(f"[red]Failed to install the Linux CDP helper: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    _print_helper_install_result("linux", result)
+
+
+@app.command("install-windows-cdp-helper")
+def install_windows_cdp_helper():
+    """Install the Windows host-side CDP helper used by Docker WhatsApp sync."""
+    if not sys.platform.startswith("win"):
+        console.print("[red]The Windows CDP helper can only be installed on Windows.[/red]")
+        raise typer.Exit(1)
+
+    from nanobot.windows_cdp_helper import install_windows_helper, load_or_create_helper_token
+
+    try:
+        result = install_windows_helper(helper_token=load_or_create_helper_token())
+    except Exception as exc:
+        console.print(f"[red]Failed to install the Windows CDP helper: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    _print_helper_install_result("windows", result)
+
+
+@app.command("install-host-cdp-helper")
+def install_host_cdp_helper():
+    """Install the current platform's host-side CDP helper used by Docker WhatsApp sync."""
+    platform_name = _host_helper_platform_name()
+    if platform_name == "macos":
+        install_macos_cdp_helper()
+        return
+    if platform_name == "linux":
+        install_linux_cdp_helper()
+        return
+    if platform_name == "windows":
+        install_windows_cdp_helper()
+        return
+
+    console.print(f"[red]Host CDP helper is not supported on this platform: {platform_name}[/red]")
+    raise typer.Exit(1)
+
+
+@app.command("docker-up")
+def docker_up(
+    services: list[str] = typer.Argument(
+        None,
+        metavar="[SERVICE]...",
+        help="Optional docker compose services to build/start.",
+    ),
+):
+    """Run Docker host preflight, prepare host sync dependencies, and start the stack."""
+    root_dir = _docker_up_root_dir()
+    platform_name = _host_helper_platform_name()
+    service_args = services or []
+
+    _require_command("docker", "Install Docker Desktop or another Docker engine with Compose support.")
+    _check_docker_compose_available()
+
+    env = {**os.environ}
+    env["WEB_BROWSER_MODE"] = str(env.get("WEB_BROWSER_MODE") or "cdp")
+    env["WEB_CDP_URL"] = str(env.get("WEB_CDP_URL") or "http://host.docker.internal:9222")
+    env["WEB_CDP_HELPER_URL"] = str(env.get("WEB_CDP_HELPER_URL") or "http://host.docker.internal:9230")
+    env["WEB_HOST_PROFILE_DIR"] = str(Path(env.get("WEB_HOST_PROFILE_DIR") or (root_dir / "whatsapp-web")).resolve())
+    Path(env["WEB_HOST_PROFILE_DIR"]).mkdir(parents=True, exist_ok=True)
+    env.setdefault("WEB_HISTORY_SYNC_ENABLED", "true")
+
+    if platform_name == "macos":
+        from nanobot.macos_cdp_helper import DEFAULT_HELPER_URL, install_launchd_helper, request_helper_health, resolve_chrome_path
+
+        console.print("Checking macOS Chrome/CDP prerequisites...")
+        try:
+            resolve_chrome_path(str(env.get("WEB_CDP_CHROME_PATH") or ""))
+        except Exception as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+
+        env["WEB_CDP_HELPER_PLATFORM"] = "macos"
+        env.pop("WEB_CDP_HELPER_TOKEN", None)
+
+        if request_helper_health(DEFAULT_HELPER_URL, timeout_s=0.5):
+            console.print("[green]✓[/green] macOS CDP helper already healthy")
+        else:
+            console.print("Installing macOS CDP helper...")
+            try:
+                install_launchd_helper()
+            except Exception as exc:
+                console.print(f"[red]Failed to install the macOS CDP helper: {exc}[/red]")
+                raise typer.Exit(1) from exc
+    elif platform_name == "linux":
+        from nanobot.linux_cdp_helper import (
+            DEFAULT_HELPER_URL,
+            install_linux_helper,
+            load_or_create_helper_token,
+            request_helper_health,
+            resolve_chrome_path,
+        )
+
+        if not _non_macos_desktop_ready(platform_name):
+            console.print("[red]Linux Docker sync requires a desktop session (DISPLAY or WAYLAND_DISPLAY).[/red]")
+            raise typer.Exit(1)
+
+        console.print("Checking Linux Chrome/CDP prerequisites...")
+        try:
+            resolve_chrome_path(str(env.get("WEB_CDP_CHROME_PATH") or ""))
+        except Exception as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+
+        env["WEB_CDP_HELPER_PLATFORM"] = "linux"
+        env["WEB_CDP_HELPER_TOKEN"] = load_or_create_helper_token()
+
+        if request_helper_health(DEFAULT_HELPER_URL, timeout_s=0.5):
+            console.print("[green]✓[/green] Linux CDP helper already healthy")
+        else:
+            console.print("Installing Linux CDP helper...")
+            try:
+                install_linux_helper(helper_token=env["WEB_CDP_HELPER_TOKEN"])
+            except Exception as exc:
+                console.print(f"[red]Failed to install the Linux CDP helper: {exc}[/red]")
+                raise typer.Exit(1) from exc
+    elif platform_name == "windows":
+        from nanobot.windows_cdp_helper import (
+            DEFAULT_HELPER_URL,
+            install_windows_helper,
+            load_or_create_helper_token,
+            request_helper_health,
+            resolve_chrome_path,
+        )
+
+        console.print("Checking Windows Chrome/CDP prerequisites...")
+        try:
+            resolve_chrome_path(str(env.get("WEB_CDP_CHROME_PATH") or ""))
+        except Exception as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+
+        env["WEB_CDP_HELPER_PLATFORM"] = "windows"
+        env["WEB_CDP_HELPER_TOKEN"] = load_or_create_helper_token()
+
+        if request_helper_health(DEFAULT_HELPER_URL, timeout_s=0.5):
+            console.print("[green]✓[/green] Windows CDP helper already healthy")
+        else:
+            console.print("Installing Windows CDP helper...")
+            try:
+                install_windows_helper(helper_token=env["WEB_CDP_HELPER_TOKEN"])
+            except Exception as exc:
+                console.print(f"[red]Failed to install the Windows CDP helper: {exc}[/red]")
+                raise typer.Exit(1) from exc
+    else:
+        env["WEB_HISTORY_SYNC_ENABLED"] = "false"
+        env["WEB_CDP_HELPER_URL"] = ""
+        env.pop("WEB_CDP_HELPER_TOKEN", None)
+        env["WEB_CDP_HELPER_PLATFORM"] = platform_name
+        console.print(
+            "[yellow]Docker startup is supported on this host, but WhatsApp history sync is not prepared here.[/yellow]"
+        )
+
+    console.print("Starting Docker services...")
+    try:
+        subprocess.run(
+            ["docker", "compose", "up", "-d", "--build", *service_args],
+            cwd=root_dir,
+            env=env,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]docker compose up failed with exit code {exc.returncode}[/red]")
+        raise typer.Exit(exc.returncode) from exc
+
+
 # ============================================================================
 # Onboard / Setup
 # ============================================================================
@@ -672,11 +918,22 @@ def setup():
 @app.command()
 def onboard():
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_path, load_config, save_config
+    from nanobot.config.errors import ConfigLayoutError
+    from nanobot.config.loader import (
+        assert_canonical_split_config_layout,
+        get_config_path,
+        load_config,
+        save_config,
+    )
     from nanobot.config.schema import Config
     from nanobot.utils.helpers import get_workspace_path
 
     config_path = get_config_path()
+    try:
+        assert_canonical_split_config_layout(config_path)
+    except ConfigLayoutError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
 
     if config_path.exists():
         console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
@@ -1422,8 +1679,17 @@ def _build_whatsapp_bridge_env(config: Config) -> dict[str, str]:
 
             if request_helper_health(DEFAULT_HELPER_URL, timeout_s=0.2):
                 env["WEB_CDP_HELPER_URL"] = DEFAULT_HELPER_URL
+                env["WEB_CDP_HELPER_PLATFORM"] = "macos"
         except Exception:
             pass
+
+    runtime_helper_token = str(os.environ.get("WEB_CDP_HELPER_TOKEN") or "").strip()
+    if runtime_helper_token:
+        env["WEB_CDP_HELPER_TOKEN"] = runtime_helper_token
+
+    runtime_helper_platform = str(os.environ.get("WEB_CDP_HELPER_PLATFORM") or "").strip()
+    if runtime_helper_platform:
+        env["WEB_CDP_HELPER_PLATFORM"] = runtime_helper_platform
 
     parsed = urlparse(wa.bridge_url)
     if parsed.port:

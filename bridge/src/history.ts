@@ -184,7 +184,7 @@ export class HistoryParser extends WhatsAppWebSession {
       || detail.includes('No Chrome/Chromium executable was found')
       || detail.includes('Configured Chrome executable does not exist')
       || detail.includes('Failed to launch the CDP browser')
-      || detail.includes('Mac CDP helper')
+      || detail.includes('Host CDP helper')
       || detail.includes('Host Chrome CDP is not reachable')
       || (detail.includes('spawn ') && detail.includes(' ENOENT'))
     ) {

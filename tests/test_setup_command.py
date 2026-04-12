@@ -34,16 +34,6 @@ def _write_google_credential(path: Path) -> None:
     )
 
 
-def _pick_existing(tmp_path: Path, preferred: str, legacy: str) -> Path:
-    preferred_path = tmp_path / preferred
-    if preferred_path.exists():
-        return preferred_path
-    legacy_path = tmp_path / legacy
-    if legacy_path.exists():
-        return legacy_path
-    return preferred_path
-
-
 def test_setup_first_run_core_only_and_status(monkeypatch, tmp_path: Path) -> None:
     _use_temp_project(monkeypatch, tmp_path)
 
@@ -121,8 +111,8 @@ def test_setup_supabase_only(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.stdout
 
-    supabase_path = _pick_existing(tmp_path, "supabase.json", "supabaseconfig.json")
-    google_path = _pick_existing(tmp_path, "google.json", "googleconfig.json")
+    supabase_path = tmp_path / "supabase.json"
+    google_path = tmp_path / "google.json"
     assert "supabase.json" in result.stdout
     assert "google.json" in result.stdout
     assert supabase_path.exists()
@@ -167,8 +157,8 @@ def test_setup_google_only(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.stdout
 
-    google_path = _pick_existing(tmp_path, "google.json", "googleconfig.json")
-    supabase_path = _pick_existing(tmp_path, "supabase.json", "supabaseconfig.json")
+    google_path = tmp_path / "google.json"
+    supabase_path = tmp_path / "supabase.json"
     assert "supabase.json" in result.stdout
     assert "google.json" in result.stdout
     assert google_path.exists()
@@ -214,8 +204,8 @@ def test_setup_both_enabled(monkeypatch, tmp_path: Path) -> None:
     assert (tmp_path / "config.json").exists()
     assert "supabase.json" in result.stdout
     assert "google.json" in result.stdout
-    supabase_path = _pick_existing(tmp_path, "supabase.json", "supabaseconfig.json")
-    google_path = _pick_existing(tmp_path, "google.json", "googleconfig.json")
+    supabase_path = tmp_path / "supabase.json"
+    google_path = tmp_path / "google.json"
     assert supabase_path.exists()
     assert google_path.exists()
 
@@ -255,7 +245,7 @@ def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Pa
         ),
         encoding="utf-8",
     )
-    (tmp_path / "supabaseconfig.json").write_text(
+    (tmp_path / "supabase.json").write_text(
         json.dumps(
             {
                 "supabaseUrl": "https://old.supabase.co",
@@ -265,7 +255,7 @@ def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Pa
         ),
         encoding="utf-8",
     )
-    (tmp_path / "googleconfig.json").write_text(
+    (tmp_path / "google.json").write_text(
         json.dumps(
             {
                 "projectId": "old-project",
@@ -311,8 +301,8 @@ def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Pa
     assert result.exit_code == 0, result.stdout
 
     config_payload = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    supabase_payload = json.loads((tmp_path / "supabaseconfig.json").read_text(encoding="utf-8"))
-    google_payload = json.loads((tmp_path / "googleconfig.json").read_text(encoding="utf-8"))
+    supabase_payload = json.loads((tmp_path / "supabase.json").read_text(encoding="utf-8"))
+    google_payload = json.loads((tmp_path / "google.json").read_text(encoding="utf-8"))
 
     assert config_payload["providers"]["litellm"]["apiKey"] == "new-key"
     assert config_payload["providers"]["litellm"]["baseUrl"] == "https://new.example/v1"
@@ -332,3 +322,27 @@ def test_setup_rerun_handles_update_skip_and_overwrite(monkeypatch, tmp_path: Pa
     assert google_payload["location"] == "eu"
     assert google_payload["credentialJsonPath"] == "secrets/new-google.json"
     assert "extraNote" not in google_payload
+
+
+def test_setup_aborts_on_legacy_split_config_files(monkeypatch, tmp_path: Path) -> None:
+    _use_temp_project(monkeypatch, tmp_path)
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "googleconfig.json").write_text("{}", encoding="utf-8")
+
+    result = runner.invoke(app, ["setup"])
+
+    assert result.exit_code != 0
+    assert "Unsupported legacy Google config file found" in result.stdout
+
+
+def test_setup_aborts_on_inline_catalog_in_config_json(monkeypatch, tmp_path: Path) -> None:
+    _use_temp_project(monkeypatch, tmp_path)
+    (tmp_path / "config.json").write_text(
+        json.dumps({"catalog": {"supabaseUrl": "https://legacy.supabase.co"}}),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["setup"])
+
+    assert result.exit_code != 0
+    assert "config.json contains unsupported 'catalog' settings" in result.stdout

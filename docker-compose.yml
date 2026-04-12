@@ -9,6 +9,8 @@ x-backend-common: &backend-common
     WEB_BROWSER_MODE: ${WEB_BROWSER_MODE-cdp}
     WEB_CDP_URL: ${WEB_CDP_URL-http://host.docker.internal:9222}
     WEB_CDP_HELPER_URL: ${WEB_CDP_HELPER_URL-http://host.docker.internal:9230}
+    WEB_CDP_HELPER_TOKEN: ${WEB_CDP_HELPER_TOKEN-}
+    WEB_CDP_HELPER_PLATFORM: ${WEB_CDP_HELPER_PLATFORM-}
     WEB_HOST_PROFILE_DIR: ${WEB_HOST_PROFILE_DIR-./whatsapp-web}
     WEB_HISTORY_SYNC_ENABLED: ${WEB_HISTORY_SYNC_ENABLED-true}
   volumes:

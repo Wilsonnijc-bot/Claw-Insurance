@@ -82,6 +82,7 @@ export interface CdpHelperEnsureRequest {
   startUrl: string;
   chromePath?: string;
   forceNewWindow?: boolean;
+  helperToken?: string;
 }
 
 export interface CdpHelperEnsureResult {
@@ -110,10 +111,15 @@ export const DEFAULT_CDP_HELPER_CLIENT: CdpHelperClient = {
     startUrl,
     chromePath,
     forceNewWindow,
+    helperToken,
   }: CdpHelperEnsureRequest): Promise<CdpHelperEnsureResult> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (helperToken && helperToken.trim()) {
+      headers.Authorization = `Bearer ${helperToken.trim()}`;
+    }
     const response = await fetch(`${helperUrl.replace(/\/+$/, '')}/v1/cdp/ensure`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         endpointUrl,
         profileDir,
@@ -338,7 +344,7 @@ export class WhatsAppWebSession {
       }
       throw new Error(
         helperResult.detail
-        || `Host Chrome CDP is not reachable at ${this.cdpEndpoint} after the macOS helper ran.`,
+        || `Host Chrome CDP is not reachable at ${this.cdpEndpoint} after the host helper ran.`,
       );
     }
 
@@ -381,25 +387,28 @@ export class WhatsAppWebSession {
     }
 
     try {
-      const result = await this.cdpHelperClient.ensureBrowser({
+      const helperToken = (process.env.WEB_CDP_HELPER_TOKEN || '').trim();
+      const request: CdpHelperEnsureRequest = {
         helperUrl,
         endpointUrl: this.cdpEndpoint,
         profileDir: this._effectiveHostProfileDir(),
         startUrl: WHATSAPP_WEB_URL,
         chromePath: this.cdpChromePath.trim() || undefined,
         forceNewWindow,
-      });
+        ...(helperToken ? { helperToken } : {}),
+      };
+      const result = await this.cdpHelperClient.ensureBrowser(request);
       if (result.status === 'failed') {
         throw new Error(
           result.detail
-          || `Mac CDP helper failed to launch or reuse Chrome for ${this.cdpEndpoint}.`,
+          || `Host CDP helper failed to launch or reuse Chrome for ${this.cdpEndpoint}.`,
         );
       }
       return result;
     } catch (error) {
       const detail = this._stringifyError(error);
       throw new Error(
-        `Mac CDP helper is not installed/running at ${helperUrl}, or it could not launch Chrome successfully. ${detail}`.trim(),
+        `Host CDP helper is not installed/running at ${helperUrl}, or it could not launch Chrome successfully. ${detail}`.trim(),
       );
     }
   }

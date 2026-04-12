@@ -60,6 +60,8 @@ def test_build_whatsapp_bridge_env_prefers_runtime_env_in_source() -> None:
     assert '_set_runtime_value("WEB_HOST_PROFILE_DIR", str(_project_root / "whatsapp-web"))' in source
     assert '_set_runtime_value("AUTH_DIR", str(_project_root / "whatsapp-auth"))' in source
     assert 'WEB_CDP_HELPER_URL' in source
+    assert 'WEB_CDP_HELPER_TOKEN' in source
+    assert 'WEB_CDP_HELPER_PLATFORM' in source
 
 
 def test_build_whatsapp_bridge_env_auto_detects_healthy_macos_helper(monkeypatch) -> None:
@@ -74,6 +76,19 @@ def test_build_whatsapp_bridge_env_auto_detects_healthy_macos_helper(monkeypatch
     env = _build_whatsapp_bridge_env(config)
 
     assert env["WEB_CDP_HELPER_URL"] == helper.DEFAULT_HELPER_URL
+    assert env["WEB_CDP_HELPER_PLATFORM"] == "macos"
+
+
+def test_build_whatsapp_bridge_env_includes_runtime_helper_token_and_platform(monkeypatch) -> None:
+    config = Config.model_validate({"channels": {"whatsapp": {"enabled": True}}})
+
+    monkeypatch.setenv("WEB_CDP_HELPER_TOKEN", "secret-token")
+    monkeypatch.setenv("WEB_CDP_HELPER_PLATFORM", "linux")
+
+    env = _build_whatsapp_bridge_env(config)
+
+    assert env["WEB_CDP_HELPER_TOKEN"] == "secret-token"
+    assert env["WEB_CDP_HELPER_PLATFORM"] == "linux"
 
 
 def test_whatsapp_web_gateway_entry_routes_to_gateway(monkeypatch) -> None:

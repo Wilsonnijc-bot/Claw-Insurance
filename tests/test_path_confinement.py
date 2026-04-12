@@ -20,6 +20,7 @@ import pytest
 
 from nanobot.utils.paths import (
     PathEscapeError,
+    _looks_like_runtime_root,
     _set_project_root,
     confine_path,
     is_inside_project,
@@ -68,6 +69,14 @@ class TestProjectRoot:
             assert project_root() == runtime_root.resolve()
         finally:
             _set_project_root(old_root)
+
+    def test_legacy_split_filenames_do_not_mark_runtime_root(self, tmp_path):
+        runtime_root = tmp_path / "runtime-root"
+        (runtime_root / "nanobot").mkdir(parents=True)
+        (runtime_root / "googleconfig.json").write_text("{}", encoding="utf-8")
+        (runtime_root / "supabaseconfig.json").write_text("{}", encoding="utf-8")
+
+        assert not _looks_like_runtime_root(runtime_root)
 
 
 class TestConfinePath:
@@ -313,6 +322,9 @@ class TestSourceCodeAudit:
         allowed_files = {
             "nanobot/cli/commands.py",  # install-ui-command (intentional)
             "nanobot/macos_cdp_helper.py",  # macOS host helper installer/runtime
+            "nanobot/_non_macos_cdp_helper.py",  # Linux/Windows host helper installer/runtime
+            "nanobot/linux_cdp_helper.py",  # Linux host helper wrapper
+            "nanobot/windows_cdp_helper.py",  # Windows host helper wrapper
             "nanobot/utils/paths.py",   # is_inside_project uses it in tests only
         }
         for rel, source in self._read_python_sources().items():
@@ -363,6 +375,16 @@ class TestDockerConfinement:
             "Dockerfile still references /root/.nanobot"
         )
 
+    def test_dockerfile_copies_canonical_split_configs(self):
+        dockerfile = project_root() / "Dockerfile"
+        if not dockerfile.exists():
+            pytest.skip("Dockerfile not found")
+        content = dockerfile.read_text(encoding="utf-8")
+        assert "COPY google.example.json /app/google.json" in content
+        assert "COPY supabase.example.json /app/supabase.json" in content
+        assert "googleconfig.example.json" not in content
+        assert "supabaseconfig.example.json" not in content
+
     def test_compose_no_home_nanobot_volume(self):
         compose = project_root() / "docker-compose.yml"
         if not compose.exists():
@@ -386,6 +408,8 @@ class TestDockerConfinement:
             pytest.skip("docker-compose.yml not found")
         content = compose.read_text(encoding="utf-8")
         assert "WEB_CDP_HELPER_URL: ${WEB_CDP_HELPER_URL-http://host.docker.internal:9230}" in content
+        assert "WEB_CDP_HELPER_TOKEN: ${WEB_CDP_HELPER_TOKEN-}" in content
+        assert "WEB_CDP_HELPER_PLATFORM: ${WEB_CDP_HELPER_PLATFORM-}" in content
         assert "WEB_HOST_PROFILE_DIR: ${WEB_HOST_PROFILE_DIR-./whatsapp-web}" in content
         assert "${PWD}/whatsapp-web" not in content
         assert "WEB_HISTORY_SYNC_ENABLED: ${WEB_HISTORY_SYNC_ENABLED-true}" in content
@@ -439,7 +463,4 @@ class TestDockerConfinement:
         if not script.exists():
             pytest.skip("docker-up not found")
         content = script.read_text(encoding="utf-8")
-        assert 'python3 -m nanobot.macos_cdp_helper health' in content
-        assert 'python3 -m nanobot.macos_cdp_helper install' in content
-        assert 'export WEB_HISTORY_SYNC_ENABLED="false"' in content
-        assert 'docker compose up -d --build "$@"' in content
+        assert 'exec python3 -m nanobot docker-up "$@"' in content

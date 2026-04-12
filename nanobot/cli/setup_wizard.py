@@ -12,12 +12,17 @@ import typer
 from rich.console import Console
 
 from nanobot import __logo__
+from nanobot.config.errors import ConfigLayoutError
 from nanobot.config.google_loader import (
     GoogleConfigError,
     get_google_config_path,
     load_google_config,
 )
-from nanobot.config.loader import get_config_path, load_config
+from nanobot.config.loader import (
+    assert_canonical_split_config_layout,
+    get_config_path,
+    load_config,
+)
 from nanobot.config.schema import Config
 from nanobot.config.supabase_loader import (
     get_supabase_config_path,
@@ -41,7 +46,13 @@ def run_setup_wizard() -> None:
     """Run the guided setup flow and write split config files."""
     config_path = get_config_path()
     supabase_path = get_supabase_config_path(config_path)
-    google_path = get_google_config_path()
+    google_path = get_google_config_path(config_path)
+
+    try:
+        assert_canonical_split_config_layout(config_path)
+    except ConfigLayoutError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
 
     existing_config_raw = _read_json_object(config_path)
     existing_supabase_raw = _read_json_object(supabase_path)
@@ -49,11 +60,17 @@ def run_setup_wizard() -> None:
 
     try:
         existing_config = load_config(config_path) if config_path.exists() else Config()
+    except ConfigLayoutError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
     except Exception:
         existing_config = Config()
 
     try:
         existing_catalog = load_supabase_config(config_path) if supabase_path.exists() else {}
+    except ConfigLayoutError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
     except Exception:
         existing_catalog = {}
 
@@ -188,13 +205,6 @@ def run_setup_wizard() -> None:
         notes.append(
             f"{google_path.name} was kept, so Google STT stays configured."
         )
-
-    if not wants_supabase and core_action == "skip":
-        raw_catalog = (existing_config_raw or {}).get("catalog")
-        if isinstance(raw_catalog, dict) and raw_catalog:
-            notes.append(
-                "config.json still contains legacy catalog settings because it was kept unchanged."
-            )
 
     final_config = load_config(config_path)
     workspace = get_workspace_path(final_config.agents.defaults.workspace)

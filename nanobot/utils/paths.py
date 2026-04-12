@@ -49,8 +49,6 @@ def _looks_like_runtime_root(path: Path) -> bool:
             or (path / "config.json").exists()
             or (path / "google.json").exists()
             or (path / "supabase.json").exists()
-            or (path / "googleconfig.json").exists()
-            or (path / "supabaseconfig.json").exists()
         )
     )
 

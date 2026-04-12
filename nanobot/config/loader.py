@@ -1,11 +1,6 @@
-"""Configuration loading utilities.
+"""Configuration loading utilities."""
 
-Path confinement: config is loaded from the project-local ``config.json``
-unless an explicit env var override (``NANOBOT_CONFIG_PATH`` or
-``NANOBOT_APP_CONFIG_PATH``) is set.  The legacy ``~/.nanobot`` migration
-has been removed.  If you still have state there from an older install, run
-the standalone ``scripts/migrate_from_home.py`` script once.
-"""
+from __future__ import annotations
 
 import json
 import logging
@@ -13,9 +8,10 @@ import os
 from pathlib import Path
 from typing import Any
 
+from nanobot.config.errors import ConfigLayoutError
 from nanobot.config.schema import Config
 from nanobot.config.supabase_loader import (
-    has_external_supabase_config,
+    get_supabase_config_path,
     load_supabase_config,
     save_supabase_config,
 )
@@ -30,19 +26,10 @@ def _project_config_path() -> Path:
 
 
 def get_config_path() -> Path:
-    """Get the preferred configuration file path.
-
-    Lookup order:
-    1. ``NANOBOT_CONFIG_PATH`` env var  (explicit override, may be external)
-    2. ``NANOBOT_APP_CONFIG_PATH`` env var  (explicit override, may be external)
-    3. Project-local ``config.json``
-
-    Env var overrides are the *only* way to point config outside this repo.
-    """
+    """Get the preferred configuration file path."""
     explicit = os.environ.get("NANOBOT_CONFIG_PATH")
     if explicit:
         p = Path(explicit)
-        # Log a warning when the explicit path is outside the project tree
         try:
             confine_path(p)
         except ValueError:
@@ -66,11 +53,7 @@ def get_config_path() -> Path:
 
 
 def get_config_search_paths(config_path: Path | None = None) -> list[Path]:
-    """Return candidate config paths in lookup order.
-
-    Search is intentionally project-local unless an explicit env var or path is
-    provided by the caller.
-    """
+    """Return candidate config paths in lookup order."""
     if config_path is not None:
         return [config_path.resolve()]
 
@@ -97,24 +80,38 @@ def get_config_search_paths(config_path: Path | None = None) -> list[Path]:
 def get_data_dir() -> Path:
     """Get the nanobot data directory."""
     from nanobot.utils.helpers import get_data_path
+
     return get_data_path()
 
 
-def load_config(config_path: Path | None = None) -> Config:
-    """Load configuration from file or create default.
+def assert_canonical_split_config_layout(config_path: Path | None = None) -> None:
+    """Reject legacy split config files and inline catalog config."""
+    path = get_config_search_paths(config_path)[0]
+    _assert_no_legacy_split_files(path)
+    try:
+        data = _read_optional_json_object(path, label="config.json")
+    except ValueError:
+        return
+    _assert_no_inline_catalog_data(data, path)
 
-    No legacy migration is performed.  Config is resolved strictly from
-    the project-local ``config.json`` or an explicit env-var override.
-    """
+
+def load_config(config_path: Path | None = None) -> Config:
+    """Load configuration from canonical config files or create default."""
     for path in get_config_search_paths(config_path):
         try:
             data = _read_optional_json_object(path, label="config.json")
+            _assert_no_legacy_split_files(path)
+            _assert_no_inline_catalog_data(data, path)
             split_catalog = load_supabase_config(path)
             if data is None and not split_catalog:
                 continue
             data = _migrate_config(data or {})
-            data = _merge_split_configs(data, catalog=split_catalog)
+            if split_catalog:
+                data = dict(data)
+                data["catalog"] = dict(split_catalog)
             return Config.model_validate(data)
+        except ConfigLayoutError:
+            raise
         except ValueError as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
@@ -124,23 +121,26 @@ def load_config(config_path: Path | None = None) -> Config:
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
-    """
-    Save configuration to file.
-
-    Args:
-        config: Configuration to save.
-        config_path: Optional path to save to. Uses default if not provided.
-    """
+    """Save configuration to canonical config files."""
     path = get_config_search_paths(config_path)[0]
+    assert_canonical_split_config_layout(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    catalog_payload = config.catalog.model_dump(
+        by_alias=True,
+        exclude_defaults=True,
+        exclude_none=True,
+    )
     data = config.model_dump(by_alias=True)
-    externalized_catalog = has_external_supabase_config(path)
-    catalog_data = data.pop("catalog", None) if externalized_catalog else None
+    data.pop("catalog", None)
 
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    if externalized_catalog:
-        save_supabase_config(catalog_data or {}, path)
+
+    supabase_path = get_supabase_config_path(path)
+    if catalog_payload:
+        save_supabase_config(catalog_payload, path)
+    else:
+        supabase_path.unlink(missing_ok=True)
 
 
 def _read_optional_json_object(path: Path, *, label: str) -> dict[str, Any] | None:
@@ -156,20 +156,39 @@ def _read_optional_json_object(path: Path, *, label: str) -> dict[str, Any] | No
     return payload
 
 
-def _merge_split_configs(data: dict[str, Any], *, catalog: dict[str, Any]) -> dict[str, Any]:
-    if not catalog:
-        return data
-    merged = dict(data)
-    current_catalog = merged.get("catalog")
-    base_catalog = dict(current_catalog) if isinstance(current_catalog, dict) else {}
-    base_catalog.update(catalog)
-    merged["catalog"] = base_catalog
-    return merged
+def _assert_no_legacy_split_files(config_path: Path) -> None:
+    base_dir = config_path.resolve().parent
+    legacy_google_path = base_dir / "googleconfig.json"
+    legacy_supabase_path = base_dir / "supabaseconfig.json"
+    google_path = base_dir / "google.json"
+    supabase_path = base_dir / "supabase.json"
+
+    if legacy_google_path.exists():
+        raise ConfigLayoutError(
+            "Unsupported legacy Google config file found: "
+            f"{legacy_google_path}. Rename or move it to {google_path} and use google.example.json as the template."
+        )
+    if legacy_supabase_path.exists():
+        raise ConfigLayoutError(
+            "Unsupported legacy Supabase config file found: "
+            f"{legacy_supabase_path}. Move these settings into {supabase_path} and use supabase.example.json as the template."
+        )
+
+
+def _assert_no_inline_catalog_data(data: dict[str, Any] | None, path: Path) -> None:
+    if not data or "catalog" not in data:
+        return
+    catalog = data.get("catalog")
+    if isinstance(catalog, dict) and not catalog:
+        return
+    raise ConfigLayoutError(
+        "config.json contains unsupported 'catalog' settings: "
+        f"{path}. Move them into {get_supabase_config_path(path)} and keep config.json for core app settings only."
+    )
 
 
 def _migrate_config(data: dict) -> dict:
     """Migrate old config formats to current."""
-    # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
     tools = data.get("tools", {})
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:

@@ -288,19 +288,61 @@ class ApiServer:
         raw = str(os.environ.get(name, str(default))).strip().lower()
         return raw not in {"0", "false", "no", "off"}
 
+    @staticmethod
+    def _whatsapp_helper_platform() -> str:
+        raw = str(os.environ.get("WEB_CDP_HELPER_PLATFORM") or "").strip().lower()
+        if raw:
+            return raw
+        helper_url = str(os.environ.get("WEB_CDP_HELPER_URL") or "").strip()
+        return "macos" if helper_url else ""
+
+    @staticmethod
+    def _whatsapp_helper_install_command(platform_name: str) -> str:
+        if platform_name == "macos":
+            return "python3 -m nanobot.macos_cdp_helper install"
+        if platform_name == "linux":
+            return "python -m nanobot install-linux-cdp-helper"
+        if platform_name == "windows":
+            return "python -m nanobot install-windows-cdp-helper"
+        return "python -m nanobot install-host-cdp-helper"
+
+    @staticmethod
+    def _whatsapp_docker_up_hint(platform_name: str) -> str:
+        if platform_name == "macos":
+            return "python -m nanobot docker-up（macOS 也可继续使用 ./docker-up）"
+        return "python -m nanobot docker-up"
+
+    @staticmethod
+    def _whatsapp_helper_probe(platform_name: str):
+        if platform_name == "macos":
+            from nanobot.macos_cdp_helper import request_helper_health
+
+            return request_helper_health
+        if platform_name == "linux":
+            from nanobot.linux_cdp_helper import request_helper_health
+
+            return request_helper_health
+        if platform_name == "windows":
+            from nanobot.windows_cdp_helper import request_helper_health
+
+            return request_helper_health
+        raise RuntimeError(f"Unsupported host helper platform: {platform_name or 'unknown'}")
+
     def _get_whatsapp_sync_status(self) -> dict[str, Any]:
         """Return whether WhatsApp history sync is prepared for this runtime."""
         if not self._env_flag("WEB_HISTORY_SYNC_ENABLED", default=True):
+            platform_name = self._whatsapp_helper_platform()
             return {
                 "available": False,
                 "message": (
                     "当前 Docker 主机未准备 WhatsApp 历史同步。应用仍可正常使用；"
-                    "如需历史同步，请在 macOS 主机上先运行 ./docker-up 完成预检。"
+                    f"如需历史同步，请在宿主机运行 {self._whatsapp_docker_up_hint(platform_name)} 完成预检。"
                 ),
             }
 
         browser_mode = str(os.environ.get("WEB_BROWSER_MODE") or "").strip().lower()
         helper_url = str(os.environ.get("WEB_CDP_HELPER_URL") or "").strip()
+        platform_name = self._whatsapp_helper_platform()
         running_in_docker_workspace = str(os.environ.get("NANOBOT_PROJECT_ROOT") or "").strip() == "/workspace"
 
         if browser_mode == "cdp" and running_in_docker_workspace:
@@ -309,20 +351,20 @@ class ApiServer:
                     "available": False,
                     "message": (
                         "Docker WhatsApp 历史同步尚未配置主机侧 CDP helper。"
-                        "请使用 ./docker-up 启动，或手动提供 WEB_CDP_HELPER_URL。"
+                        f"请使用 {self._whatsapp_docker_up_hint(platform_name)} 启动，或手动提供 WEB_CDP_HELPER_URL。"
                     ),
                 }
 
             try:
-                from nanobot.macos_cdp_helper import request_helper_health
+                request_helper_health = self._whatsapp_helper_probe(platform_name)
 
                 if not request_helper_health(helper_url, timeout_s=0.4):
                     return {
                         "available": False,
                         "message": (
-                            f"Mac CDP helper 未就绪：{helper_url}。"
-                            "请在宿主机运行 ./docker-up，或执行 "
-                            "python3 -m nanobot.macos_cdp_helper install 后重试。"
+                            f"主机侧 CDP helper 未就绪：{helper_url}。"
+                            f"请在宿主机运行 {self._whatsapp_docker_up_hint(platform_name)}，或执行 "
+                            f"{self._whatsapp_helper_install_command(platform_name)} 后重试。"
                         ),
                     }
                 return {"available": True, "message": ""}
@@ -331,8 +373,8 @@ class ApiServer:
                 return {
                     "available": False,
                     "message": (
-                        f"无法检查 Mac CDP helper：{helper_url}。"
-                        "请在宿主机重新运行 ./docker-up 后重试。"
+                        f"无法检查主机侧 CDP helper：{helper_url}。"
+                        f"请在宿主机重新运行 {self._whatsapp_docker_up_hint(platform_name)} 后重试。"
                     ),
                 }
 

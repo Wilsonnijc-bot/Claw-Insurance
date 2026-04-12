@@ -1122,7 +1122,7 @@ test('scrapeHistory retries in a fresh CDP window when the attached page is not 
   }
 });
 
-test('scrapeHistory reports window_launch_failed when the macOS helper cannot launch or reuse host Chrome', async () => {
+test('scrapeHistory reports window_launch_failed when the host helper cannot launch or reuse host Chrome', async () => {
   const page = new FakePage({
     initialUrl: 'https://web.whatsapp.com/',
     searchVisible: false,
@@ -1145,7 +1145,7 @@ test('scrapeHistory reports window_launch_failed when the macOS helper cannot la
     {
       async ensureBrowser(request) {
         helperCalls.push(request);
-        throw new Error('Mac CDP helper is not installed/running at http://127.0.0.1:9230.');
+        throw new Error('Host CDP helper is not installed/running at http://127.0.0.1:9230.');
       },
     },
   );
@@ -1155,7 +1155,7 @@ test('scrapeHistory reports window_launch_failed when the macOS helper cannot la
   );
 
   assert.equal(result.status, 'window_launch_failed');
-  assert.match(result.detail, /Mac CDP helper is not installed\/running/);
+  assert.match(result.detail, /Host CDP helper is not installed\/running/);
   assert.equal(spawnCalls.length, 0);
   assert.equal(helperCalls.length, 2);
 });

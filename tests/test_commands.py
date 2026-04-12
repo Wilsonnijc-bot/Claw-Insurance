@@ -96,6 +96,16 @@ def test_onboard_existing_workspace_safe_create(mock_paths):
     assert (workspace_dir / "HEARTBEAT.md").exists()
 
 
+def test_onboard_rejects_inline_catalog_in_main_config(mock_paths):
+    config_file, _workspace_dir = mock_paths
+    config_file.write_text('{"catalog": {"supabaseUrl": "https://legacy.supabase.co"}}')
+
+    result = runner.invoke(app, ["onboard"])
+
+    assert result.exit_code != 0
+    assert "unsupported 'catalog' settings" in result.stdout
+
+
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():
     config = Config()
     config.agents.defaults.provider = "auto"

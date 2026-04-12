@@ -25,8 +25,8 @@ RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
 COPY nanobot/ nanobot/
 COPY bridge/ bridge/
 COPY config.example.json /app/config.json
-COPY googleconfig.example.json /app/googleconfig.json
-COPY supabaseconfig.example.json /app/supabaseconfig.json
+COPY google.example.json /app/google.json
+COPY supabase.example.json /app/supabase.json
 RUN uv pip install --system --no-cache . && \
     python3 -c "import google.cloud.speech_v2"
 

@@ -101,8 +101,8 @@ include = [
     "README.md",
     "LICENSE",
     "config.example.json",
-    "googleconfig.example.json",
-    "supabaseconfig.example.json",
+    "google.example.json",
+    "supabase.example.json",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
