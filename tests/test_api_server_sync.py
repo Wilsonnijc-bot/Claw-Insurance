@@ -309,7 +309,7 @@ async def test_api_sync_returns_sync_unavailable_when_runtime_gate_is_disabled(
     assert json.loads(response.text) == {
         "error": (
             "当前 Docker 主机未准备 WhatsApp 历史同步。应用仍可正常使用；"
-            "如需历史同步，请在宿主机运行 python -m nanobot docker-up 完成预检。"
+            "如需历史同步，请在宿主机运行 python3 -m nanobot docker-up 完成预检。"
         ),
         "code": "sync_unavailable",
     }
@@ -345,7 +345,19 @@ async def test_status_exposes_sync_availability_without_bridge_error(
     assert response.status == 200
     assert json.loads(response.text)["whatsapp_sync_available"] is False
     assert json.loads(response.text)["whatsapp_bridge_error"] is False
-    assert "python -m nanobot docker-up" in json.loads(response.text)["whatsapp_sync_message"]
+    assert "python3 -m nanobot docker-up" in json.loads(response.text)["whatsapp_sync_message"]
+
+
+def test_whatsapp_docker_up_hint_uses_platform_specific_commands() -> None:
+    assert ApiServer._whatsapp_docker_up_hint("macos") == "./docker-up or python3 -m nanobot docker-up"
+    assert ApiServer._whatsapp_docker_up_hint("linux") == "python3 -m nanobot docker-up"
+    assert ApiServer._whatsapp_docker_up_hint("windows") == "py -3 -m nanobot docker-up"
+
+
+def test_whatsapp_helper_install_command_uses_lightweight_platform_modules() -> None:
+    assert ApiServer._whatsapp_helper_install_command("macos") == "python3 -m nanobot.macos_cdp_helper install"
+    assert ApiServer._whatsapp_helper_install_command("linux") == "python3 -m nanobot.linux_cdp_helper install"
+    assert ApiServer._whatsapp_helper_install_command("windows") == "py -3 -m nanobot.windows_cdp_helper install"
 
 
 @pytest.mark.asyncio

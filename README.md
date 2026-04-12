@@ -23,7 +23,8 @@ Docker is the recommended way to run this project.
 ### Prerequisites
 
 - Docker Desktop or another Docker engine with Compose v2
-- `python` / `python3` must be available because `python -m nanobot docker-up` runs the host CDP helper preflight
+- macOS / Linux: `python3` must be available
+- Windows: `py -3` must be available
 - Chrome/Chromium is required on the host for Docker WhatsApp history sync
 
 ### 1. Clone The Repo
@@ -51,16 +52,20 @@ Then:
 ### 3. Build And Start
 
 ```bash
-python -m nanobot docker-up
+python3 -m nanobot docker-up
 ```
 
-This command does the host checks and then runs:
+That command does the host checks, installs or reuses the host CDP helper, and then runs:
 
 ```bash
 docker compose up -d --build
 ```
 
-On macOS and Linux, `./docker-up` remains as a compatibility wrapper around the same Python command.
+Platform commands:
+
+- macOS: `./docker-up` or `python3 -m nanobot docker-up`
+- Linux / Huawei Linux: `python3 -m nanobot docker-up`
+- Windows / Huawei Windows: `py -3 -m nanobot docker-up`
 
 ### 4. Open The App
 
@@ -77,8 +82,9 @@ Then log in and complete WhatsApp login / QR steps if needed.
 Use these commands from the project root.
 
 ```bash
-python -m nanobot docker-up        # build and start everything
-./docker-up                        # macOS/Linux compatibility wrapper
+python3 -m nanobot docker-up       # macOS/Linux build and start everything
+py -3 -m nanobot docker-up         # Windows build and start everything
+./docker-up                        # macOS compatibility wrapper
 docker compose up -d               # start without rebuilding
 docker compose ps                  # show running services
 docker compose logs -f             # follow all logs
@@ -89,8 +95,9 @@ docker compose down                # stop everything
 
 Useful notes:
 
-- `python -m nanobot docker-up` is the official start command
-- `./docker-up` remains available on macOS/Linux
+- macOS: use `./docker-up` or `python3 -m nanobot docker-up`
+- Linux / Huawei Linux: use `python3 -m nanobot docker-up`
+- Windows / Huawei Windows: use `py -3 -m nanobot docker-up`
 - `docker compose down` stops the current stack
 - `docker compose down` does not delete your project files in this repo
 

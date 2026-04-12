@@ -301,16 +301,18 @@ class ApiServer:
         if platform_name == "macos":
             return "python3 -m nanobot.macos_cdp_helper install"
         if platform_name == "linux":
-            return "python -m nanobot install-linux-cdp-helper"
+            return "python3 -m nanobot.linux_cdp_helper install"
         if platform_name == "windows":
-            return "python -m nanobot install-windows-cdp-helper"
-        return "python -m nanobot install-host-cdp-helper"
+            return "py -3 -m nanobot.windows_cdp_helper install"
+        return "python3 -m nanobot docker-up"
 
     @staticmethod
     def _whatsapp_docker_up_hint(platform_name: str) -> str:
         if platform_name == "macos":
-            return "python -m nanobot docker-up（macOS 也可继续使用 ./docker-up）"
-        return "python -m nanobot docker-up"
+            return "./docker-up or python3 -m nanobot docker-up"
+        if platform_name == "windows":
+            return "py -3 -m nanobot docker-up"
+        return "python3 -m nanobot docker-up"
 
     @staticmethod
     def _whatsapp_helper_probe(platform_name: str):
