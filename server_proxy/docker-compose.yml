@@ -33,6 +33,9 @@ services:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - DB_PROXY_API_KEY=${DB_PROXY_API_KEY}
+      - LITELLM_BASE_URL=http://litellm:4000
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - AUDIT_DATABASE_URL=postgresql://litellm:${LITELLM_DB_PASSWORD}@db:5432/litellm
     ports:
       - "5000:5000"
     restart: unless-stopped
@@ -44,6 +47,9 @@ services:
     environment:
       - GOOGLE_CREDENTIAL_JSON_PATH=/secrets/google.json
       - INTERVIEW_PROXY_API_KEY=${INTERVIEW_PROXY_API_KEY}
+      - LITELLM_BASE_URL=http://litellm:4000
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - AUDIT_DATABASE_URL=postgresql://litellm:${LITELLM_DB_PASSWORD}@db:5432/litellm
     volumes:
       - ./secrets:/secrets:ro
     ports:

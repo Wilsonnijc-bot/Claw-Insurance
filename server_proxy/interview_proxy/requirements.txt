@@ -3,3 +3,4 @@ uvicorn[standard]
 httpx
 python-dotenv
 google-cloud-speech
+psycopg[binary]

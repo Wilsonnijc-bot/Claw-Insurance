@@ -47,14 +47,181 @@
 
 ## Required server `.env` variables
 
-- `LITELLM_MASTER_KEY`
-- `LITELLM_DB_PASSWORD`
-- `MOONSHOT_API_KEY`
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_KEY`
-- `DB_PROXY_API_KEY`
-- `INTERVIEW_PROXY_API_KEY`
-- `GOOGLE_CREDENTIAL_JSON_PATH`
+- `LITELLM_MASTER_KEY` — Admin key for generating virtual keys
+- `LITELLM_DB_PASSWORD` — Database password (shared between LiteLLM and PostgreSQL)
+- `SUPABASE_URL` — Supabase project URL
+- `SUPABASE_SERVICE_KEY` — Service role key (server-side only)
+- `GOOGLE_CREDENTIAL_JSON_PATH` — Path to Google service account JSON
+- `DB_PROXY_API_KEY` — API key for db-proxy (shared in NanoBot config.json)
+- `INTERVIEW_PROXY_API_KEY` — API key for interview-proxy (shared in NanoBot config.json)
+- `AUDIT_DATABASE_URL` — PostgreSQL connection string for audit logs (e.g., `postgresql://user:pwd@postgres:5432/audit_db`)
+- `LEGACY_DB_PROXY_API_KEY` — Fallback key if LiteLLM unavailable (optional, for backward compatibility)
+
+## Unified Key Management & Audit Logging
+
+### LiteLLM Virtual Keys with Metadata
+
+Each proxy request is validated via LiteLLM's `/key/info` endpoint. Virtual keys contain metadata:
+
+```json
+{
+  "key": "sk-...",
+  "user_id": "user-123",
+  "tenant_id": "org-456",
+  "can_use_db": true,
+  "can_use_interview": false,
+  "can_use_llm": true
+}
+```
+
+Permission checks:
+
+- db-proxy: checks `can_use_db`
+- interview-proxy: checks `can_use_interview`
+- Tenant filtering applied to all queries
+
+### PostgreSQL Audit Table
+
+Table: `proxy_audit_logs`
+
+| Column        | Type      | Purpose                                     |
+| ------------- | --------- | ------------------------------------------- |
+| request_id    | UUID      | Unique request identifier                   |
+| service_name  | TEXT      | "db-proxy" or "interview-proxy"             |
+| endpoint      | TEXT      | e.g., "/query", "/recognize"                |
+| method        | TEXT      | HTTP method                                 |
+| key_hash      | TEXT      | SHA256(key) for privacy                     |
+| key_prefix    | TEXT      | First 8 chars of key                        |
+| user_id       | TEXT      | From LiteLLM metadata                       |
+| tenant_id     | TEXT      | From LiteLLM metadata                       |
+| allowed       | BOOLEAN   | True if request passed auth                 |
+| status_code   | INT       | HTTP response code                          |
+| latency_ms    | INT       | Request duration                            |
+| client_ip     | TEXT      | Source IP address                           |
+| details       | JSONB     | Extra context (request size, response size) |
+| error_message | TEXT      | Error if allowed=false                      |
+| created_at    | TIMESTAMP | Request timestamp                           |
+
+**Auto-created on startup** if not present.
+
+## Operator Workflow
+
+### 1. Start Services
+
+```bash
+cd server_proxy/
+docker compose up -d --build
+```
+
+### 2. Generate Virtual Keys
+
+Generate keys with specific user/tenant metadata:
+
+```bash
+curl -X POST http://localhost:4000/key/generate \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key_name": "tenant-org-456-user-123-db",
+    "metadata": {
+      "user_id": "user-123",
+      "tenant_id": "org-456",
+      "can_use_db": true,
+      "can_use_interview": false,
+      "can_use_llm": true
+    }
+  }'
+```
+
+Response:
+
+```json
+{
+  "key": "sk-xyzabc...",
+  "key_name": "tenant-org-456-user-123-db"
+}
+```
+
+### 3. Share Keys with Users
+
+Provide the generated key in your communication channel. User will add it to `config.json`.
+
+### 4. Monitor Audit Logs
+
+```bash
+# Connect to audit database
+psql $AUDIT_DATABASE_URL -c "
+  SELECT
+    created_at,
+    service_name,
+    user_id,
+    tenant_id,
+    status_code,
+    latency_ms,
+    allowed
+  FROM proxy_audit_logs
+  ORDER BY created_at DESC
+  LIMIT 20;
+"
+```
+
+Query by user or tenant:
+
+```bash
+psql $AUDIT_DATABASE_URL -c "
+  SELECT * FROM proxy_audit_logs
+  WHERE user_id='user-123' OR tenant_id='org-456'
+  ORDER BY created_at DESC;
+"
+```
+
+## User Workflow
+
+### 1. Obtain API Keys from Operator
+
+Request keys for:
+
+- Database access (db-proxy)
+- Speech recognition (interview-proxy)
+- LLM provider (if using server-side LiteLLM)
+
+### 2. Update config.json
+
+```json
+{
+  "catalog": {
+    "db_proxy": {
+      "baseUrl": "http://server-ip:5000",
+      "apiKey": "<DB_PROXY_API_KEY_FROM_OPERATOR>"
+    }
+  },
+  "interviewProxy": "http://server-ip:5001",
+  "providers": {
+    "litellm": {
+      "baseUrl": "http://server-ip:4000",
+      "apiKey": "<LITELLM_VIRTUAL_KEY_FROM_OPERATOR>"
+    }
+  }
+}
+```
+
+### 3. Start NanoBot
+
+```bash
+# macOS/Linux
+python3 -m nanobot docker-up
+
+# Windows
+py -3 -m nanobot docker-up
+```
+
+### 4. Verify Access
+
+Open `http://localhost:8080` and test database queries. Each request is:
+
+- Validated against LiteLLM virtual key
+- Filtered by tenant_id
+- Logged to PostgreSQL audit table
 
 ## Quick start & test commands
 
