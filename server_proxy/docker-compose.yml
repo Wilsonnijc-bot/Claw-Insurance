@@ -1,0 +1,51 @@
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+    environment:
+      - DATABASE_URL=postgresql://litellm:your_db_password@db:5432/litellm
+      - STORE_MODEL_IN_DB=True
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+    command: --config /app/config.yaml --port 4000
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=YzhYxLyp252608
+      - POSTGRES_DB=litellm
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  db-proxy:
+    build:
+      context: ./db_proxy
+      dockerfile: Dockerfile
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - DB_PROXY_API_KEY=${DB_PROXY_API_KEY}
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  interview-proxy:
+    build:
+      context: ./interview_proxy
+      dockerfile: Dockerfile
+    environment:
+      - GOOGLE_CREDENTIAL_JSON_PATH=/secrets/google.json
+      - INTERVIEW_PROXY_API_KEY=${INTERVIEW_PROXY_API_KEY}
+    volumes:
+      - ./secrets:/secrets:ro
+    ports:
+      - "5001:5001"
+    restart: unless-stopped

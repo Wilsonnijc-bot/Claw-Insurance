@@ -1,0 +1,11 @@
+# Ignore runtime secrets and generated data
+.env
+secrets/
+postgres_data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Misc
+.DS_Store

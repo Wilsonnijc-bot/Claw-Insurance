@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+import base64
+
+import httpx
 
 from loguru import logger
 
@@ -70,6 +73,45 @@ class GoogleSpeechProvider:
     async def transcribe(self, audio_bytes: bytes) -> str:
         """Return plain transcript text for a short in-memory audio clip."""
         if not audio_bytes:
+            return ""
+
+        # If proxy is configured, call external Interview proxy service instead of Google client
+        if getattr(self.config, "proxy_url", None):
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    url = self.config.proxy_url.rstrip("/") + "/recognize"
+                    payload = {
+                        "audio_base64": base64.b64encode(audio_bytes).decode(),
+                        "language": self.config.language_code,
+                    }
+                    headers = {"Accept": "application/json"}
+                    if getattr(self.config, "proxy_api_key", None):
+                        headers["Authorization"] = f"Bearer {self.config.proxy_api_key}"
+                    resp = await client.post(url, json=payload, headers=headers)
+            except Exception as exc:
+                logger.exception("Interview proxy request failed")
+                raise RuntimeError("Interview proxy transcription failed") from exc
+
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Interview proxy returned error ({resp.status_code}): {resp.text[:300]}")
+
+            try:
+                body = resp.json()
+            except Exception:
+                # Accept plain text body
+                return (resp.text or "").strip()
+
+            # Accept several possible shapes
+            if isinstance(body, dict):
+                text = body.get("transcript") or body.get("text") or body.get("result")
+                if isinstance(text, str):
+                    return text.strip()
+                # If 'results' array present, join
+                if isinstance(body.get("results"), list):
+                    parts = [str(item).strip() for item in body.get("results") if item]
+                    return " ".join(parts).strip()
+            if isinstance(body, str):
+                return body.strip()
             return ""
 
         try:

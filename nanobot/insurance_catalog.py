@@ -63,6 +63,9 @@ class CatalogSettings:
     supabase_management_token: str = ""
     supabase_catalog_table: str = ""
     supabase_catalog_tables: tuple[str, ...] = ()
+    # Optional DB proxy settings (when present, use proxy instead of direct Supabase requests)
+    db_proxy_url: str = ""
+    db_proxy_api_key: str = ""
     auto_restore_paused_project: bool = True
     restore_timeout_seconds: int = _DEFAULT_RESTORE_TIMEOUT_SECONDS
     cache_ttl_seconds: int = _DEFAULT_CACHE_TTL_SECONDS
@@ -156,6 +159,19 @@ def load_catalog_settings() -> CatalogSettings:
     if not tables:
         tables = ["insurance_products", "dental_insurance"]
 
+    # DB proxy config may appear under catalog.db_proxy (camelCase) or catalog.db_proxy
+    db_proxy_conf = configured.get("db_proxy") or configured.get("dbProxy") or {}
+    db_proxy_url = (
+        os.environ.get("CATALOG__DB_PROXY_URL")
+        or os.environ.get("DB_PROXY_URL")
+        or str(db_proxy_conf.get("baseUrl") or db_proxy_conf.get("base_url") or "")
+    ).strip()
+    db_proxy_api_key = (
+        os.environ.get("CATALOG__DB_PROXY_API_KEY")
+        or os.environ.get("DB_PROXY_API_KEY")
+        or str(db_proxy_conf.get("apiKey") or db_proxy_conf.get("api_key") or "")
+    ).strip()
+
     return CatalogSettings(
         supabase_url=_pick("CATALOG__SUPABASE_URL", "SUPABASE_URL", default="supabase_url"),
         supabase_anon_key=_pick(
@@ -177,6 +193,8 @@ def load_catalog_settings() -> CatalogSettings:
         ),
         supabase_catalog_table=single_table,
         supabase_catalog_tables=tuple(tables),
+        db_proxy_url=db_proxy_url,
+        db_proxy_api_key=db_proxy_api_key,
         auto_restore_paused_project=_pick_bool(
             "CATALOG__AUTO_RESTORE_PAUSED_PROJECT",
             "SUPABASE_AUTO_RESTORE_PAUSED_PROJECT",
@@ -215,6 +233,60 @@ class CsvCatalogRepository:
                 reader = csv.DictReader(handle)
                 for raw in reader:
                     rows.append(_normalize_row(raw, source_file=path.name))
+        return rows
+
+    def _fetch_table_rows_via_proxy(
+        self,
+        client: httpx.Client,
+        settings: CatalogSettings,
+        table_name: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch table rows by calling an external DB proxy service."""
+        base = settings.db_proxy_url.rstrip("/")
+        url = f"{base}/query"
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        headers = {"Accept": "application/json"}
+        if settings.db_proxy_api_key:
+            headers["Authorization"] = f"Bearer {settings.db_proxy_api_key}"
+
+        while True:
+            payload = {
+                "query_type": "select",
+                "table": table_name,
+                "limit": self._page_size,
+                "offset": offset,
+            }
+            response = client.post(url, json=payload, headers=headers)
+            if response.status_code >= 400:
+                detail = response.text.strip()[:300]
+                raise CatalogUnavailableError(
+                    f"DB proxy request failed for {table_name} ({response.status_code}): {detail}"
+                )
+            try:
+                payload_json = response.json()
+            except Exception:
+                raise CatalogUnavailableError("DB proxy returned non-JSON payload.")
+
+            # Accept either a top-level list or an object with 'rows' list
+            if isinstance(payload_json, list):
+                batch_src = payload_json
+            elif isinstance(payload_json, dict) and isinstance(payload_json.get("rows"), list):
+                batch_src = payload_json.get("rows")
+            else:
+                raise CatalogUnavailableError(
+                    f"DB proxy returned unexpected payload shape for {table_name}."
+                )
+
+            batch = [
+                _normalize_row(item, source_file="supabase")
+                for item in batch_src
+                if isinstance(item, dict)
+            ]
+            rows.extend(batch)
+            if len(batch_src) < self._page_size:
+                break
+            offset += len(batch_src)
         return rows
 
 
@@ -258,9 +330,13 @@ class SupabaseCatalogRepository:
     def _fetch_rows(self) -> list[dict[str, Any]]:
         settings = self._settings
         if not settings.supabase_url:
-            raise CatalogUnavailableError("Supabase catalog is not configured: missing supabase_url.")
+            # If DB proxy is configured, we will use it instead of direct Supabase access
+            if not settings.db_proxy_url:
+                raise CatalogUnavailableError("Supabase catalog is not configured: missing supabase_url.")
         if not settings.supabase_anon_key:
-            raise CatalogUnavailableError("Supabase catalog is not configured: missing supabase_anon_key.")
+            # when using db proxy, anon key is not required
+            if not settings.db_proxy_url:
+                raise CatalogUnavailableError("Supabase catalog is not configured: missing supabase_anon_key.")
         table_names = self._table_names()
         if not table_names:
             raise CatalogUnavailableError(
@@ -281,7 +357,10 @@ class SupabaseCatalogRepository:
                     rows = []
                     try:
                         for table_name in table_names:
-                            rows.extend(self._fetch_table_rows(client, settings.supabase_url, table_name, headers))
+                            if settings.db_proxy_url:
+                                rows.extend(self._fetch_table_rows_via_proxy(client, settings, table_name))
+                            else:
+                                rows.extend(self._fetch_table_rows(client, settings.supabase_url, table_name, headers))
                         break
                     except CatalogUnavailableError as exc:
                         if attempted_recovery or not self._should_attempt_restore(str(exc)):

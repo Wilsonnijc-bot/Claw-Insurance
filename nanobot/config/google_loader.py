@@ -37,7 +37,10 @@ class GoogleSpeechConfig:
     location: str
     language_code: str
     model: str
-    credential_json_path: Path
+    credential_json_path: Path | None
+    # Optional proxy settings — when present, use external speech proxy instead of direct Google client
+    proxy_url: str | None = None
+    proxy_api_key: str | None = None
     config_path: Path
 
     @property
@@ -111,7 +114,31 @@ def load_google_config(config_path: Path | None = None) -> GoogleSpeechConfig:
             "Unsupported legacy Google config file found: "
             f"{legacy_path}. Rename or move it to {path} and use google.example.json as the template."
         )
+    # If a local google.json exists, prefer it. Otherwise allow using top-level config interview_proxy.
     if not path.exists():
+        # Try to find interview proxy in main config.json
+        try:
+            from nanobot.config.loader import load_config
+
+            cfg = load_config()
+            ip = getattr(cfg, "interview_proxy", None)
+            if ip and (getattr(ip, "base_url", None) or getattr(ip, "baseUrl", None)):
+                # Build proxy-based GoogleSpeechConfig without local credential file
+                proxy_url = str(getattr(ip, "base_url", "") or getattr(ip, "baseUrl", ""))
+                proxy_api_key = str(getattr(ip, "api_key", "") or getattr(ip, "apiKey", ""))
+                # Use some sensible defaults; project_id etc. may be blank when proxy handles everything
+                return GoogleSpeechConfig(
+                    project_id="",
+                    location="",
+                    language_code="",
+                    model="",
+                    credential_json_path=None,
+                    proxy_url=proxy_url,
+                    proxy_api_key=proxy_api_key,
+                    config_path=path,
+                )
+        except Exception:
+            pass
         raise GoogleConfigError(
             "Google config not found: "
             f"{path}. Create google.json from google.example.json next to {get_config_path().resolve().name}."
@@ -120,30 +147,52 @@ def load_google_config(config_path: Path | None = None) -> GoogleSpeechConfig:
     label = path.name
     payload = _read_json_file(path, label=label)
 
-    project_id = _require_text(payload, "projectId", label=label)
-    location = _require_text(payload, "location", label=label)
-    language_code = _require_text(payload, "languageCode", label=label)
-    model = _require_text(payload, "model", label=label)
-    credential_json_path = _require_text(payload, "credentialJsonPath", label=label)
+    project_id = payload.get("projectId", "")
+    location = payload.get("location", "")
+    language_code = payload.get("languageCode", "")
+    model = payload.get("model", "")
+    credential_json_path = payload.get("credentialJsonPath")
 
-    if model != "chirp_3":
-        raise GoogleConfigError(f"{label} field 'model' must be exactly 'chirp_3'")
+    # Validate if this is a local credential-based config
+    if credential_json_path:
+        project_id = _require_text(payload, "projectId", label=label)
+        location = _require_text(payload, "location", label=label)
+        language_code = _require_text(payload, "languageCode", label=label)
+        model = _require_text(payload, "model", label=label)
+        credential_json_path = _require_text(payload, "credentialJsonPath", label=label)
 
-    credential_path = _resolve_credential_path(path, credential_json_path)
-    _validate_project_local_path(credential_path, root=path.parent, label=label)
-    if not credential_path.exists():
-        raise GoogleConfigError(
-            "Google credential file not found at "
-            f"{credential_path}. Update {label} credentialJsonPath."
+        if model != "chirp_3":
+            raise GoogleConfigError(f"{label} field 'model' must be exactly 'chirp_3'")
+
+        credential_path = _resolve_credential_path(path, credential_json_path)
+        _validate_project_local_path(credential_path, root=path.parent, label=label)
+        if not credential_path.exists():
+            raise GoogleConfigError(
+                "Google credential file not found at "
+                f"{credential_path}. Update {label} credentialJsonPath."
+            )
+
+        _validate_credential_file(credential_path)
+
+        return GoogleSpeechConfig(
+            project_id=project_id,
+            location=location,
+            language_code=language_code,
+            model=model,
+            credential_json_path=credential_path,
+            proxy_url=None,
+            proxy_api_key=None,
+            config_path=path,
         )
 
-    _validate_credential_file(credential_path)
-
+    # No local credential path — treat payload as minimal or fallback already handled
     return GoogleSpeechConfig(
-        project_id=project_id,
-        location=location,
-        language_code=language_code,
-        model=model,
-        credential_json_path=credential_path,
+        project_id=str(project_id or ""),
+        location=str(location or ""),
+        language_code=str(language_code or ""),
+        model=str(model or ""),
+        credential_json_path=None,
+        proxy_url=None,
+        proxy_api_key=None,
         config_path=path,
     )

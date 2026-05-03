@@ -383,6 +383,13 @@ class CatalogConfig(Base):
     cache_ttl_seconds: int = 300
 
 
+class InterviewProxyConfig(Base):
+    """Configuration for an external Interview/ speech proxy service."""
+
+    base_url: str = ""
+    api_key: str = ""
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -399,6 +406,7 @@ class Config(BaseSettings):
     privacy_gateway: PrivacyGatewayConfig = Field(default_factory=PrivacyGatewayConfig, alias="privacyGateway")
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     catalog: CatalogConfig = Field(default_factory=CatalogConfig)
+    interview_proxy: InterviewProxyConfig = Field(default_factory=InterviewProxyConfig, alias="interviewProxy")
 
     @property
     def workspace_path(self) -> Path:

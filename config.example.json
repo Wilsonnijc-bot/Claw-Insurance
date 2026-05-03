@@ -1,13 +1,13 @@
 {
   "providers": {
     "litellm": {
-      "baseUrl": "https://api.moonshot.cn/v1",
-      "apiKey": "sk-your-real-api-key"
+      "baseUrl": "http://127.0.0.1:4000",
+      "apiKey": "your-litellm-master-key"
     }
   },
   "agents": {
     "defaults": {
-      "model": "moonshot-v1-8k",
+      "model": "kimi-v1-8k",
       "provider": "litellm"
     }
   },
@@ -17,5 +17,15 @@
       "deliveryMode": "send",
       "bridgeUrl": "ws://localhost:3001"
     }
+  },
+  "catalog": {
+    "db_proxy": {
+      "baseUrl": "http://127.0.0.1:5000",
+      "apiKey": "your-db-proxy-api-key"
+    }
+  },
+  "interviewProxy": {
+    "baseUrl": "http://127.0.0.1:5001",
+    "apiKey": "your-interview-proxy-api-key"
   }
 }
