@@ -1,13 +1,13 @@
 [project]
 name = "nanobot-ai"
 version = "0.1.4.post3"
-description = "A lightweight personal AI assistant framework"
+description = "Claw Insurance workspace built on the nanobot assistant framework"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "nanobot contributors"}
+    {name = "Wilsonnijc-bot"}
 ]
-keywords = ["ai", "agent", "chatbot"]
+keywords = ["ai", "agent", "chatbot", "whatsapp", "insurance"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -44,6 +44,8 @@ dependencies = [
     "json-repair>=0.57.0,<1.0.0",
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
+    "aiohttp>=3.9.0,<4.0.0",
+    "google-cloud-speech>=2.35.0,<3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -61,8 +63,10 @@ dev = [
     "nh3>=0.2.17,<1.0.0",
 ]
 
-[project.scripts]
-nanobot = "nanobot.cli.commands:app"
+[project.urls]
+Homepage = "https://github.com/Wilsonnijc-bot/Claw-Insurance"
+Repository = "https://github.com/Wilsonnijc-bot/Claw-Insurance"
+Issues = "https://github.com/Wilsonnijc-bot/Claw-Insurance/issues"
 
 [build-system]
 requires = ["hatchling"]
@@ -91,6 +95,9 @@ include = [
     "bridge/",
     "README.md",
     "LICENSE",
+    "config.example.json",
+    "google.example.json",
+    "supabase.example.json",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]

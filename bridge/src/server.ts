@@ -5,7 +5,8 @@
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { DraftComposer } from './draft.js';
-import { WhatsAppClient } from './whatsapp.js';
+import { HistoryParser, type ScrapedHistoryMessage } from './history.js';
+import { WhatsAppClient, type ChatTarget, type HistoryBatch } from './whatsapp.js';
 
 interface SendCommand {
   type: 'send';
@@ -17,26 +18,45 @@ interface PrepareDraftCommand {
   type: 'prepare_draft';
   to: string;
   text: string;
+  target?: ChatTarget;
+}
+
+interface ScrapeDirectHistoryCommand {
+  type: 'scrape_direct_history';
+  target: ChatTarget;
+  requestId?: string;
+}
+
+interface ScrapeReplyTargetsHistoryCommand {
+  type: 'scrape_reply_targets_history';
+  targets: ChatTarget[];
+  requestId?: string;
 }
 
 interface BridgeMessage {
-  type: 'message' | 'deleted' | 'status' | 'qr' | 'error' | 'ack';
+  type: 'message' | 'history' | 'deleted' | 'status' | 'qr' | 'error' | 'ack';
   [key: string]: unknown;
 }
 
-type BridgeCommand = SendCommand | PrepareDraftCommand;
+type BridgeCommand = SendCommand | PrepareDraftCommand | ScrapeDirectHistoryCommand | ScrapeReplyTargetsHistoryCommand;
 
 export class BridgeServer {
   private wss: WebSocketServer | null = null;
   private wa: WhatsAppClient | null = null;
   private clients: Set<WebSocket> = new Set();
-  private composer: DraftComposer | null = null;
+  private draftComposer: DraftComposer | null = null;
+  private historyParser: HistoryParser | null = null;
 
   constructor(
     private port: number,
     private authDir: string,
     private webProfileDir: string,
     private token?: string,
+    private webBrowserMode: 'cdp' | 'launch' = 'cdp',
+    private webCdpUrl: string = 'http://127.0.0.1:9222',
+    private webCdpChromePath: string = '',
+    private webCdpHelperUrl: string = '',
+    private webHostProfileDir: string = '',
   ) {}
 
   async start(): Promise<void> {
@@ -49,11 +69,31 @@ export class BridgeServer {
     this.wa = new WhatsAppClient({
       authDir: this.authDir,
       onMessage: (msg) => this.broadcast({ type: 'message', ...msg }),
+      onHistory: (batch: HistoryBatch) => this.broadcast({ type: 'history', ...batch }),
       onDelete: (msg) => this.broadcast({ type: 'deleted', ...msg }),
       onQR: (qr) => this.broadcast({ type: 'qr', qr }),
       onStatus: (status) => this.broadcast({ type: 'status', status }),
     });
-    this.composer = new DraftComposer(this.webProfileDir);
+    this.draftComposer = new DraftComposer(
+      this.webProfileDir,
+      undefined,
+      this.webBrowserMode,
+      this.webCdpUrl,
+      this.webCdpChromePath,
+      undefined,
+      this.webCdpHelperUrl,
+      this.webHostProfileDir,
+    );
+    this.historyParser = new HistoryParser(
+      this.webProfileDir,
+      undefined,
+      this.webBrowserMode,
+      this.webCdpUrl,
+      this.webCdpChromePath,
+      undefined,
+      this.webCdpHelperUrl,
+      this.webHostProfileDir,
+    );
 
     // Handle WebSocket connections
     this.wss.on('connection', (ws) => {
@@ -116,7 +156,7 @@ export class BridgeServer {
     }
 
     if (cmd.type === 'prepare_draft') {
-      if (!this.wa || !this.composer) {
+      if (!this.wa || !this.draftComposer) {
         return {
           type: 'ack',
           action: cmd.type,
@@ -126,7 +166,7 @@ export class BridgeServer {
         };
       }
 
-      const target = this.wa.getChatTarget(cmd.to);
+      const target = this.normalizeDraftTarget(cmd.target, cmd.to) ?? this.wa.getChatTarget(cmd.to);
       if (!target) {
         return {
           type: 'ack',
@@ -138,7 +178,7 @@ export class BridgeServer {
       }
 
       try {
-        const result = await this.composer.prepareDraft(target, cmd.text);
+        const result = await this.draftComposer.prepareDraft(target, cmd.text);
         return { type: 'ack', action: cmd.type, to: cmd.to, ...result };
       } catch (error) {
         return {
@@ -146,6 +186,181 @@ export class BridgeServer {
           action: cmd.type,
           to: cmd.to,
           status: 'not_ready',
+          detail: String(error),
+        };
+      }
+    }
+
+    if (cmd.type === 'scrape_direct_history') {
+      if (!this.historyParser) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          status: 'not_ready',
+          detail: 'Bridge is not ready yet.',
+        };
+      }
+
+      const target = this.normalizeHistoryTarget(cmd.target, '');
+      if (!target) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          status: 'chat_not_found',
+          detail: 'No valid direct-message target with a normalized phone was provided.',
+        };
+      }
+
+      try {
+        const result = await this.historyParser.scrapeHistory(target);
+        if (result.status !== 'history_scraped') {
+          return {
+            type: 'ack',
+            action: cmd.type,
+            to: target.chatId,
+            ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+            status: result.status,
+            detail: result.detail,
+          };
+        }
+
+        const messages = this.normalizeScrapedHistory(target, result.messages || []);
+        if (messages.length > 0) {
+          this.broadcast({
+            type: 'history',
+            source: 'web_scrape',
+            ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+            messages,
+            target: target.chatId,
+          });
+        }
+        if (cmd.requestId) {
+          this.broadcast({
+            type: 'history',
+            source: 'web_scrape',
+            requestId: cmd.requestId,
+            isLatest: true,
+            messages: [],
+            target: target.chatId,
+          });
+        }
+
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: target.chatId,
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'history_scraped',
+          scrapedTargets: 1,
+          scrapedMessages: messages.length,
+          missedTargets: 0,
+          importPhones: messages.length > 0 && target.phone ? [target.phone] : [],
+        };
+      } catch (error) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: target.chatId,
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'window_launch_failed',
+          detail: String(error),
+        };
+      }
+    }
+
+    if (cmd.type === 'scrape_reply_targets_history') {
+      if (!this.historyParser) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          status: 'bridge_unreachable',
+          detail: 'Bridge is not ready yet.',
+        };
+      }
+
+      const targets = (Array.isArray(cmd.targets) ? cmd.targets : [])
+        .map((target) => this.normalizeHistoryTarget(target, ''))
+        .filter((target): target is ChatTarget => target !== null);
+      if (targets.length === 0) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          status: 'chat_not_found',
+          detail: 'No valid direct-message targets with normalized phones were provided.',
+        };
+      }
+
+      try {
+        const result = await this.historyParser.scrapeReplyTargets(targets);
+        if (result.status !== 'history_scraped') {
+          return {
+            type: 'ack',
+            action: cmd.type,
+            to: '',
+            ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+            status: result.status,
+            detail: result.detail,
+          };
+        }
+
+        let scrapedTargets = 0;
+        let scrapedMessages = 0;
+        let missedTargets = 0;
+        const importPhones = new Set<string>();
+
+        for (const item of result.results) {
+          if (item.status === 'chat_not_found') {
+            missedTargets += 1;
+            continue;
+          }
+          const messages = this.normalizeScrapedHistory(item.target, item.messages || []);
+          scrapedTargets += 1;
+          scrapedMessages += messages.length;
+          if (messages.length > 0) {
+            if (item.target.phone) {
+              importPhones.add(item.target.phone);
+            }
+            this.broadcast({
+              type: 'history',
+              source: 'web_scrape',
+              ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+              messages,
+              target: item.target.chatId,
+            });
+          }
+        }
+        if (cmd.requestId) {
+          this.broadcast({
+            type: 'history',
+            source: 'web_scrape',
+            requestId: cmd.requestId,
+            isLatest: true,
+            messages: [],
+          });
+        }
+
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'history_scraped',
+          scrapedTargets,
+          scrapedMessages,
+          missedTargets,
+          importPhones: [...importPhones],
+        };
+      } catch (error) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: '',
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'window_launch_failed',
           detail: String(error),
         };
       }
@@ -160,6 +375,46 @@ export class BridgeServer {
     };
   }
 
+  private normalizeDraftTarget(target: ChatTarget | undefined, fallbackChatId: string): ChatTarget | null {
+    if (!target || typeof target !== 'object') {
+      return null;
+    }
+
+    const chatId = typeof target.chatId === 'string' && target.chatId.trim()
+      ? target.chatId.trim()
+      : fallbackChatId.trim();
+    if (!chatId) {
+      return null;
+    }
+
+    const phone = typeof target.phone === 'string' && target.phone.trim()
+      ? target.phone.trim()
+      : undefined;
+    const rawSearchTerms = Array.isArray(target.searchTerms) ? target.searchTerms : [];
+    const searchTerms = rawSearchTerms
+      .filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+    if (!phone && searchTerms.length === 0) {
+      return null;
+    }
+
+    return {
+      chatId,
+      ...(phone ? { phone } : {}),
+      searchTerms,
+    };
+  }
+
+  private normalizeHistoryTarget(target: ChatTarget | undefined, fallbackChatId: string): ChatTarget | null {
+    const normalized = this.normalizeDraftTarget(target, fallbackChatId);
+    if (!normalized?.phone) {
+      return null;
+    }
+    return normalized;
+  }
+
   private broadcast(msg: BridgeMessage): void {
     const data = JSON.stringify(msg);
     for (const client of this.clients) {
@@ -167,6 +422,21 @@ export class BridgeServer {
         client.send(data);
       }
     }
+  }
+
+  private normalizeScrapedHistory(target: ChatTarget, messages: ScrapedHistoryMessage[]): HistoryBatch['messages'] {
+    return messages.map((message) => ({
+      id: message.id,
+      sender: target.chatId,
+      pn: target.phone || '',
+      content: message.content,
+      timestamp: Number.isNaN(Date.parse(message.timestamp))
+        ? Math.floor(Date.now() / 1000)
+        : Math.floor(Date.parse(message.timestamp) / 1000),
+      fromMe: message.fromMe,
+      isGroup: false,
+      ...(message.pushName ? { pushName: message.pushName } : {}),
+    }));
   }
 
   async stop(): Promise<void> {
@@ -188,9 +458,14 @@ export class BridgeServer {
       this.wa = null;
     }
 
-    if (this.composer) {
-      await this.composer.stop();
-      this.composer = null;
+    if (this.draftComposer) {
+      await this.draftComposer.stop();
+      this.draftComposer = null;
+    }
+
+    if (this.historyParser) {
+      await this.historyParser.stop();
+      this.historyParser = null;
     }
   }
 }

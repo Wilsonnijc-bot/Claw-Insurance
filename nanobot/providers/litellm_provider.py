@@ -89,6 +89,16 @@ class LiteLLMProvider(LLMProvider):
     def _resolve_model(self, model: str) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
         if self._gateway:
+            if self._gateway.name == "litellm":
+                # Project config uses `litellm/...` as a user-facing alias for the
+                # local LiteLLM gateway, but the LiteLLM SDK routes proxy traffic
+                # via the special `litellm_proxy/...` provider.
+                if model.startswith("litellm_proxy/"):
+                    return model
+                if model.startswith("litellm/"):
+                    model = model.split("/", 1)[1]
+                return f"litellm_proxy/{model}"
+
             # Gateway mode: apply gateway prefix, skip provider-specific prefixes
             prefix = self._gateway.litellm_prefix
             if self._gateway.strip_model_prefix:
@@ -105,6 +115,25 @@ class LiteLLMProvider(LLMProvider):
                 model = f"{spec.litellm_prefix}/{model}"
 
         return model
+
+    def _format_gateway_error(self, error: Exception) -> str:
+        """Return a clearer operator-facing error for known gateway failures."""
+        text = str(error)
+
+        if self._gateway and self._gateway.name == "litellm":
+            if (
+                "Invalid proxy server token" in text
+                or "LiteLLM_VerificationTokenTable" in text
+                or "token_not_found_in_db" in text
+            ):
+                proxy_url = self.api_base or self._gateway.default_api_base or "the configured LiteLLM proxy"
+                return (
+                    "LiteLLM proxy authentication failed. "
+                    f"The configured providers.litellm.apiKey is not a valid LiteLLM proxy token for {proxy_url}. "
+                    "This endpoint expects a LiteLLM proxy master key or virtual key, not an upstream provider API key."
+                )
+
+        return text
 
     @staticmethod
     def _canonicalize_explicit_prefix(model: str, spec_name: str, canonical_prefix: str) -> str:
@@ -275,7 +304,7 @@ class LiteLLMProvider(LLMProvider):
         except Exception as e:
             # Return error as content for graceful handling
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=f"Error calling LLM: {self._format_gateway_error(e)}",
                 finish_reason="error",
             )
 

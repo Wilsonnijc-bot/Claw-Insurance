@@ -1,0 +1,12 @@
+{
+  "supabaseUrl": "https://znhoybdxcwlatsoqmbnt.supabase.co",
+  "supabaseAnonKey": "",
+  "supabaseProjectRef": "znhoybdxcwlatsoqmbnt",
+  "supabaseCatalogTables": [
+    "insurance_products",
+    "dental_insurance"
+  ],
+  "autoRestorePausedProject": false,
+  "restoreTimeoutSeconds": 300,
+  "cacheTtlSeconds": 300
+}

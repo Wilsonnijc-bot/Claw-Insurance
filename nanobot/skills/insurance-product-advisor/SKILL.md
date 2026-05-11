@@ -15,7 +15,7 @@ Apply this skill based on the runtime insurance flow state:
 - `generic` mode:
   - answer naturally
   - steer the participant one step closer to qualification
-  - do not run local shortlist or brochure research yet
+  - do not run the catalog shortlist or brochure research yet
 - `skill` mode:
   - stop generic product advice
   - ask only the next required fact, or run the product workflow immediately if the minimum facts are complete
@@ -37,10 +37,10 @@ The session can enter `skill` mode in 2 ways:
 7. If fewer than 2 useful facts are present, ask only the next missing fact in one short sentence.
 8. If the shortlist result includes `remaining_fields`, treat them as refinement questions, not blockers for the first recommendation pass.
 9. Save the collected facts to a temporary JSON file in the workspace.
-10. Run `scripts/find_products.py` to get `missing_fields`, `remaining_fields`, or shortlisted candidates.
+10. Run `scripts/find_products.py` to get `missing_fields`, `remaining_fields`, or shortlisted candidates from the configured catalog.
 11. If `missing_fields` is non-empty, ask only those questions and stop.
 12. If candidates exist, save them to a temporary JSON file and run `scripts/research_products.py`.
-13. Reply in Traditional Chinese with a compact top-3 comparison grounded in the local CSV data and Tavily brochure research.
+13. Reply in Traditional Chinese with a compact top-3 comparison grounded in the catalog data and Tavily brochure research.
 
 ## First-Layer Domain Menu
 
@@ -89,7 +89,7 @@ Ask the participant which direction they want first when the domain is not yet c
 
 The helper scripts live in the same skill directory under `scripts/`.
 
-### 1. Local shortlist
+### 1. Catalog shortlist
 
 Write facts JSON to a temp file, then run:
 
@@ -106,6 +106,7 @@ Expected output fields:
 - `remaining_fields`
 - `facts_used`
 - `candidates`
+- optional `catalog_unavailable` and `catalog_error` when the Supabase catalog cannot be reached
 
 Each candidate includes:
 
@@ -116,7 +117,7 @@ Each candidate includes:
 - `brochure_url`
 - `score`
 - `score_reasons`
-- local CSV fact fields such as pricing, coverage description, age, requirements, and additional info
+- catalog fact fields such as pricing, coverage description, age, requirements, and additional info
 
 ### 2. Brochure research
 
@@ -131,7 +132,7 @@ This script:
 - uses direct brochure extraction first
 - falls back to focused Tavily deep search if extraction is thin
 - returns concise brochure-backed notes per product
-- falls back to local CSV facts only if Tavily is unavailable or fails
+- falls back to catalog facts only if Tavily is unavailable or fails
 
 ## Reply Rules
 
@@ -139,7 +140,8 @@ This script:
 - Do not expose the internal workflow, script names, or raw JSON in the final reply.
 - Do not invent premiums, underwriting decisions, guarantees, or policy facts.
 - If the catalog fit is weak, say so clearly.
-- If brochure verification is missing, say the recommendation is based on the local product file and the brochure details could not be fully verified.
+- If the shortlist reports `catalog_unavailable`, explain that the product catalog is temporarily unavailable and avoid making a recommendation from memory.
+- If brochure verification is missing, say the recommendation is based on the product catalog and the brochure details could not be fully verified.
 - Do not use bullet points unless the user explicitly asks for a list.
 - Avoid perfect list-like structure. Prefer 2-4 short paragraphs.
 - Do not sound humble, flattering, or pushy.

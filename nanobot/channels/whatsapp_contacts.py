@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from nanobot.utils.paths import confine_path, project_root
+
 
 @dataclass(frozen=True)
 class WhatsAppContact:
@@ -17,8 +19,11 @@ class WhatsAppContact:
 
 
 def contacts_path(path_str: str) -> Path:
-    """Return the expanded local contacts file path."""
-    return Path(path_str).expanduser()
+    """Return the expanded local contacts file path (project-confined)."""
+    path = Path(path_str)
+    if path.is_absolute():
+        return confine_path(path)
+    return confine_path(project_root() / path)
 
 
 def init_contacts_store(path_str: str) -> Path:

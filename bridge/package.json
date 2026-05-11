@@ -1,7 +1,16 @@
 {
   "name": "nanobot-whatsapp-bridge",
   "version": "0.1.0",
-  "description": "WhatsApp bridge for nanobot using Baileys",
+  "description": "WhatsApp bridge for the Claw Insurance nanobot workspace",
+  "author": "Wilsonnijc-bot",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Wilsonnijc-bot/Claw-Insurance.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Wilsonnijc-bot/Claw-Insurance/issues"
+  },
+  "homepage": "https://github.com/Wilsonnijc-bot/Claw-Insurance",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

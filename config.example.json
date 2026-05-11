@@ -1,0 +1,31 @@
+{
+  "providers": {
+    "litellm": {
+      "baseUrl": "http://127.0.0.1:4000",
+      "apiKey": "your-litellm-master-key"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "kimi-v1-8k",
+      "provider": "litellm"
+    }
+  },
+  "channels": {
+    "whatsapp": {
+      "enabled": true,
+      "deliveryMode": "send",
+      "bridgeUrl": "ws://localhost:3001"
+    }
+  },
+  "catalog": {
+    "db_proxy": {
+      "baseUrl": "http://127.0.0.1:5000",
+      "apiKey": "your-db-proxy-api-key"
+    }
+  },
+  "interviewProxy": {
+    "baseUrl": "http://127.0.0.1:5001",
+    "apiKey": "your-interview-proxy-api-key"
+  }
+}

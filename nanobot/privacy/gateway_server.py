@@ -36,6 +36,10 @@ class PrivacyGatewayHandler(BaseHTTPRequestHandler):
             self._write_json(404, {"error": "not_found"})
             return
 
+        # Privacy pipeline step 3:
+        # terminate OpenAI-compatible traffic locally, parse the JSON body,
+        # then delegate the real privacy logic to PrivacyGatewayService.
+
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -83,8 +87,11 @@ def build_server(
 
 def main() -> None:
     """Run the privacy gateway using environment configuration."""
+    # Privacy pipeline step 3a: the CLI passes the true upstream URL and the
+    # privacy flags through environment variables, and this process rebuilds
+    # a runtime PrivacyGatewayConfig from them.
     upstream_base = os.environ["NANOBOT_PRIVACY_UPSTREAM_BASE"]
-    workspace = Path(os.environ["NANOBOT_PRIVACY_WORKSPACE"]).expanduser()
+    workspace = Path(os.environ["NANOBOT_PRIVACY_WORKSPACE"])
     host = os.environ.get("NANOBOT_PRIVACY_LISTEN_HOST", "127.0.0.1")
     port = int(os.environ.get("NANOBOT_PRIVACY_LISTEN_PORT", "8787"))
     config = PrivacyGatewayConfig(

@@ -3,26 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
-from nanobot.channels.whatsapp_contacts import (
-    WhatsAppContact,
-    load_contacts,
-    normalize_contact_id,
-    save_contacts,
-)
+from nanobot.channels.whatsapp_contacts import normalize_contact_id
 from nanobot.channels.whatsapp_group_members import (
     WhatsAppGroupMember,
     load_group_members,
     normalize_group_name,
     save_group_members,
 )
-from nanobot.channels.whatsapp_storage import (
-    storage_path,
-    sync_direct_contact_storage,
-    sync_group_row_storage,
-)
-
 _INDIVIDUAL_MARKER = "#chatbot reply to individuals#"
 _GROUP_MARKER = "#chatbot reply to groups#"
 
@@ -49,42 +37,23 @@ def parse_self_routing_instruction(text: str) -> SelfRoutingInstruction | None:
 
 def apply_self_routing_instruction(
     *,
-    workspace: Path,
-    contacts_file: str,
     group_members_file: str,
-    storage_dir: str,
     instruction: SelfRoutingInstruction,
 ) -> dict[str, int]:
-    """Apply parsed self-chat routing to local stores used by WhatsApp routing."""
-    storage_dir_path = storage_path(storage_dir, workspace)
+    """Apply parsed self-chat routing to legacy compatibility stores."""
     stats: dict[str, int] = {}
 
     if instruction.individuals is not None:
-        existing_contacts = load_contacts(contacts_file)
-        existing_by_phone = {normalize_contact_id(c.phone): c for c in existing_contacts if normalize_contact_id(c.phone)}
-        contacts: list[WhatsAppContact] = []
         seen: set[str] = set()
         for raw_phone in instruction.individuals:
             phone = normalize_contact_id(raw_phone)
             if not phone or phone in seen:
                 continue
             seen.add(phone)
-            prev = existing_by_phone.get(phone)
-            contacts.append(
-                WhatsAppContact(
-                    phone=phone,
-                    label=prev.label if prev else "",
-                    enabled=True,
-                )
-            )
-
-        save_contacts(contacts_file, contacts)
-        for contact in contacts:
-            sync_direct_contact_storage(storage_dir_path, workspace, contact)
-        stats["individual_count"] = len(contacts)
+        stats["individual_count"] = len(seen)
 
     if instruction.groups is not None:
-        existing_rows = load_group_members(group_members_file)
+        existing_rows = load_group_members(group_members_file) if group_members_file else []
         existing_by_key: dict[tuple[str, str], WhatsAppGroupMember] = {}
         for row in existing_rows:
             key = (normalize_group_name(row.group_name), normalize_contact_id(row.member_pn))
@@ -117,9 +86,8 @@ def apply_self_routing_instruction(
                 )
             )
 
-        save_group_members(group_members_file, rows)
-        for index, row in enumerate(rows, start=1):
-            sync_group_row_storage(storage_dir_path, workspace, index, row)
+        if group_members_file:
+            save_group_members(group_members_file, rows)
         stats["group_member_count"] = len(rows)
 
     return stats

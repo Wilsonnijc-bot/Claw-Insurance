@@ -1,6 +1,7 @@
 """Test session management with cache-friendly message handling."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

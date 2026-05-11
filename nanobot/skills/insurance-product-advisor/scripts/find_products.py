@@ -4,17 +4,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from product_catalog import DEFAULT_CATALOGS, load_json, rank_products
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from product_catalog import load_json, rank_products
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Shortlist insurance products from local CSV catalogs.")
+    parser = argparse.ArgumentParser(description="Shortlist insurance products from the configured catalog.")
     parser.add_argument("--domain", required=True, help="Insurance domain, e.g. Dental or Life Protection")
     parser.add_argument("--facts-json", help="Raw JSON object of collected facts")
     parser.add_argument("--facts-file", type=Path, help="Path to a JSON file of collected facts")
-    parser.add_argument("--catalog", action="append", dest="catalogs", type=Path, help="Override catalog path")
+    parser.add_argument(
+        "--catalog",
+        action="append",
+        dest="catalogs",
+        type=Path,
+        help="Override catalog CSV path for tests or local development",
+    )
     parser.add_argument("--limit", type=int, default=3, help="Maximum candidates to return")
     return parser.parse_args()
 
@@ -30,11 +41,10 @@ def load_facts(args: argparse.Namespace) -> dict:
 def main() -> None:
     args = parse_args()
     facts = load_facts(args)
-    catalogs = args.catalogs or DEFAULT_CATALOGS
     result = rank_products(
         domain=args.domain,
         facts=facts,
-        catalog_paths=catalogs,
+        catalog_paths=args.catalogs,
         limit=args.limit,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

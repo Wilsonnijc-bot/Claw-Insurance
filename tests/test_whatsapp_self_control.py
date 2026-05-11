@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from nanobot.channels.whatsapp_contacts import WhatsAppContact, load_contacts, save_contacts
 from nanobot.channels.whatsapp_group_members import (
     WhatsAppGroupMember,
     load_group_members,
@@ -42,18 +41,8 @@ def test_parse_self_routing_instruction_uses_latest_block_and_parses_groups() ->
 
 
 def test_apply_self_routing_instruction_rewrites_targets_and_preserves_known_ids(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
-    contacts_file = str(tmp_path / "contacts.json")
     groups_file = str(tmp_path / "groups.csv")
 
-    save_contacts(
-        contacts_file,
-        [
-            WhatsAppContact(phone="+85212345678", label="Alice", enabled=True),
-            WhatsAppContact(phone="+85299998888", label="Old", enabled=True),
-        ],
-    )
     save_group_members(
         groups_file,
         [
@@ -88,19 +77,13 @@ def test_apply_self_routing_instruction_rewrites_targets_and_preserves_known_ids
     assert instruction is not None
 
     stats = apply_self_routing_instruction(
-        workspace=workspace,
-        contacts_file=contacts_file,
         group_members_file=groups_file,
-        storage_dir="",
         instruction=instruction,
     )
 
-    contacts = load_contacts(contacts_file)
     rows = load_group_members(groups_file)
 
     assert stats["individual_count"] == 2
     assert stats["group_member_count"] == 1
-    assert [c.phone for c in contacts] == ["85212345678", "85277776666"]
-    assert contacts[0].label == "Alice"
     assert rows[0].group_id == "1203630group@g.us"
     assert rows[0].member_id == "alice@lid"

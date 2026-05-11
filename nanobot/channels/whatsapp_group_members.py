@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from nanobot.channels.whatsapp_contacts import normalize_contact_id
+from nanobot.utils.paths import confine_path, project_root
 
 
 @dataclass(frozen=True)
@@ -22,8 +23,11 @@ class WhatsAppGroupMember:
 
 
 def group_members_path(path_str: str) -> Path:
-    """Return the expanded local group-members file path."""
-    return Path(path_str).expanduser()
+    """Return the expanded local group-members file path (project-confined)."""
+    path = Path(path_str)
+    if path.is_absolute():
+        return confine_path(path)
+    return confine_path(project_root() / path)
 
 
 def init_group_members_store(path_str: str) -> Path:

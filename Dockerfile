@@ -13,6 +13,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+ENV NANOBOT_PROJECT_ROOT=/app
 
 # Install Python dependencies first (cached layer)
 COPY pyproject.toml README.md LICENSE ./
@@ -23,18 +24,25 @@ RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
 # Copy the full source and install
 COPY nanobot/ nanobot/
 COPY bridge/ bridge/
-RUN uv pip install --system --no-cache .
+COPY config.example.json /app/config.json
+COPY google.example.json /app/google.json
+COPY supabase.example.json /app/supabase.json
+RUN uv pip install --system --no-cache . && \
+    python3 -c "import google.cloud.speech_v2"
 
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
-RUN npm install && npm run build
+RUN npm ci && npm run build
 WORKDIR /app
 
-# Create config directory
-RUN mkdir -p /root/.nanobot
+# Create project-local runtime directories
+RUN mkdir -p /app/data /app/sessions /app/state /app/memory \
+    /app/whatsapp-auth /app/whatsapp-web /app/whatsapp-web-debug \
+    /app/skills /app/media /app/cron \
+    /app/secrets
 
-# Gateway default port
-EXPOSE 18790
+# Gateway API port used by frontend and external clients
+EXPOSE 3456
 
-ENTRYPOINT ["nanobot"]
-CMD ["status"]
+ENTRYPOINT ["python3", "-m", "nanobot.runtime.docker_entrypoint"]
+CMD ["--api-port", "3456"]

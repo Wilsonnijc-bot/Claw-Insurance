@@ -7,7 +7,6 @@ from pathlib import Path
 import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.utils.helpers import sync_workspace_templates
 
 
 class _FakeDatetime(real_datetime):
@@ -62,7 +61,8 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert ContextBuilder._RUNTIME_CONTEXT_TAG in user_content
     assert "Current Time:" in user_content
     assert "Channel: cli" in user_content
-    assert "Chat ID: direct" in user_content
+    # Chat ID is no longer injected into the prompt (privacy hardening)
+    assert "Chat ID:" not in user_content
     assert "Return exactly: OK" in user_content
 
 
@@ -88,7 +88,8 @@ def test_whatsapp_direct_runtime_context_includes_sender_metadata(tmp_path) -> N
     assert "Conversation Mode: whatsapp_direct" in user_content
     assert "Is Group: false" in user_content
     assert "Sender Name: Alice Chan" in user_content
-    assert "Sender Phone: +852 1234 5678" in user_content
+    # Sender Phone is omitted in DM contexts (privacy hardening)
+    assert "Sender Phone:" not in user_content
 
 
 def test_whatsapp_group_runtime_context_includes_group_metadata(tmp_path) -> None:
@@ -142,10 +143,9 @@ def test_runtime_context_includes_insurance_flow_state(tmp_path) -> None:
     assert "Insurance Cycle Active: true" in user_content
 
 
-def test_synced_templates_build_insurance_persona_prompt(tmp_path) -> None:
-    """Workspace templates should encode the insurance persona and missing-facts guardrails."""
+def test_shipped_templates_build_insurance_persona_prompt(tmp_path) -> None:
+    """Shipped templates should encode the insurance persona and missing-facts guardrails."""
     workspace = _make_workspace(tmp_path)
-    sync_workspace_templates(workspace, silent=True)
     builder = ContextBuilder(workspace)
 
     prompt = builder.build_system_prompt()

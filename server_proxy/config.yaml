@@ -1,0 +1,12 @@
+model_list:
+  - model_name: kimi-v1-8k
+    litellm_params:
+      model: moonshot/moonshot-v1-8k
+      api_key: ${MOONSHOT_API_KEY}
+      api_base: https://api.moonshot.cn/v1
+    litellm_settings:
+      drop_params: true
+      set_verbose: false
+
+general_settings:
+  master_key: ${LITELLM_MASTER_KEY}

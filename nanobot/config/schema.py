@@ -7,6 +7,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from nanobot.utils.paths import project_path_str, project_root
+
+
+def _project_path_str(*parts: str) -> str:
+    """Return an absolute project-root path as a string."""
+    return project_path_str(*parts)
+
 
 class Base(BaseModel):
     """Base model that accepts both camelCase and snake_case keys."""
@@ -18,14 +25,15 @@ class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
 
     enabled: bool = False
-    delivery_mode: Literal["send", "draft"] = "send"
+    delivery_mode: Literal["send", "draft"] = "draft"
     bridge_url: str = "ws://localhost:3001"
     bridge_token: str = ""  # Shared token for bridge auth (optional, recommended)
-    web_profile_dir: str = "~/.nanobot/whatsapp-web"
-    contacts_file: str = "~/.nanobot/contacts/whatsapp.json"
-    group_members_file: str = "~/.nanobot/contacts/whatsapp_groups.csv"
-    reply_targets_file: str = "data/whatsapp_reply_targets.json"
-    storage_dir: str = ""
+    web_browser_mode: Literal["cdp", "launch"] = "cdp"
+    web_cdp_url: str = "http://127.0.0.1:9222"
+    web_cdp_chrome_path: str = ""
+    web_profile_dir: str = Field(default_factory=lambda: _project_path_str("whatsapp-web"))
+    group_members_file: str = ""
+    reply_targets_file: str = Field(default_factory=lambda: _project_path_str("data", "whatsapp_reply_targets.json"))
     allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
 
 
@@ -227,11 +235,9 @@ class ChannelsConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
-    workspace: str = "~/.nanobot/workspace"
-    model: str = "anthropic/claude-opus-4-5"
-    provider: str = (
-        "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
-    )
+    workspace: str = Field(default_factory=lambda: _project_path_str())
+    model: str = "litellm/kimi-k2.5"
+    provider: str = "litellm"
     max_tokens: int = 8192
     temperature: float = 0.1
     max_tool_iterations: int = 40
@@ -248,15 +254,26 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
+    base_url: str | None = None
     api_key: str = ""
-    api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+
+    @property
+    def api_base(self) -> str | None:
+        """Legacy compatibility alias for older runtime code paths."""
+        return self.base_url
+
+    @api_base.setter
+    def api_base(self, value: str | None) -> None:
+        self.base_url = value
 
 
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
-    custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
+    litellm: ProviderConfig = Field(
+        default_factory=lambda: ProviderConfig(base_url="http://43.129.246.127:4000")
+    )
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -284,7 +301,12 @@ class HeartbeatConfig(Base):
 
 
 class PrivacyGatewayConfig(Base):
-    """Local privacy gateway configuration."""
+    """Local privacy gateway configuration.
+
+    Privacy pipeline step 1 in ``PRIVACY_PIPELINE.md``.
+    These fields control whether LiteLLM endpoint traffic is rerouted through
+    the local privacy gateway before leaving the machine.
+    """
 
     enabled: bool = True
     listen_host: str = "127.0.0.1"
@@ -299,7 +321,7 @@ class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
-    port: int = 18790
+    port: int = 3456
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
@@ -347,10 +369,35 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class CatalogConfig(Base):
+    """Insurance catalog backend configuration."""
+
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_project_ref: str = ""
+    supabase_management_token: str = ""
+    supabase_catalog_table: str = ""
+    supabase_catalog_tables: list[str] = Field(default_factory=list)
+    auto_restore_paused_project: bool = True
+    restore_timeout_seconds: int = 300
+    cache_ttl_seconds: int = 300
+
+
+class InterviewProxyConfig(Base):
+    """Configuration for an external Interview/ speech proxy service."""
+
+    base_url: str = ""
+    api_key: str = ""
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
-    model_config = SettingsConfigDict(alias_generator=to_camel, populate_by_name=True)
+    model_config = SettingsConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        env_nested_delimiter="__",
+    )
 
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
@@ -358,11 +405,22 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     privacy_gateway: PrivacyGatewayConfig = Field(default_factory=PrivacyGatewayConfig, alias="privacyGateway")
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    catalog: CatalogConfig = Field(default_factory=CatalogConfig)
+    interview_proxy: InterviewProxyConfig = Field(default_factory=InterviewProxyConfig, alias="interviewProxy")
 
     @property
     def workspace_path(self) -> Path:
-        """Get expanded workspace path."""
-        return Path(self.agents.defaults.workspace).expanduser()
+        """Get workspace path (project-local, no expanduser).
+
+        Relative values are resolved against the project root.
+        The workspace must stay inside the project tree.
+        """
+        from nanobot.utils.paths import confine_path
+
+        workspace = Path(self.agents.defaults.workspace)
+        if not workspace.is_absolute():
+            workspace = project_root() / workspace
+        return confine_path(workspace)
 
     def _match_provider(
         self, model: str | None = None
@@ -428,8 +486,8 @@ class Config(BaseSettings):
         from nanobot.providers.registry import find_by_name
 
         p, name = self._match_provider(model)
-        if p and p.api_base:
-            return p.api_base
+        if p and p.base_url:
+            return p.base_url
         # Only gateways get a default api_base here. Standard providers
         # (like Moonshot) set their base URL via env vars in _setup_env
         # to avoid polluting the global litellm.api_base.

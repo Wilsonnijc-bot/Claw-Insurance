@@ -3,6 +3,9 @@
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+from nanobot.utils.paths import confine_path, project_root
 
 
 def detect_image_mime(data: bytes) -> str | None:
@@ -25,13 +28,25 @@ def ensure_dir(path: Path) -> Path:
 
 
 def get_data_path() -> Path:
-    """~/.nanobot data directory."""
-    return ensure_dir(Path.home() / ".nanobot")
+    """Project-local data directory."""
+    return ensure_dir(project_root())
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:
-    """Resolve and ensure workspace path. Defaults to ~/.nanobot/workspace."""
-    path = Path(workspace).expanduser() if workspace else Path.home() / ".nanobot" / "workspace"
+    """Resolve and ensure workspace path. Defaults to the project root.
+
+    Workspace must resolve inside the project root (path confinement).
+    The legacy ``expanduser()`` call has been removed — tilde is no longer
+    expanded so paths cannot silently escape to the home directory.
+    """
+    if workspace:
+        path = Path(workspace)
+        if not path.is_absolute():
+            path = project_root() / path
+        # Enforce confinement — workspace cannot escape the project tree
+        path = confine_path(path)
+    else:
+        path = project_root()
     return ensure_dir(path)
 
 
@@ -45,6 +60,32 @@ _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 def safe_filename(name: str) -> str:
     """Replace unsafe path characters with underscores."""
     return _UNSAFE_CHARS.sub("_", name).strip()
+
+
+def readable_session_bundle_name(key: str) -> str:
+    """Return a normalized readable bundle folder name for a session key."""
+    text = str(key or "").strip()
+    if not text:
+        return "session__unknown"
+
+    if not text.startswith("whatsapp:"):
+        return safe_filename(text.replace(":", "__"))
+
+    parts = text.split(":")
+    if len(parts) == 2:
+        identity = str(parts[1] or "").strip()
+        digits = "".join(ch for ch in identity if ch.isdigit())
+        if digits:
+            return safe_filename(f"whatsapp__{digits}")
+        return safe_filename(text.replace(":", "__"))
+
+    if len(parts) == 3:
+        group_id = str(parts[1] or "").strip()
+        member_identity = str(parts[2] or "").strip()
+        member_digits = "".join(ch for ch in member_identity if ch.isdigit())
+        return safe_filename(f"whatsapp__{group_id}__{member_digits or member_identity}")
+
+    return safe_filename(text.replace(":", "__"))
 
 
 def split_message(content: str, max_len: int = 2000) -> list[str]:
@@ -79,14 +120,33 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
     return chunks
 
 
-def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to workspace. Only creates missing files."""
+def _template_root() -> Any | None:
     from importlib.resources import files as pkg_files
+
     try:
         tpl = pkg_files("nanobot") / "templates"
     except Exception:
-        return []
+        return None
     if not tpl.is_dir():
+        return None
+    return tpl
+
+
+def load_shipped_template(name: str) -> str | None:
+    """Return shipped template content by filename when available."""
+    tpl = _template_root()
+    if tpl is None:
+        return None
+    path = tpl / name
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
+    """Create mutable workspace scaffolding from bundled templates when missing."""
+    tpl = _template_root()
+    if tpl is None:
         return []
 
     added: list[str] = []
@@ -98,10 +158,14 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
         added.append(str(dest.relative_to(workspace)))
 
-    for item in tpl.iterdir():
-        if item.name.endswith(".md"):
-            _write(item, workspace / item.name)
-    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
+    # Prompt/persona files now load directly from bundled shipped templates.
+    # Only create mutable workspace-local files here.
+    heartbeat = tpl / "HEARTBEAT.md"
+    if heartbeat.is_file():
+        _write(heartbeat, workspace / "HEARTBEAT.md")
+    # Per-client memory dirs are created on-demand by MemoryStore.
+    # Only create the global knowledge file placeholder here.
+    _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "GLOBAL.md")
     _write(None, workspace / "memory" / "HISTORY.md")
     (workspace / "skills").mkdir(exist_ok=True)
 

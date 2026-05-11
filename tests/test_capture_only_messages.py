@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nanobot.agent.loop import AgentLoop
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import HistoryImportResult, InboundHistoryBatch, InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.whatsapp_contacts import load_contacts
+from nanobot.channels.whatsapp import WhatsAppChannel
 from nanobot.channels.whatsapp_group_members import load_group_members
-from nanobot.channels.whatsapp_reply_targets import load_reply_targets
+from nanobot.channels.whatsapp_reply_targets import load_reply_targets, rewrite_from_self_instruction
 from nanobot.config.schema import ChannelsConfig, WhatsAppConfig
 from nanobot.providers.base import LLMResponse
 
@@ -51,19 +53,17 @@ async def test_capture_only_message_is_saved_without_reply_or_llm_call(tmp_path:
 
     session = loop.sessions.get_or_create("whatsapp:85212345678")
     assert len(session.messages) == 1
-    assert session.messages[0]["role"] == "user"
+    assert session.messages[0]["role"] == "me"
     assert session.messages[0]["content"] == "self note"
 
 
 @pytest.mark.asyncio
 async def test_capture_only_self_command_updates_whatsapp_routing_files(tmp_path: Path) -> None:
-    contacts_file = str(tmp_path / "contacts.json")
     groups_file = str(tmp_path / "groups.csv")
     targets_file = str(tmp_path / "data" / "whatsapp_reply_targets.json")
     channels_config = ChannelsConfig(
         whatsapp=WhatsAppConfig(
             enabled=True,
-            contacts_file=contacts_file,
             group_members_file=groups_file,
             reply_targets_file=targets_file,
         )
@@ -91,11 +91,10 @@ async def test_capture_only_self_command_updates_whatsapp_routing_files(tmp_path
     response = await loop._process_message(msg)
     assert response is None
     loop.provider.chat.assert_not_called()
+    assert loop.bus.outbound_size == 0
 
-    contacts = load_contacts(contacts_file)
     rows = load_group_members(groups_file)
     targets = load_reply_targets(Path(targets_file))
-    assert [c.phone for c in contacts] == ["85212345678"]
     assert len(rows) == 1
     assert rows[0].group_name == "Insurance sales"
     assert rows[0].member_pn == "85269432591"
@@ -150,6 +149,45 @@ async def test_deleted_message_event_marks_existing_history_without_removing_con
 
 
 @pytest.mark.asyncio
+async def test_dispatch_history_publishes_import_result_for_request_scoped_batch(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    observer = loop.bus.add_history_result_observer()
+    batch = InboundHistoryBatch(
+        channel="whatsapp",
+        entries=[
+            {
+                "session_key": "whatsapp:15550001111",
+                "chat_id": "15550001111@s.whatsapp.net",
+                "phone": "15550001111",
+                "sender": "15550001111@s.whatsapp.net",
+                "sender_id": "15550001111",
+                "content": "Hi",
+                "message_id": "wa-hist-1",
+                "timestamp": 1700000000,
+                "from_me": False,
+                "push_name": "Alice",
+            }
+        ],
+        metadata={"request_id": "req-123"},
+    )
+
+    try:
+        await loop._dispatch_history(batch)
+        result = await asyncio.wait_for(observer.get(), timeout=1)
+    finally:
+        loop.bus.remove_history_result_observer(observer)
+
+    assert isinstance(result, HistoryImportResult)
+    assert result.channel == "whatsapp"
+    assert result.metadata["request_id"] == "req-123"
+    assert result.matched_entries == 1
+    assert result.imported_entries == 1
+    assert result.verified_entries == 1
+    assert result.phones == ["15550001111"]
+    assert result.verified_phones == ["15550001111"]
+
+
+@pytest.mark.asyncio
 async def test_normal_whatsapp_turn_persists_inbound_message_id_for_future_delete_markers(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path)
     loop.provider.chat = AsyncMock(return_value=LLMResponse(content="reply"))
@@ -167,6 +205,376 @@ async def test_normal_whatsapp_turn_persists_inbound_message_id_for_future_delet
 
     assert response is not None
     session = loop.sessions.get_or_create("whatsapp:85212345678")
-    assert session.messages[0]["role"] == "user"
+    assert session.messages[0]["role"] == "client"
     assert session.messages[0]["message_id"] == "wa-msg-2"
     assert session.messages[0]["content"] == "hello there"
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_prompt_uses_full_stored_history_not_only_memory_window(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    loop.provider.chat = AsyncMock(return_value=LLMResponse(content="reply"))
+
+    session = loop.sessions.get_or_create("whatsapp:85212345678")
+    session.add_message("user", "older client message 1")
+    session.add_message("assistant", "older my message 1")
+    session.add_message("user", "older client message 2")
+    session.add_message("assistant", "older my message 2")
+    session.add_message("user", "older client message 3")
+    session.add_message("assistant", "older my message 3")
+    loop.sessions.save(session)
+
+    msg = InboundMessage(
+        channel="whatsapp",
+        sender_id="85212345678",
+        chat_id="85212345678@s.whatsapp.net",
+        content="new inbound",
+        metadata={"message_id": "wa-msg-full-history"},
+        session_key_override="whatsapp:85212345678",
+    )
+
+    response = await loop._process_message(msg)
+
+    assert response is not None
+    sent_messages = loop.provider.chat.await_args.kwargs["messages"]
+    assert [item["content"] for item in sent_messages[1:7]] == [
+        "older client message 1",
+        "older my message 1",
+        "older client message 2",
+        "older my message 2",
+        "older client message 3",
+        "older my message 3",
+    ]
+    assert [item["role"] for item in sent_messages[1:7]] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert any(
+        item.get("role") == "user" and "new inbound" in str(item.get("content", ""))
+        for item in sent_messages[7:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_target_whatsapp_draft_message_from_channel_skips_llm_and_reply(tmp_path: Path) -> None:
+    targets_file = str(tmp_path / "data" / "whatsapp_reply_targets.json")
+    channels_config = ChannelsConfig(
+        whatsapp=WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            allow_from=["+85212345678"],
+            contacts_file="",
+            group_members_file="",
+            reply_targets_file=targets_file,
+        )
+    )
+    loop = _make_loop(tmp_path, channels_config=channels_config)
+    loop.provider.chat = AsyncMock(side_effect=AssertionError("LLM should not be called for non-target draft capture"))
+    channel = WhatsAppChannel(channels_config.whatsapp, loop.bus, workspace=tmp_path)
+
+    await channel._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "wa-non-target-1",
+                "sender": "85212345678@s.whatsapp.net",
+                "pn": "+85212345678",
+                "pushName": "Alice",
+                "content": "hello draft mode",
+                "timestamp": 1700001000,
+                "isGroup": False,
+            }
+        )
+    )
+
+    msg = await loop.bus.consume_inbound()
+    assert msg.metadata["capture_only"] is True
+
+    response = await loop._process_message(msg)
+    assert response is None
+    loop.provider.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_history_batch_imports_both_sides_without_llm_and_updates_visible_exports(tmp_path: Path) -> None:
+    targets_file = str(tmp_path / "data" / "whatsapp_reply_targets.json")
+    target_phone = "+15550001111"
+    normalized_phone = "15550001111"
+    chat_id = "15550001111@s.whatsapp.net"
+    channels_config = ChannelsConfig(
+        whatsapp=WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            allow_from=[target_phone],
+            contacts_file="",
+            group_members_file="",
+            reply_targets_file=targets_file,
+        )
+    )
+    rewrite_payload = {
+        "type": "history",
+        "source": "history_sync",
+        "messages": [
+            {
+                "id": "wa-hist-1",
+                "sender": chat_id,
+                "pn": target_phone,
+                "pushName": "Alice",
+                "content": "Hi",
+                "timestamp": 1700000000,
+                "fromMe": False,
+                "isGroup": False,
+            },
+            {
+                "id": "wa-hist-2",
+                "sender": chat_id,
+                "pn": target_phone,
+                "content": "Hello Alice",
+                "timestamp": 1700000001,
+                "fromMe": True,
+                "isGroup": False,
+            },
+        ],
+    }
+
+    loop = _make_loop(tmp_path, channels_config=channels_config)
+    loop.provider.chat = AsyncMock(side_effect=AssertionError("LLM should not be called for history import"))
+    channel = WhatsAppChannel(channels_config.whatsapp, loop.bus, workspace=tmp_path)
+    rewrite_from_self_instruction(Path(targets_file), individuals=[target_phone], groups=None)
+
+    await channel._handle_bridge_message(json.dumps(rewrite_payload))
+    batch = await loop.bus.consume_history()
+
+    first_result = loop._import_history_batch(batch)
+    loop.provider.chat.assert_not_called()
+
+    session = loop.sessions.get_or_create(f"whatsapp:{normalized_phone}")
+    assert [msg["role"] for msg in session.messages] == ["client", "me"]
+    assert [msg["content"] for msg in session.messages] == ["Hi", "Hello Alice"]
+    assert [msg["message_id"] for msg in session.messages] == ["wa-hist-1", "wa-hist-2"]
+    assert first_result is not None
+    assert first_result.matched_entries == 2
+    assert first_result.imported_entries == 2
+    assert first_result.verified_entries == 2
+    assert first_result.verified_phones == [normalized_phone]
+
+    bundle_meta = loop.sessions.get_session_meta_path(f"whatsapp:{normalized_phone}")
+    assert bundle_meta.exists()
+    meta = json.loads(bundle_meta.read_text(encoding="utf-8"))
+    assert meta["session_file"].endswith("session.jsonl")
+
+    session.metadata["client_label"] = "Alice Chan"
+    session.metadata["client_push_name"] = "Alice"
+    loop.sessions.save(session)
+    meta = json.loads(bundle_meta.read_text(encoding="utf-8"))
+    assert meta["client_name"] == "Alice Chan"
+    assert meta["client"]["name"] == "Alice Chan"
+    assert meta["client"]["push_name"] == "Alice"
+    assert meta["metadata"]["client_name"] == "Alice Chan"
+
+    second_result = loop._import_history_batch(batch)
+    assert len(loop.sessions.get_or_create(f"whatsapp:{normalized_phone}").messages) == 2
+    assert second_result is not None
+    assert second_result.matched_entries == 2
+    assert second_result.imported_entries == 0
+    assert second_result.verified_entries == 2
+    assert second_result.verified_phones == [normalized_phone]
+
+
+@pytest.mark.asyncio
+async def test_manual_history_replay_can_import_cached_messages_for_new_reply_targets(tmp_path: Path) -> None:
+    targets_file = str(tmp_path / "data" / "whatsapp_reply_targets.json")
+    contacts_file = str(tmp_path / "contacts.json")
+    groups_file = str(tmp_path / "groups.csv")
+    target_phone = "+15550002222"
+    normalized_phone = "15550002222"
+    target_chat_id = "15550002222@s.whatsapp.net"
+    channels_config = ChannelsConfig(
+        whatsapp=WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            allow_from=[target_phone],
+            contacts_file=contacts_file,
+            group_members_file=groups_file,
+            reply_targets_file=targets_file,
+        )
+    )
+    loop = _make_loop(tmp_path, channels_config=channels_config)
+    loop.provider.chat = AsyncMock(side_effect=AssertionError("LLM should not be called for history replay"))
+    channel = WhatsAppChannel(channels_config.whatsapp, loop.bus, workspace=tmp_path)
+
+    await channel._handle_bridge_message(
+        json.dumps(
+            {
+                "type": "history",
+                "source": "history_sync",
+                "messages": [
+                    {
+                        "id": "wa-cache-1",
+                        "sender": target_chat_id,
+                        "pn": target_phone,
+                        "pushName": "Alice",
+                        "content": "Earlier hello",
+                        "timestamp": 1700000100,
+                        "fromMe": False,
+                        "isGroup": False,
+                    },
+                    {
+                        "id": "wa-cache-2",
+                        "sender": target_chat_id,
+                        "pn": target_phone,
+                        "content": "Earlier reply",
+                        "timestamp": 1700000101,
+                        "fromMe": True,
+                        "isGroup": False,
+                    },
+                ],
+            }
+        )
+    )
+    assert loop.bus.history_size == 0
+
+    cmd = """
+    #chatbot reply to individuals#
+    +15550002222
+    #chatbot reply to individuals#
+    """
+    response = await loop._process_message(
+        InboundMessage(
+            channel="whatsapp",
+            sender_id="85212345678",
+            chat_id="85212345678@s.whatsapp.net",
+            content=cmd,
+            metadata={"capture_only": True, "is_self_chat": True},
+            session_key_override="whatsapp:85212345678",
+        )
+    )
+    assert response is None
+
+    await channel._replay_cached_history([normalized_phone])
+    batch = await asyncio.wait_for(loop.bus.consume_history(), timeout=1)
+    loop._import_history_batch(batch)
+
+    session = loop.sessions.get_or_create(f"whatsapp:{normalized_phone}")
+    assert [msg["role"] for msg in session.messages] == ["client", "me"]
+    assert [msg["message_id"] for msg in session.messages] == ["wa-cache-1", "wa-cache-2"]
+
+
+def test_history_import_normalizes_imported_client_reply_with_quote(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    session = loop.sessions.get_or_create("whatsapp:85212345678")
+    session.add_message(
+        "me",
+        "how’s going on\nthe poster...",
+        message_id="agent-quote-1",
+        timestamp="2026-01-01T10:00:00",
+    )
+    loop.sessions.save(session)
+
+    batch = InboundHistoryBatch(
+        channel="whatsapp",
+        entries=[
+            {
+                "session_key": "whatsapp:85212345678",
+                "message_id": "hist-quoted-1",
+                "chat_id": "85212345678@s.whatsapp.net",
+                "phone": "85212345678",
+                "sender": "85212345678@s.whatsapp.net",
+                "content": "你\nhow’s going on the poster...\nI’ve been doing the whole thing anyways\nYou don't need to pay",
+                "timestamp": "2026-01-01T11:00:00",
+                "from_me": False,
+                "push_name": "Alice",
+            }
+        ],
+    )
+
+    result = loop._import_history_batch(batch)
+
+    assert result is not None
+    assert result.imported_entries == 1
+    imported = loop.sessions.get_or_create("whatsapp:85212345678").messages[-1]
+    assert imported["message_type"] == "imported_client_reply_with_quote"
+    assert imported["content"] == "I’ve been doing the whole thing anyways\nYou don't need to pay"
+    assert imported["reply_text"] == "I’ve been doing the whole thing anyways\nYou don't need to pay"
+    assert imported["quoted_text"] == "how’s going on\nthe poster..."
+    assert imported["quoted_message_id"] == "agent-quote-1"
+
+
+def test_history_import_prefers_nearest_earlier_outbound_quote_match(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    session = loop.sessions.get_or_create("whatsapp:85212345678")
+    session.add_message("me", "Same quoted text", message_id="agent-quote-old", timestamp="2026-01-01T09:00:00")
+    session.add_message("me", "Same quoted text", message_id="agent-quote-near", timestamp="2026-01-01T10:00:00")
+    loop.sessions.save(session)
+
+    batch = InboundHistoryBatch(
+        channel="whatsapp",
+        entries=[
+            {
+                "session_key": "whatsapp:85212345678",
+                "message_id": "hist-quoted-2",
+                "chat_id": "85212345678@s.whatsapp.net",
+                "phone": "85212345678",
+                "sender": "85212345678@s.whatsapp.net",
+                "content": "你\nSame quoted text\nactual reply",
+                "timestamp": "2026-01-01T11:00:00",
+                "from_me": False,
+                "push_name": "Alice",
+            }
+        ],
+    )
+
+    loop._import_history_batch(batch)
+
+    imported = loop.sessions.get_or_create("whatsapp:85212345678").messages[-1]
+    assert imported["message_type"] == "imported_client_reply_with_quote"
+    assert imported["quoted_message_id"] == "agent-quote-near"
+    assert imported["content"] == "actual reply"
+
+
+@pytest.mark.parametrize(
+    ("raw_content", "quoted_seed"),
+    [
+        ("他\nQuoted seed\nactual reply", "Quoted seed"),
+        ("你\nDifferent quote\nactual reply", "Quoted seed"),
+        ("你\nQuoted seed", "Quoted seed"),
+    ],
+)
+def test_history_import_reply_with_quote_falls_back_to_flat_content_when_split_is_not_safe(
+    tmp_path: Path,
+    raw_content: str,
+    quoted_seed: str,
+) -> None:
+    loop = _make_loop(tmp_path)
+    session = loop.sessions.get_or_create("whatsapp:85212345678")
+    session.add_message("me", quoted_seed, message_id="agent-quote-seed", timestamp="2026-01-01T10:00:00")
+    loop.sessions.save(session)
+
+    batch = InboundHistoryBatch(
+        channel="whatsapp",
+        entries=[
+            {
+                "session_key": "whatsapp:85212345678",
+                "message_id": "hist-flat-1",
+                "chat_id": "85212345678@s.whatsapp.net",
+                "phone": "85212345678",
+                "sender": "85212345678@s.whatsapp.net",
+                "content": raw_content,
+                "timestamp": "2026-01-01T11:00:00",
+                "from_me": False,
+                "push_name": "Alice",
+            }
+        ],
+    )
+
+    loop._import_history_batch(batch)
+
+    imported = loop.sessions.get_or_create("whatsapp:85212345678").messages[-1]
+    assert imported["content"] == raw_content
+    assert "message_type" not in imported
+    assert "reply_text" not in imported
+    assert "quoted_text" not in imported

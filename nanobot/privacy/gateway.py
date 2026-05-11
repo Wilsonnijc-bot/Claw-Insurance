@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from nanobot.config.schema import PrivacyGatewayConfig
-from nanobot.privacy.sanitizer import SanitizationResult, TextPrivacySanitizer, privacy_debug_dir
+from nanobot.privacy.sanitizer import SanitizationResult, TextPrivacySanitizer, load_known_names, privacy_debug_dir
 
 
 @dataclass
@@ -24,7 +24,13 @@ class GatewayResponse:
 
 
 class PrivacyDebugStore:
-    """Persist sanitized request and response payloads locally."""
+    """Persist raw and sanitized request/response payloads locally.
+
+    Privacy pipeline step 4 side effect: write gateway-facing artifacts into
+    ``test_words/privacy_XXXXX.json`` so the exact raw-vs-sanitized prompt
+    diff can be audited locally without exposing the raw outbound payload to
+    the cloud.
+    """
 
     def __init__(self, workspace: Path):
         self.dir = privacy_debug_dir(workspace)
@@ -36,6 +42,7 @@ class PrivacyDebugStore:
     def write(
         self,
         *,
+        raw_request: dict[str, Any],
         result: SanitizationResult,
         upstream_url: str,
         response_status: int,
@@ -56,7 +63,11 @@ class PrivacyDebugStore:
             "blocked": result.blocked,
             "reasons": result.reasons,
             "upstream_url": upstream_url,
+            "placeholder_map": result.placeholder_map,
+            "raw_request": raw_request,
             "sanitized_request": result.sanitized_payload,
+            "raw_prompt": raw_request.get("messages"),
+            "sanitized_prompt": result.sanitized_payload.get("messages"),
             "response_status": response_status,
             "sanitized_response": response_body,
         }
@@ -77,7 +88,7 @@ class PrivacyGatewayService:
         self.upstream_base = upstream_base.rstrip("/")
         self.workspace = workspace
         self.config = config
-        self.sanitizer = TextPrivacySanitizer(config)
+        self.sanitizer = TextPrivacySanitizer(config, known_names=load_known_names(workspace))
         self.debug_store = PrivacyDebugStore(workspace)
         self._client = httpx.Client(timeout=120.0)
 
@@ -91,13 +102,19 @@ class PrivacyGatewayService:
         *,
         headers: dict[str, str] | None = None,
     ) -> GatewayResponse:
+        # Privacy pipeline step 4:
+        # sanitize the outbound payload first, then either block locally or
+        # forward only the sanitized copy to the real upstream endpoint.
         result = self.sanitizer.sanitize_chat_payload(payload, headers=headers)
         model = str(payload.get("model") or "unknown")
 
         if result.blocked:
+            # Fail-closed behavior: do not call the cloud when validation still
+            # sees risky text after masking.
             blocked = TextPrivacySanitizer.build_blocked_response(model=model)
             if self.config.save_redacted_debug:
                 self.debug_store.write(
+                    raw_request=payload,
                     result=result,
                     upstream_url=f"{self.upstream_base}/chat/completions",
                     response_status=200,
@@ -106,6 +123,7 @@ class PrivacyGatewayService:
             return GatewayResponse(status_code=200, body=json.dumps(blocked).encode("utf-8"))
 
         upstream_headers = self._build_upstream_headers(headers)
+        # Only the sanitized payload is sent upstream.
         response = self._client.post(
             f"{self.upstream_base}/chat/completions",
             json=result.sanitized_payload,
@@ -123,7 +141,9 @@ class PrivacyGatewayService:
             raw_body = response.content
 
         if self.config.save_redacted_debug:
+            # Persist the sanitized request/response pair for inspection.
             self.debug_store.write(
+                raw_request=payload,
                 result=result,
                 upstream_url=f"{self.upstream_base}/chat/completions",
                 response_status=response.status_code,
@@ -134,7 +154,10 @@ class PrivacyGatewayService:
 
     @staticmethod
     def _build_upstream_headers(headers: dict[str, str] | None) -> dict[str, str]:
-        allowed = {"authorization", "x-session-affinity", "openai-organization", "openai-project"}
+        # Allow auth and org headers through but strip x-session-affinity
+        # to prevent the stable process-lifetime UUID from becoming a
+        # cross-session correlation token at the cloud provider.
+        allowed = {"authorization", "openai-organization", "openai-project"}
         forwarded: dict[str, str] = {}
         for key, value in (headers or {}).items():
             if key.lower() in allowed:

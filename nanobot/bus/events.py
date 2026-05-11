@@ -25,6 +25,43 @@ class InboundMessage:
 
 
 @dataclass
+class InboundHistoryBatch:
+    """Batch of historical messages imported from a channel without reply handling."""
+
+    channel: str
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HistoryImportResult:
+    """Result emitted after a history batch has been processed and merged."""
+
+    channel: str
+    matched_entries: int = 0
+    imported_entries: int = 0
+    verified_entries: int = 0
+    phones: list[str] = field(default_factory=list)
+    verified_phones: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PersistedHistoryEvent:
+    """History mutation that has already been committed to session.jsonl."""
+
+    channel: str
+    session_key: str
+    phone: str
+    change_type: str = "updated"
+    chat_id: str = ""
+    content: str = ""
+    sender: str = "client"
+    timestamp: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class OutboundMessage:
     """Message to send to a chat channel."""
 
@@ -34,5 +71,3 @@ class OutboundMessage:
     reply_to: str | None = None
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-
-

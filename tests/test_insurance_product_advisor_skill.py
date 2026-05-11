@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+from nanobot.insurance_catalog import StaticCatalogRepository
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "nanobot" / "skills" / "insurance-product-advisor" / "scripts"
@@ -19,6 +20,10 @@ def _load_module(name: str, path: Path):
 
 product_catalog = _load_module("insurance_product_catalog", SCRIPT_ROOT / "product_catalog.py")
 brochure_research = _load_module("insurance_brochure_research", SCRIPT_ROOT / "brochure_research.py")
+
+
+def _catalog_rows(path: Path) -> list[dict]:
+    return product_catalog.load_catalog_rows([path])
 
 
 def test_load_catalog_rows_normalizes_spaced_headers() -> None:
@@ -56,7 +61,7 @@ def test_rank_products_dental_returns_top_candidates_with_brochure_urls() -> Non
             "residence_location": "Hong Kong",
             "coverage_context": "individual",
         },
-        catalog_paths=[REPO_ROOT / "data" / "dental_insurance.csv"],
+        repository=StaticCatalogRepository(_catalog_rows(REPO_ROOT / "data" / "dental_insurance.csv")),
         limit=3,
     )
 
@@ -75,7 +80,7 @@ def test_rank_products_can_shortlist_with_domain_plus_two_facts() -> None:
             "age": "30",
             "residence_location": "Hong Kong",
         },
-        catalog_paths=[REPO_ROOT / "data" / "dental_insurance.csv"],
+        repository=StaticCatalogRepository(_catalog_rows(REPO_ROOT / "data" / "dental_insurance.csv")),
         limit=3,
     )
 
@@ -113,7 +118,7 @@ def test_research_candidate_falls_back_to_search_when_extract_is_thin(monkeypatc
     assert result["brochure_research"]["pricing_notes"]
 
 
-def test_research_candidate_falls_back_to_csv_only_when_tavily_fails(monkeypatch) -> None:
+def test_research_candidate_falls_back_to_catalog_only_when_tavily_fails(monkeypatch) -> None:
     candidate = {
         "plan_name": "Fallback Plan",
         "provider": "AIA HK",
@@ -133,6 +138,60 @@ def test_research_candidate_falls_back_to_csv_only_when_tavily_fails(monkeypatch
     result = brochure_research.research_candidate(candidate)
     notes = result["brochure_research"]
 
-    assert notes["source_method"] == "csv_only"
+    assert notes["source_method"] == "catalog_only"
     assert notes["pricing_notes"] == ["HK$200/year"]
     assert any("could not be verified" in item.casefold() for item in notes["uncertainty_flags"])
+
+
+def test_rank_products_uses_supabase_repository_by_default(monkeypatch) -> None:
+    rows = _catalog_rows(REPO_ROOT / "data" / "dental_insurance.csv")
+    monkeypatch.setattr(
+        product_catalog,
+        "get_default_catalog_repository",
+        lambda: StaticCatalogRepository(rows),
+    )
+
+    result = product_catalog.rank_products(
+        domain="Dental",
+        facts={
+            "age": "30",
+            "residence_location": "Hong Kong",
+            "coverage_context": "individual",
+        },
+        limit=3,
+    )
+
+    assert result["missing_fields"] == []
+    assert result.get("catalog_unavailable") is not True
+    assert 1 <= len(result["candidates"]) <= 3
+    assert all(candidate["source_file"] == "supabase" for candidate in result["candidates"])
+
+
+def test_supabase_row_shape_keeps_csv_shortlist_order() -> None:
+    csv_path = REPO_ROOT / "data" / "dental_insurance.csv"
+    rows = _catalog_rows(csv_path)
+
+    csv_result = product_catalog.rank_products(
+        domain="Dental",
+        facts={
+            "age": "30",
+            "residence_location": "Hong Kong",
+            "coverage_context": "individual",
+        },
+        catalog_paths=[csv_path],
+        limit=3,
+    )
+    supabase_result = product_catalog.rank_products(
+        domain="Dental",
+        facts={
+            "age": "30",
+            "residence_location": "Hong Kong",
+            "coverage_context": "individual",
+        },
+        repository=StaticCatalogRepository(rows),
+        limit=3,
+    )
+
+    assert [item["plan_id"] for item in supabase_result["candidates"]] == [
+        item["plan_id"] for item in csv_result["candidates"]
+    ]

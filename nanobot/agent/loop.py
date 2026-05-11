@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import weakref
@@ -23,11 +24,16 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import HistoryImportResult, InboundHistoryBatch, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.privacy.sanitizer import TextPrivacySanitizer
+from nanobot.privacy.sanitizer import TextPrivacySanitizer, load_known_names
 from nanobot.providers.base import LLMProvider
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import (
+    Session,
+    SessionManager,
+    model_role_for_session,
+    storage_role_for_session,
+)
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, PrivacyGatewayConfig
@@ -53,6 +59,8 @@ class AgentLoop:
     _INSURANCE_WAITING_FOR_ANSWER_KEY = "insurance_waiting_for_answer"
     _INSURANCE_GENERIC_LIMIT = 2
     _INSURANCE_SKILL_NAME = "insurance-product-advisor"
+    _OFFLINE_MEETING_RUNTIME_KEY = "offline_meeting_notes"
+    _OFFLINE_MEETING_CONTEXT_LIMIT = 3
     _INSURANCE_TOPIC_KEYWORDS = (
         "insurance",
         "insured",
@@ -196,7 +204,9 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
-        self.context = ContextBuilder(workspace)
+        self._known_names = load_known_names(workspace)
+        # Legacy fallback context (no client scoping) for non-WhatsApp sessions.
+        self.context = ContextBuilder(workspace, known_names=self._known_names)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -226,9 +236,31 @@ class AgentLoop:
         self._project_root = Path(__file__).resolve().parents[2]
         self._test_words_dir = self._project_root / "test_words"
         self._test_counter_file = self._test_words_dir / ".counter"
-        self._privacy_sanitizer = TextPrivacySanitizer(privacy_config or PrivacyGatewayConfig())
+        # Privacy pipeline companion path:
+        # AgentLoop writes local raw/sanitized snapshots for inspection using
+        # the same deterministic sanitizer that protects cloud-bound payloads.
+        self._privacy_sanitizer = TextPrivacySanitizer(
+            privacy_config or PrivacyGatewayConfig(),
+            known_names=load_known_names(workspace),
+        )
         self._ensure_test_words_dir()
         self._register_default_tools()
+
+    def _context_for_session(self, session_key: str) -> ContextBuilder:
+        """Return a ContextBuilder scoped to the client owning *session_key*.
+
+        For WhatsApp sessions the builder carries a per-client
+        :class:`MemoryStore` so that only that client's memory (plus the
+        optional global knowledge file) is injected into the prompt.
+
+        Non-WhatsApp sessions fall back to the unscoped builder.
+        """
+        from nanobot.session.client_key import ClientKey
+        try:
+            client_key = ClientKey.from_session_key(session_key)
+        except ValueError:
+            return self.context  # fallback for CLI / non-WA sessions
+        return ContextBuilder(self.workspace, client_key=client_key, known_names=self._known_names)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -254,8 +286,12 @@ class AgentLoop:
         if not self._test_counter_file.exists():
             self._test_counter_file.write_text("0\n", encoding="utf-8")
 
-    def _next_test_file_paths(self) -> tuple[Path, Path]:
-        """Return the next sequential raw+sanitized test_words file paths."""
+    def _next_test_file_paths(self, *, client_tag: str = "") -> tuple[Path, Path]:
+        """Return the next sequential raw+sanitized test_words file paths.
+
+        When *client_tag* is provided the phone is embedded in the filename
+        so that debug artefacts are visibly scoped to one client.
+        """
         try:
             raw = self._test_counter_file.read_text(encoding="utf-8").strip()
             current = int(raw) if raw else 0
@@ -263,8 +299,9 @@ class AgentLoop:
             current = 0
         next_index = current + 1
         self._test_counter_file.write_text(f"{next_index}\n", encoding="utf-8")
-        raw_path = self._test_words_dir / f"test_{next_index:05d}.txt"
-        sanitized_path = self._test_words_dir / f"test_{next_index:05d}_sanitized.txt"
+        tag = f"_{client_tag}" if client_tag else ""
+        raw_path = self._test_words_dir / f"test_{next_index:05d}{tag}.txt"
+        sanitized_path = self._test_words_dir / f"test_{next_index:05d}{tag}_sanitized.txt"
         return raw_path, sanitized_path
 
     @staticmethod
@@ -335,12 +372,24 @@ class AgentLoop:
             return
 
         try:
-            out_raw, out_sanitized = self._next_test_file_paths()
+            # Read per-client memory when possible; fall back to legacy global files.
+            from nanobot.session.client_key import ClientKey
+            client_key = ClientKey.try_normalize(
+                session_key.split(":", 1)[1] if ":" in session_key else session_key
+            )
+            client_tag = client_key.phone if client_key else ""
+            out_raw, out_sanitized = self._next_test_file_paths(client_tag=client_tag)
             generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S (%A) (%Z)")
             system_prompt = self._stringify_message_content(initial_messages[0].get("content", ""))
             user_payload = initial_messages[-1].get("content", "")
-            memory_file = self.workspace / "memory" / "MEMORY.md"
-            history_file = self.workspace / "memory" / "HISTORY.md"
+            if client_key:
+                per_client_mem = client_key.memory_dir(self.workspace) / "MEMORY.md"
+                per_client_hist = client_key.memory_dir(self.workspace) / "HISTORY.md"
+            else:
+                per_client_mem = None
+                per_client_hist = None
+            memory_file = per_client_mem if (per_client_mem and per_client_mem.exists()) else self.workspace / "memory" / "MEMORY.md"
+            history_file = per_client_hist if (per_client_hist and per_client_hist.exists()) else self.workspace / "memory" / "HISTORY.md"
             memory_text = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
             history_text = history_file.read_text(encoding="utf-8") if history_file.exists() else ""
 
@@ -355,8 +404,12 @@ class AgentLoop:
                 history_text=history_text,
                 user_payload=str(user_payload),
             )
+            # Local-only artifact: raw snapshot before privacy masking.
             out_raw.write_text(raw_text, encoding="utf-8")
 
+            # Privacy pipeline debug companion:
+            # sanitize the same turn snapshot so test_words/ can show a raw vs
+            # sanitized comparison using the identical masking rules.
             sanitized_result = self._privacy_sanitizer.sanitize_chat_payload(
                 {"messages": initial_messages},
                 headers={"x-session-affinity": session_key},
@@ -392,6 +445,7 @@ class AgentLoop:
                     "placeholder_map": sanitized_result.placeholder_map,
                 },
             )
+            # Local-only artifact: sanitized snapshot with placeholder metadata.
             out_sanitized.write_text(sanitized_text, encoding="utf-8")
         except Exception:
             logger.exception("Failed to write test_words snapshot")
@@ -413,7 +467,7 @@ class AgentLoop:
             return json.dumps(content, ensure_ascii=False, indent=2)
         return str(content)
 
-    def _apply_whatsapp_self_routing_from_message(self, content: str) -> None:
+    async def _apply_whatsapp_self_routing_from_message(self, content: str) -> None:
         """Apply self-chat routing commands to WhatsApp local allowlists."""
         if self.channels_config is None:
             return
@@ -429,6 +483,7 @@ class AgentLoop:
             reply_targets_path,
             rewrite_from_self_instruction,
         )
+        from nanobot.channels.whatsapp_contacts import normalize_contact_id
 
         instruction = parse_self_routing_instruction(content)
         if instruction is None:
@@ -436,10 +491,7 @@ class AgentLoop:
 
         try:
             stats = apply_self_routing_instruction(
-                workspace=self.workspace,
-                contacts_file=wa_cfg.contacts_file,
                 group_members_file=wa_cfg.group_members_file,
-                storage_dir=wa_cfg.storage_dir,
                 instruction=instruction,
             )
             targets_file = reply_targets_path(wa_cfg.reply_targets_file, self._project_root)
@@ -449,12 +501,16 @@ class AgentLoop:
                 groups=instruction.groups,
             )
             logger.info(
-                "Updated WhatsApp routing from self-chat command: contacts={}, groups_csv={}, direct_json={}, group_json={}",
+                "Updated WhatsApp routing from self-chat command: direct_count={}, legacy_group_cache={}, direct_json={}, group_json={}",
                 stats.get("individual_count", -1),
                 stats.get("group_member_count", -1),
                 target_stats.get("direct_reply_target_count", -1),
                 target_stats.get("group_reply_target_count", -1),
             )
+            if instruction.individuals is not None:
+                # Reply-target updates are passive until the next login direct history parse
+                # or an explicit manual sync from the UI.
+                pass
         except Exception:
             logger.exception("Failed to apply WhatsApp self-chat routing command")
 
@@ -532,6 +588,21 @@ class AgentLoop:
             cls._INSURANCE_CYCLE_ACTIVE_KEY: state[cls._INSURANCE_CYCLE_ACTIVE_KEY],
         }
 
+    @classmethod
+    def _offline_meeting_runtime_metadata(cls, session: Session) -> dict[str, Any]:
+        """Expose recent offline-meeting transcripts to the matching client prompt only."""
+        notes = [
+            str(note.get("transcript") or "").strip()
+            for note in session.offline_meeting_notes
+            if isinstance(note, dict) and str(note.get("transcript") or "").strip()
+        ]
+        if not notes:
+            return {}
+
+        return {
+            cls._OFFLINE_MEETING_RUNTIME_KEY: notes[-cls._OFFLINE_MEETING_CONTEXT_LIMIT:],
+        }
+
     @staticmethod
     def _looks_like_question(text: str | None) -> bool:
         if not text:
@@ -590,7 +661,7 @@ class AgentLoop:
     def _recent_user_text(cls, session: Session, max_messages: int = 6) -> str:
         parts: list[str] = []
         for message in session.messages[-max_messages:]:
-            if message.get("role") != "user":
+            if model_role_for_session(session.key, str(message.get("role", "") or "")) != "user":
                 continue
             text = cls._session_text_content(message.get("content"))
             if text.strip():
@@ -755,16 +826,19 @@ class AgentLoop:
 
         missing_fields = []
         no_fit_completed = False
+        catalog_unavailable = False
         if isinstance(find_result, dict):
             missing_fields = find_result.get("missing_fields") or []
+            catalog_unavailable = bool(find_result.get("catalog_unavailable"))
             candidates = find_result.get("candidates") or []
-            no_fit_completed = not missing_fields and not candidates
+            no_fit_completed = not catalog_unavailable and not missing_fields and not candidates
 
         research_completed = isinstance(research_result, dict) and "candidates" in research_result
         return {
             "find_products_used": find_result is not None,
             "research_products_used": research_result is not None,
             "missing_fields": missing_fields,
+            "catalog_unavailable": catalog_unavailable,
             "no_fit_completed": no_fit_completed,
             "research_completed": research_completed,
         }
@@ -905,19 +979,38 @@ class AgentLoop:
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
+        inbound_task = asyncio.create_task(self.bus.consume_inbound())
+        history_worker = asyncio.create_task(self._history_import_worker())
 
+        try:
+            while self._running:
+                done, _pending = await asyncio.wait(
+                    {inbound_task},
+                    timeout=1.0,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    continue
+
+                if inbound_task in done:
+                    msg = inbound_task.result()
+                    inbound_task = asyncio.create_task(self.bus.consume_inbound())
+                    if msg.content.strip().lower() == "/stop":
+                        await self._handle_stop(msg)
+                    else:
+                        task = asyncio.create_task(self._dispatch(msg))
+                        self._active_tasks.setdefault(msg.session_key, []).append(task)
+                        task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+        finally:
+            inbound_task.cancel()
+            history_worker.cancel()
+            await asyncio.gather(inbound_task, history_worker, return_exceptions=True)
+
+    async def _history_import_worker(self) -> None:
+        """Consume history batches in bus order so request-scoped terminal signals stay ordered."""
         while self._running:
-            try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-
-            if msg.content.strip().lower() == "/stop":
-                await self._handle_stop(msg)
-            else:
-                task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+            batch = await self.bus.consume_history()
+            await self._dispatch_history(batch)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -957,6 +1050,16 @@ class AgentLoop:
                     content="Sorry, I encountered an error.",
                 ))
 
+    async def _dispatch_history(self, batch: InboundHistoryBatch) -> None:
+        """Process a historical import batch under the global lock."""
+        async with self._processing_lock:
+            try:
+                result = self._import_history_batch(batch)
+                if result is not None:
+                    await self.bus.publish_history_result(result)
+            except Exception:
+                logger.exception("Error importing historical batch for {}", batch.channel)
+
     async def close_mcp(self) -> None:
         """Close MCP connections."""
         if self._mcp_stack:
@@ -971,11 +1074,382 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    def _save_session(
+        self,
+        session: Session,
+        *,
+        change_type: str = "updated",
+        metadata: dict[str, Any] | None = None,
+        notify_observers: bool = False,
+    ) -> None:
+        """Persist a session and refresh WhatsApp-visible history exports when relevant."""
+        self.sessions.save_history(
+            session,
+            bus=self.bus,
+            change_type=change_type,
+            metadata=metadata,
+            notify_observers=notify_observers,
+        )
+        self._refresh_whatsapp_history_exports(session)
+
+    def _refresh_whatsapp_history_exports(self, session: Session) -> None:
+        """Deprecated hook retained after consolidating WhatsApp data into session bundles."""
+        _ = session
+
+    def _import_history_batch(self, batch: InboundHistoryBatch) -> HistoryImportResult | None:
+        """Silently merge a historical batch into canonical session files."""
+        if batch.channel != "whatsapp":
+            return
+
+        request_id = str(batch.metadata.get("request_id", "") or "").strip()
+        if not batch.entries:
+            if request_id:
+                return HistoryImportResult(
+                    channel=batch.channel,
+                    matched_entries=0,
+                    imported_entries=0,
+                    verified_entries=0,
+                    phones=[],
+                    verified_phones=[],
+                    metadata=dict(batch.metadata or {}),
+                )
+            return None
+
+        from nanobot.channels.whatsapp_contacts import normalize_contact_id
+        from nanobot.session.client_key import ClientKey, CrossClientError
+
+        touched: dict[str, dict[str, Any]] = {}
+        matched_entries = 0
+        imported_entries = 0
+        phones_seen: set[str] = set()
+        intended_message_ids_by_phone: dict[str, set[str]] = {}
+        for raw in batch.entries:
+            if not isinstance(raw, dict):
+                continue
+
+            session_key = str(raw.get("session_key", "") or "").strip()
+            message_id = str(raw.get("message_id", "") or "").strip()
+            chat_id = str(raw.get("chat_id", "") or "").strip()
+            phone = str(raw.get("phone", "") or "").strip()
+            if not session_key or not message_id:
+                continue
+
+            # --- Per-client isolation guard (hardened) ---
+            # Require a non-empty phone on history entries so that an
+            # attacker/bug cannot bypass the guard by omitting the field.
+            if not phone:
+                logger.warning(
+                    "Skipping history entry {} — missing phone field (session {})",
+                    message_id, session_key,
+                )
+                continue
+
+            # Normalise both sides to digits-only before comparing so that
+            # formatting differences (+852-xxx vs 852xxx) never produce
+            # false matches or false rejections.
+            phone_norm = normalize_contact_id(phone)
+            session_phone_raw = session_key.split(":", 1)[1] if ":" in session_key else ""
+            session_phone_norm = normalize_contact_id(session_phone_raw)
+
+            if phone_norm and session_phone_norm and phone_norm != session_phone_norm:
+                logger.warning(
+                    "Skipping history entry {} — phone {} does not match session {}",
+                    message_id, phone, session_key,
+                )
+                continue
+
+            # Belt-and-suspenders: ClientKey assertion
+            try:
+                entry_key = ClientKey.normalize(phone)
+                session_client = ClientKey.from_session_key(session_key)
+                ClientKey.assert_same_client(entry_key, session_client)
+            except (ValueError, CrossClientError) as exc:
+                logger.warning(
+                    "Skipping history entry {} — client key mismatch: {}",
+                    message_id, exc,
+                )
+                continue
+
+            matched_entries += 1
+            if phone_norm:
+                phones_seen.add(phone_norm)
+                intended_message_ids_by_phone.setdefault(phone_norm, set()).add(message_id)
+
+            bucket = touched.setdefault(
+                session_key,
+                {
+                    "session": self.sessions.get_or_create(session_key),
+                    "imports": [],
+                    "existing_ids": set(),
+                    "earliest_ts": None,
+                },
+            )
+            session: Session = bucket["session"]
+            if not bucket["existing_ids"]:
+                bucket["existing_ids"] = {
+                    str(existing.get("message_id", "") or "").strip()
+                    for existing in session.messages
+                    if str(existing.get("message_id", "") or "").strip()
+                }
+            existing_ids: set[str] = bucket["existing_ids"]
+            if message_id in existing_ids:
+                continue
+
+            timestamp_iso = self._history_timestamp_iso(raw.get("timestamp"))
+            timestamp_value = self._history_sort_value(timestamp_iso)
+            raw_content = str(raw.get("content", "") or "")
+            normalized_reply: dict[str, Any] | None = None
+            if batch.channel == "whatsapp" and not bool(raw.get("from_me", False)) and raw_content.strip():
+                previous_messages = [
+                    existing for existing in session.messages
+                    if self._history_sort_value(existing.get("timestamp")) <= timestamp_value
+                ]
+                previous_messages.extend(
+                    existing for existing in bucket["imports"]
+                    if self._history_sort_value(existing.get("timestamp")) <= timestamp_value
+                )
+                normalized_reply = self.detect_imported_client_reply_block(raw_content, previous_messages)
+
+            entry = {
+                "role": storage_role_for_session(
+                    session_key,
+                    "assistant" if bool(raw.get("from_me", False)) else "user",
+                ),
+                "content": str((normalized_reply or {}).get("reply_text") or raw_content),
+                "timestamp": timestamp_iso,
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "sender_id": phone if not bool(raw.get("from_me", False)) else "me",
+                "sender": str(raw.get("sender", "") or ""),
+                "sender_phone": phone,
+                "push_name": str(raw.get("push_name", "") or ""),
+                "historical_import": True,
+                "from_me": bool(raw.get("from_me", False)),
+            }
+            if normalized_reply is not None:
+                entry["message_type"] = normalized_reply["message_type"]
+                entry["reply_text"] = normalized_reply["reply_text"]
+                entry["quoted_text"] = normalized_reply["quoted_text"]
+                quoted_message_id = str(normalized_reply.get("quoted_message_id", "") or "").strip()
+                if quoted_message_id:
+                    entry["quoted_message_id"] = quoted_message_id
+            bucket["imports"].append(entry)
+            imported_entries += 1
+            existing_ids.add(message_id)
+
+            entry_dt = self._history_sort_value(timestamp_iso)
+            earliest = bucket["earliest_ts"]
+            if earliest is None or entry_dt < earliest:
+                bucket["earliest_ts"] = entry_dt
+
+        for session_key, payload in touched.items():
+            imports = payload["imports"]
+            if not imports:
+                continue
+
+            session: Session = payload["session"]
+            if not session.messages and payload["earliest_ts"] is not None:
+                session.created_at = payload["earliest_ts"]
+            session.messages = self._merge_history_entries(session.messages, imports)
+            session.updated_at = datetime.now()
+            self._save_session(
+                session,
+                change_type="history_imported",
+                metadata={
+                    "request_id": request_id,
+                    "imported_entries": len(imports),
+                },
+                notify_observers=True,
+            )
+            logger.info("Imported {} WhatsApp history messages into {}", len(imports), session_key)
+
+        verified_entries = 0
+        verified_phones: set[str] = set()
+        for phone_norm, intended_ids in intended_message_ids_by_phone.items():
+            if not intended_ids:
+                continue
+            session_key = f"whatsapp:{phone_norm}"
+            session = touched.get(session_key, {}).get("session")
+            if session is None:
+                session = self.sessions.get_or_create(session_key)
+            existing_ids = {
+                str(existing.get("message_id", "") or "").strip()
+                for existing in session.messages
+                if str(existing.get("message_id", "") or "").strip()
+            }
+            verified_ids = intended_ids.intersection(existing_ids)
+            if verified_ids:
+                verified_entries += len(verified_ids)
+                verified_phones.add(phone_norm)
+
+        return HistoryImportResult(
+            channel=batch.channel,
+            matched_entries=matched_entries,
+            imported_entries=imported_entries,
+            verified_entries=verified_entries,
+            phones=sorted(phones_seen),
+            verified_phones=sorted(verified_phones),
+            metadata=dict(batch.metadata or {}),
+        )
+
+    def _merge_history_entries(self, existing: list[dict[str, Any]], imports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Insert historical imports by timestamp without disturbing existing relative order."""
+        merged = list(existing)
+        ordered_imports = sorted(imports, key=lambda item: self._history_sort_value(item.get("timestamp")))
+        for entry in ordered_imports:
+            entry_ts = self._history_sort_value(entry.get("timestamp"))
+            insert_at = len(merged)
+            for index, current in enumerate(merged):
+                if self._history_sort_value(current.get("timestamp")) > entry_ts:
+                    insert_at = index
+                    break
+            merged.insert(insert_at, entry)
+        return merged
+
+    @staticmethod
+    def _tokenize_imported_reply_text(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+        """Return non-whitespace tokens and their spans for deterministic quote matching."""
+        tokens: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for match in re.finditer(r"\S+", str(text or "")):
+            tokens.append(match.group(0))
+            spans.append(match.span())
+        return tokens, spans
+
+    @classmethod
+    def detect_imported_client_reply_block(
+        cls,
+        raw_block: str,
+        previous_messages: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Split imported inbound `你` quote blocks into quoted text and reply text."""
+        text = str(raw_block or "")
+        if not text.strip():
+            return None
+
+        lines = text.splitlines()
+        first_nonempty_index: int | None = None
+        for index, line in enumerate(lines):
+            if line.strip():
+                first_nonempty_index = index
+                break
+        if first_nonempty_index is None:
+            return None
+        if lines[first_nonempty_index].strip() != "你":
+            return None
+
+        remaining_lines = lines[first_nonempty_index + 1:]
+        if not any(line.strip() for line in remaining_lines):
+            return None
+
+        candidate_body = "\n".join(remaining_lines).strip()
+        candidate_tokens, candidate_spans = cls._tokenize_imported_reply_text(candidate_body)
+        if not candidate_tokens:
+            return None
+
+        for previous in reversed(previous_messages):
+            role = str(previous.get("role", "") or "")
+            if role not in {"me", "assistant"}:
+                continue
+
+            previous_text = str(previous.get("content", "") or "")
+            if not previous_text.strip():
+                continue
+
+            previous_tokens, _ = cls._tokenize_imported_reply_text(previous_text)
+            if not previous_tokens or len(previous_tokens) > len(candidate_tokens):
+                continue
+
+            match_start: int | None = None
+            duplicate_match = False
+            for offset in range(len(candidate_tokens) - len(previous_tokens) + 1):
+                if candidate_tokens[offset:offset + len(previous_tokens)] != previous_tokens:
+                    continue
+                if match_start is not None:
+                    duplicate_match = True
+                    break
+                match_start = offset
+            if duplicate_match or match_start is None:
+                continue
+
+            start_char = candidate_spans[match_start][0]
+            end_char = candidate_spans[match_start + len(previous_tokens) - 1][1]
+            before = candidate_body[:start_char].strip()
+            after = candidate_body[end_char:].strip()
+            reply_text = "\n".join(part for part in (before, after) if part).strip()
+            if not reply_text:
+                continue
+
+            payload: dict[str, Any] = {
+                "message_type": "imported_client_reply_with_quote",
+                "reply_text": reply_text,
+                "quoted_text": previous_text,
+            }
+            quoted_message_id = str(previous.get("message_id", "") or "").strip()
+            if quoted_message_id:
+                payload["quoted_message_id"] = quoted_message_id
+            return payload
+
+        return None
+
+    @staticmethod
+    def _history_timestamp_iso(value: Any) -> str:
+        """Normalize a historical timestamp into the session JSONL format."""
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                try:
+                    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.astimezone().replace(tzinfo=None)
+                    return parsed.isoformat()
+                except ValueError:
+                    try:
+                        return datetime.fromtimestamp(AgentLoop._history_epoch_seconds(float(text))).isoformat()
+                    except ValueError:
+                        return text
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return datetime.now().isoformat()
+        return datetime.fromtimestamp(AgentLoop._history_epoch_seconds(numeric)).isoformat()
+
+    @staticmethod
+    def _history_epoch_seconds(value: float) -> float:
+        """Normalize unix timestamps in seconds, milliseconds, or finer units down to seconds."""
+        numeric = float(value)
+        while abs(numeric) >= 1e11:
+            numeric /= 1000.0
+        return numeric
+
+    @staticmethod
+    def _history_sort_value(value: Any) -> datetime:
+        """Parse timestamps for stable historical insertion ordering."""
+        if isinstance(value, datetime):
+            return value.astimezone().replace(tzinfo=None) if value.tzinfo is not None else value
+        text = str(value or "").strip()
+        if text:
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+            except ValueError:
+                try:
+                    return datetime.fromtimestamp(AgentLoop._history_epoch_seconds(float(text)))
+                except ValueError:
+                    pass
+        return datetime.max
+
+    @staticmethod
+    def _use_full_whatsapp_history_for_prompt(channel: str, session_key: str) -> bool:
+        """WhatsApp prompts use the full stored session history, not just the recent window."""
+        return channel == "whatsapp" and str(session_key or "").startswith("whatsapp:")
+
     async def _process_message(
         self,
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        persist_history: bool = True,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -986,14 +1460,17 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=self.memory_window)
-            messages = self.context.build_messages(
+            history = session.get_history(
+                max_messages=None if self._use_full_whatsapp_history_for_prompt(channel, key) else self.memory_window,
+                include_consolidated=self._use_full_whatsapp_history_for_prompt(channel, key),
+            )
+            messages = self._context_for_session(key).build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id, metadata=msg.metadata,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
+            self._save_session(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -1001,7 +1478,17 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
+        source_session = self.sessions.get_or_create(key) if persist_history else self.sessions.read_persisted(key)
+        session = source_session
+        if not persist_history:
+            session = Session(
+                key=source_session.key,
+                messages=copy.deepcopy(source_session.messages),
+                created_at=source_session.created_at,
+                updated_at=source_session.updated_at,
+                metadata=copy.deepcopy(source_session.metadata),
+                last_consolidated=source_session.last_consolidated,
+            )
 
         if bool(msg.metadata.get("capture_only")):
             if msg.metadata.get("event_type") == "message_deleted":
@@ -1012,7 +1499,15 @@ class AgentLoop:
                     deleter_id=str(msg.metadata.get("sender") or msg.sender_id or ""),
                     chat_id=msg.chat_id,
                 )
-                self.sessions.save(session)
+                if persist_history:
+                    self._save_session(
+                        session,
+                        change_type="deleted",
+                        metadata={
+                            "message_id": str(msg.metadata.get("deleted_message_id") or ""),
+                        },
+                        notify_observers=msg.channel == "whatsapp",
+                    )
                 logger.info(
                     "Recorded deleted WhatsApp message {} for {}:{} (matched={})",
                     msg.metadata.get("deleted_message_id"),
@@ -1022,15 +1517,31 @@ class AgentLoop:
                 )
                 return None
             if msg.channel == "whatsapp" and bool(msg.metadata.get("is_self_chat")):
-                self._apply_whatsapp_self_routing_from_message(msg.content)
+                await self._apply_whatsapp_self_routing_from_message(msg.content)
+            capture_role = "assistant" if msg.channel == "whatsapp" and bool(msg.metadata.get("is_self_chat")) else "user"
             session.add_message(
-                role="user",
+                role=capture_role,
                 content=msg.content,
                 sender_id=msg.sender_id,
                 chat_id=msg.chat_id,
                 message_id=msg.metadata.get("message_id"),
+                sender=str(msg.metadata.get("sender") or msg.chat_id or ""),
+                sender_phone=str(msg.metadata.get("sender_phone") or msg.metadata.get("pn") or ""),
+                sender_name=str(msg.metadata.get("sender_name") or msg.metadata.get("push_name") or ""),
+                push_name=str(msg.metadata.get("push_name") or msg.metadata.get("sender_name") or ""),
+                reply_target_label=str(msg.metadata.get("reply_target_label") or ""),
+                reply_target_push_name=str(msg.metadata.get("reply_target_push_name") or ""),
+                from_me=bool(msg.metadata.get("is_self_chat")),
             )
-            self.sessions.save(session)
+            if persist_history:
+                self._save_session(
+                    session,
+                    change_type="message_saved",
+                    metadata={
+                        "message_id": str(msg.metadata.get("message_id") or ""),
+                    },
+                    notify_observers=msg.channel == "whatsapp",
+                )
             logger.info("Captured message without reply for {}:{} (capture_only)", msg.channel, msg.sender_id)
             return None
 
@@ -1038,6 +1549,9 @@ class AgentLoop:
         insurance_turn = False
         runtime_metadata = dict(msg.metadata or {})
         skill_names: list[str] | None = None
+
+        if msg.channel == "whatsapp":
+            runtime_metadata.update(self._offline_meeting_runtime_metadata(session))
 
         if insurance_state is not None:
             insurance_turn = self._is_whatsapp_insurance_turn(msg, session, insurance_state)
@@ -1078,8 +1592,9 @@ class AgentLoop:
                 self._consolidating.discard(session.key)
 
             session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
+            if persist_history:
+                self._save_session(session)
+                self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
@@ -1087,7 +1602,7 @@ class AgentLoop:
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
         unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
+        if persist_history and (unconsolidated >= self.memory_window and session.key not in self._consolidating):
             self._consolidating.add(session.key)
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
 
@@ -1109,8 +1624,12 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history(max_messages=self.memory_window)
-        initial_messages = self.context.build_messages(
+        use_full_history = self._use_full_whatsapp_history_for_prompt(msg.channel, session.key)
+        history = session.get_history(
+            max_messages=None if use_full_history else self.memory_window,
+            include_consolidated=use_full_history,
+        )
+        initial_messages = self._context_for_session(session.key).build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
@@ -1150,7 +1669,8 @@ class AgentLoop:
                 turn_messages=turn_messages,
             )
             self._write_insurance_state(session, next_state)
-        self.sessions.save(session)
+        if persist_history:
+            self._save_session(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -1199,13 +1719,24 @@ class AgentLoop:
                     entry.setdefault("sender_id", inbound_msg.sender_id)
                     entry.setdefault("chat_id", inbound_msg.chat_id)
                     attached_inbound_user = True
+            if role is not None:
+                entry["role"] = storage_role_for_session(session.key, str(role))
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
-        """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
+        """Delegate to a per-client MemoryStore.consolidate(). Returns True on success."""
+        from nanobot.session.client_key import ClientKey
+        try:
+            client_key = ClientKey.from_session_key(session.key)
+        except ValueError:
+            # Non-WhatsApp sessions (e.g. "cli:direct") — use a synthetic key
+            client_key = ClientKey.try_normalize(session.key.split(":", 1)[-1]) if ":" in session.key else None
+            if client_key is None:
+                logger.warning("Cannot derive ClientKey for session {}, skipping consolidation", session.key)
+                return True
+        return await MemoryStore(self.workspace, client_key).consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
@@ -1217,9 +1748,15 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        persist_history: bool = True,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(
+            msg,
+            session_key=session_key,
+            on_progress=on_progress,
+            persist_history=persist_history,
+        )
         return response.content if response else ""

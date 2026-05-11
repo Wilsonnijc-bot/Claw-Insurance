@@ -54,7 +54,7 @@ class ProviderSpec:
     # OAuth-based providers (e.g., OpenAI Codex) don't use API keys
     is_oauth: bool = False  # if True, uses OAuth flow instead of API key
 
-    # Direct providers bypass LiteLLM entirely (e.g., CustomProvider)
+    # Direct providers bypass LiteLLM entirely (e.g., Azure OpenAI)
     is_direct: bool = False
 
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
@@ -70,14 +70,22 @@ class ProviderSpec:
 # ---------------------------------------------------------------------------
 
 PROVIDERS: tuple[ProviderSpec, ...] = (
-    # === Custom (direct OpenAI-compatible endpoint, bypasses LiteLLM) ======
+    # === LiteLLM endpoint (canonical project-local default) ================
     ProviderSpec(
-        name="custom",
-        keywords=(),
-        env_key="",
-        display_name="Custom",
+        name="litellm",
+        keywords=("litellm",),
+        env_key="OPENAI_API_KEY",
+        display_name="LiteLLM",
         litellm_prefix="",
-        is_direct=True,
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=True,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="",
+        default_api_base="http://43.129.246.127:4000",
+        strip_model_prefix=False,
+        model_overrides=(),
     ),
 
     # === Azure OpenAI (direct API calls with API version 2024-10-21) =====
