@@ -28,11 +28,14 @@ def test_pyproject_exposes_no_console_startup_scripts() -> None:
     assert "whatsapp-web-nanobot" not in pyproject
 
 
-def test_root_compose_uses_only_gateway_and_frontend_services() -> None:
+def test_root_compose_uses_demo_gateway_and_frontend_services() -> None:
     compose = _read("docker-compose.yml")
 
+    assert "mock-cloud:" in compose
     assert "nanobot-gateway:" in compose
     assert "nanobot-frontend:" in compose
+    assert 'context: "./frontend"' in compose
+    assert "Insurance frontend" not in compose
     assert "nanobot-cli:" not in compose
     assert "profiles:" not in compose
     assert "3456:3456" in compose

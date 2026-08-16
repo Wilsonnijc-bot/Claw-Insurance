@@ -72,7 +72,7 @@ def _persist_session_messages(workspace: Path, phone: str, message_ids: list[str
 
 
 def _make_history_import_loop(monkeypatch: pytest.MonkeyPatch, workspace: Path, bus: MessageBus) -> AgentLoop:
-    monkeypatch.setattr(AgentLoop, "_ensure_test_words_dir", lambda self: None)
+    monkeypatch.setattr(AgentLoop, "_ensure_privacy_debug_dir", lambda self: None)
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.chat = AsyncMock(side_effect=AssertionError("LLM should not be called in history-only tests"))

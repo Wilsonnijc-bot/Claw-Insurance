@@ -9,4 +9,4 @@ This file is for coding agents only and is not part of the product runtime promp
 
 ## Client Data Isolation
 
-All client-scoped data flows must go through `ClientKey` (see `nanobot/session/client_key.py`). Read `ISOLATION.md` for the full invariant, architecture, and forbidden patterns before modifying any data path.
+All client-scoped data flows must go through `ClientKey` (see `nanobot/session/client_key.py`). Read `docs/ISOLATION.md` for the full invariant, architecture, and forbidden patterns before modifying any data path.

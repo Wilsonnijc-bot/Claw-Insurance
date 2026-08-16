@@ -54,7 +54,9 @@ def test_platform_host_cdp_installer_scripts_do_not_call_old_nanobot_cli() -> No
     assert "Set-Content -Path $TempScript -Value $Code" in combined
     assert "if ($ExitCode -ne 0)" in combined
     assert '$env:OS -ne "Windows_NT"' in combined
-    assert "& $PyLauncher.Source -3 $TempScript $RootDir" in combined
+    assert "function Test-PythonRuntime" in combined
+    assert 'Get-AppxPackage -Name "PythonSoftwareFoundation.Python*"' in combined
+    assert "& $PythonExecutable @PythonPrefixArgs $TempScript $RootDir" in combined
 
 
 def test_readme_separates_host_prereqs_from_daily_docker_runtime() -> None:

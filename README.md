@@ -21,6 +21,25 @@ The assistant can:
 - product iterations driven by real user feedback
 - Docker-based deployment for repeatable local setup
 
+## Repository Layout
+
+The repository keeps product code, optional deployment services, documentation, and local runtime data separate:
+
+```text
+frontend/       React/TypeScript operator interface
+nanobot/        Python gateway, agent loop, privacy, providers, and channels
+bridge/         Node.js WhatsApp/Baileys and WhatsApp Web integration
+server_proxy/   Optional real database and speech proxy deployment
+scripts/        Host helper installers and maintenance scripts
+skills/         Project-installed runtime skills
+tests/          Python regression tests
+docs/           Architecture, privacy, isolation, and communication notes
+data/ state/ memory/ sessions/ cron/
+                Local runtime data (ignored by Git)
+```
+
+Runtime credentials and profiles such as `.env`, `config.json`, `whatsapp-auth/`, and `whatsapp-web/` stay in the project root because Docker and the host helper share them. Do not commit them. See [the architecture diagram](docs/nanobot_arch.png), [privacy pipeline](docs/PRIVACY_PIPELINE.md), and [client isolation rules](docs/ISOLATION.md).
+
 ## Quick Start with Docker
 
 Docker Compose is the supported runtime for this project.
@@ -32,7 +51,9 @@ git clone https://github.com/Wilsonnijc-bot/Claw-Insurance.git
 cd Claw-Insurance
 ```
 
-### 2. Install host prerequisites
+## One-Time Host Prerequisites
+
+Docker does not install host services such as Chrome or the WhatsApp CDP helper.
 
 Install these on the host machine:
 
@@ -54,6 +75,12 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\scripts\install-cdp-helper-windows.ps1
 ```
 
+If the current terminal is Command Prompt (`cmd.exe`) rather than PowerShell, use:
+
+```bat
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\install-cdp-helper-windows.ps1"
+```
+
 The installer verifies host Chrome/Chromium, configures and starts the host CDP helper, and writes Docker-facing values to `.env`:
 
 - `WEB_CDP_URL`
@@ -70,25 +97,51 @@ Default helper URLs:
 
 After changing host CDP helper settings, restart the Docker stack.
 
-### 3. Create local configuration files
+On the first Windows launch, loading the Node.js WhatsApp Bridge can take longer than ten seconds. The Compose default allows 60 seconds; unusually slow hosts can override `BRIDGE_STARTUP_TIMEOUT_SECONDS` in `.env` (bounded to 5-120 seconds).
+
+### Create local configuration files
+
+On macOS or Linux:
 
 ```bash
 cp config.example.json config.json
-cp google.example.json google.json
 cp supabase.example.json supabase.json
 ```
 
-Edit `config.json` with the LiteLLM API key, model, and proxy settings you need.
+On Windows PowerShell:
 
-Keep `google.json` only if you use Google Speech-to-Text. If Google Speech-to-Text is enabled, place the credential JSON under `secrets/` and point `google.json` at that file.
+```powershell
+Copy-Item config.example.json config.json
+Copy-Item supabase.example.json supabase.json
+```
 
-Keep `supabase.json` only if you use Supabase-backed catalog features.
+Edit `config.json` with the OpenAI-compatible API base URL, API key, and model you need. `config.json` is ignored by Git and must never be committed.
 
-### 4. Build and run the app
+Core agent, channel, AI provider, privacy gateway, and interview proxy settings belong in `config.json`. Insurance catalog settings belong in the separate `supabase.json`; do not add a `catalog` object to `config.json`.
+
+The default demo configuration routes database and speech requests to the local `mock-cloud` service. It makes real HTTP requests and returns deterministic demo data without contacting Supabase or Google.
+
+Create `google.json` only when using real Google Speech-to-Text credentials. Place the credential JSON under `secrets/` and point `google.json` at that project-local file. When `interviewProxy` is configured, `google.json` is not required.
+
+## Daily Docker Runtime
+
+Docker Compose remains the only supported app runtime.
+
+### Build and run the app
+
+Use this after cloning, after changing dependencies, Docker files, or frontend source, and after pulling new code:
 
 ```bash
 docker compose up -d --build
 ```
+
+For an ordinary start when the images are already built:
+
+```bash
+docker compose up -d
+```
+
+Compose waits for the mock cloud and gateway health checks before starting the frontend.
 
 Open the frontend:
 
@@ -102,9 +155,22 @@ The backend API runs on:
 http://localhost:3456
 ```
 
+The local demo cloud API runs on:
+
+```text
+http://localhost:5050
+```
+
+Check its health and privacy-safe request journal at:
+
+- `http://localhost:5050/healthz`
+- `http://localhost:5050/requests`
+
+After adding a real AI key to the ignored `config.json`, send one harmless prompt from the frontend to verify that the configured provider is reached through the local privacy gateway.
+
 Log in from the frontend and complete the WhatsApp login / QR flow if needed.
 
-### 5. Common Docker commands
+### Common Docker commands
 
 Run these from the project root:
 
@@ -114,10 +180,13 @@ docker compose down
 docker compose ps
 docker compose logs -f
 docker compose logs -f nanobot-gateway
+docker compose logs -f mock-cloud
 docker compose restart nanobot-gateway
 ```
 
 `docker compose down` stops the stack without deleting project files in this repository.
+
+Changes to `config.json` normally need `docker compose restart nanobot-gateway`. Changes to backend dependencies, the frontend, a Dockerfile, or Compose should use `docker compose up -d --build`.
 
 ## Key Features
 
@@ -172,13 +241,14 @@ docker compose restart nanobot-gateway
 - Docker
 - Docker Compose
 - Backend container built from the root `Dockerfile`
-- Frontend container built from `Insurance frontend/Dockerfile`
+- Frontend container built from `frontend/Dockerfile`
 - Optional server proxy Docker Compose stack under `server_proxy/`
 
 ## Services
 
 The main `docker-compose.yml` starts:
 
+- `mock-cloud`: deterministic local database, interview, and AI demo endpoints on `http://localhost:5050`
 - `nanobot-gateway`: backend launcher/API on `http://localhost:3456`
 - `nanobot-frontend`: web UI on `http://localhost:8080`
 

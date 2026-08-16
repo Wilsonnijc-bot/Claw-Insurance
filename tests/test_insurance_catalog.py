@@ -60,6 +60,10 @@ def test_catalog_config_accepts_supabase_fields() -> None:
                 "supabaseManagementToken": "sbp-token",
                 "supabaseCatalogTable": "insurance_products",
                 "supabaseCatalogTables": ["insurance_products", "dental_insurance"],
+                "dbProxy": {
+                    "baseUrl": "http://mock-cloud:5050",
+                    "apiKey": "demo-db-key",
+                },
                 "autoRestorePausedProject": True,
                 "restoreTimeoutSeconds": 120,
                 "cacheTtlSeconds": 120,
@@ -73,6 +77,8 @@ def test_catalog_config_accepts_supabase_fields() -> None:
     assert config.catalog.supabase_management_token == "sbp-token"
     assert config.catalog.supabase_catalog_table == "insurance_products"
     assert config.catalog.supabase_catalog_tables == ["insurance_products", "dental_insurance"]
+    assert config.catalog.db_proxy.base_url == "http://mock-cloud:5050"
+    assert config.catalog.db_proxy.api_key == "demo-db-key"
     assert config.catalog.auto_restore_paused_project is True
     assert config.catalog.restore_timeout_seconds == 120
     assert config.catalog.cache_ttl_seconds == 120
@@ -179,6 +185,40 @@ def test_supabase_repository_reads_both_raw_tables() -> None:
 
     assert [row["plan_id"] for row in rows] == ["p1", "d1"]
     assert all(row["source_file"] == "supabase" for row in rows)
+
+
+def test_supabase_repository_reads_catalog_through_db_proxy() -> None:
+    clear_catalog_cache()
+    settings = CatalogSettings(
+        db_proxy_url="http://mock-cloud:5050",
+        db_proxy_api_key="demo-db-key",
+        supabase_catalog_tables=("insurance_products",),
+        cache_ttl_seconds=0,
+    )
+    client = _FakeClient(
+        [
+            _FakeResponse(
+                200,
+                {
+                    "rows": [
+                        {
+                            "plan_id": "mock-1",
+                            "plan_name": "Mock Plan",
+                            "provider_company": "Demo Insurance",
+                            "plan_category": "health",
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    repo = SupabaseCatalogRepository(settings, client_factory=lambda **kwargs: client)
+
+    rows = repo.get_rows()
+
+    assert rows[0]["plan_id"] == "mock-1"
+    assert rows[0]["source_file"] == "supabase"
+    assert client.calls == [("POST", "http://mock-cloud:5050/query")]
 
 
 def test_supabase_repository_restores_inactive_project_and_retries() -> None:

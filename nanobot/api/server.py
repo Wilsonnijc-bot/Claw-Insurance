@@ -462,6 +462,7 @@ class ApiServer:
         """
         import subprocess
         from nanobot.runtime.gateway_runtime import (
+            bridge_cache_dir,
             build_whatsapp_bridge_env,
             get_bridge_dir,
             stop_whatsapp_bridge,
@@ -478,10 +479,10 @@ class ApiServer:
 
         # 2. Rebuild bridge from source (invalidates the cache)
         import shutil
-        build_dir = Path(__file__).resolve().parents[2] / ".bridge-build"
+        build_dir = bridge_cache_dir()
         if build_dir.exists():
             shutil.rmtree(build_dir)
-            logger.info("Deleted stale .bridge-build/ cache")
+            logger.info("Deleted stale WhatsApp bridge cache")
 
         bridge_dir = get_bridge_dir()
 

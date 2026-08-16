@@ -141,6 +141,12 @@ export function isSelfDirectChat(remoteJid: string, selfJid: string): boolean {
   return normalizeJidLocal(remote) === normalizeJidLocal(self);
 }
 
+// WhatsApp currently rejects Baileys fresh-device registration when it
+// advertises a native macOS/Windows Desktop sub-platform, closing with 428
+// before a QR can be emitted. A web-browser identity follows the supported
+// WhatsApp Web pairing path.
+export const BAILEYS_BROWSER_IDENTITY = Browsers.ubuntu('Chrome');
+
 export class WhatsAppClient {
   private sock: any = null;
   private options: WhatsAppClientOptions;
@@ -181,7 +187,7 @@ export class WhatsAppClient {
       version,
       logger,
       printQRInTerminal: false,
-      browser: Browsers.macOS('Desktop'),
+      browser: BAILEYS_BROWSER_IDENTITY,
       syncFullHistory: true,
       markOnlineOnConnect: false,
     });

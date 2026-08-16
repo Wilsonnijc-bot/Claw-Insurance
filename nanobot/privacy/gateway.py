@@ -27,7 +27,7 @@ class PrivacyDebugStore:
     """Persist raw and sanitized request/response payloads locally.
 
     Privacy pipeline step 4 side effect: write gateway-facing artifacts into
-    ``test_words/privacy_XXXXX.json`` so the exact raw-vs-sanitized prompt
+    ``state/debug/privacy/privacy_XXXXX.json`` so the sanitized request
     diff can be audited locally without exposing the raw outbound payload to
     the cloud.
     """

@@ -202,10 +202,12 @@ def test_config_example_uses_canonical_litellm_shape() -> None:
     config = Config.model_validate(payload)
 
     assert config.agents.defaults.provider == "litellm"
-    assert config.agents.defaults.model == "moonshot-v1-8k"
+    assert config.agents.defaults.model == "kimi-k3"
     assert config.gateway.port == 3456
     assert config.providers.litellm.base_url == "https://api.moonshot.cn/v1"
-    assert config.channels.whatsapp.delivery_mode == "send"
+    assert config.channels.whatsapp.delivery_mode == "draft"
+    assert config.interview_proxy.base_url == "http://mock-cloud:5050"
+    assert "catalog" not in payload
 
 
 def test_google_and_supabase_example_files_are_valid_json_objects() -> None:
@@ -216,6 +218,8 @@ def test_google_and_supabase_example_files_are_valid_json_objects() -> None:
     assert google_payload["model"] == "chirp_3"
     assert isinstance(supabase_payload, dict)
     assert isinstance(supabase_payload["supabaseCatalogTables"], list)
+    catalog = Config.model_validate({"catalog": supabase_payload}).catalog
+    assert catalog.db_proxy.base_url == "http://mock-cloud:5050"
 
 
 def test_pyproject_sdist_includes_canonical_example_files_only() -> None:

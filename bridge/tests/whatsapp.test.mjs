@@ -1,7 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { WhatsAppClient, extractPhoneFromJid, isSelfDirectChat, resolvePhoneIdentifier } from '../dist/whatsapp.js';
+import {
+  BAILEYS_BROWSER_IDENTITY,
+  WhatsAppClient,
+  extractPhoneFromJid,
+  isSelfDirectChat,
+  resolvePhoneIdentifier,
+} from '../dist/whatsapp.js';
+
+test('fresh-device pairing advertises a web browser instead of a rejected desktop identity', () => {
+  assert.equal(BAILEYS_BROWSER_IDENTITY[0], 'Ubuntu');
+  assert.equal(BAILEYS_BROWSER_IDENTITY[1], 'Chrome');
+});
 
 test('extractPhoneFromJid returns phone digits for legacy direct chat JIDs', () => {
   assert.equal(extractPhoneFromJid('85212345678@s.whatsapp.net'), '85212345678');

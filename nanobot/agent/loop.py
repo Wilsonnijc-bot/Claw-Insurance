@@ -234,8 +234,8 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
         self._project_root = Path(__file__).resolve().parents[2]
-        self._test_words_dir = self._project_root / "test_words"
-        self._test_counter_file = self._test_words_dir / ".counter"
+        self._privacy_debug_dir = self._project_root / "state" / "debug" / "privacy"
+        self._privacy_debug_counter_file = self._privacy_debug_dir / ".counter"
         # Privacy pipeline companion path:
         # AgentLoop writes local raw/sanitized snapshots for inspection using
         # the same deterministic sanitizer that protects cloud-bound payloads.
@@ -243,7 +243,7 @@ class AgentLoop:
             privacy_config or PrivacyGatewayConfig(),
             known_names=load_known_names(workspace),
         )
-        self._ensure_test_words_dir()
+        self._ensure_privacy_debug_dir()
         self._register_default_tools()
 
     def _context_for_session(self, session_key: str) -> ContextBuilder:
@@ -280,28 +280,28 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
-    def _ensure_test_words_dir(self) -> None:
-        """Create the test_words folder at repo root if needed."""
-        self._test_words_dir.mkdir(parents=True, exist_ok=True)
-        if not self._test_counter_file.exists():
-            self._test_counter_file.write_text("0\n", encoding="utf-8")
+    def _ensure_privacy_debug_dir(self) -> None:
+        """Create the project-local privacy debug directory when needed."""
+        self._privacy_debug_dir.mkdir(parents=True, exist_ok=True)
+        if not self._privacy_debug_counter_file.exists():
+            self._privacy_debug_counter_file.write_text("0\n", encoding="utf-8")
 
-    def _next_test_file_paths(self, *, client_tag: str = "") -> tuple[Path, Path]:
-        """Return the next sequential raw+sanitized test_words file paths.
+    def _next_privacy_debug_paths(self, *, client_tag: str = "") -> tuple[Path, Path]:
+        """Return the next sequential raw and sanitized privacy debug paths.
 
         When *client_tag* is provided the phone is embedded in the filename
         so that debug artefacts are visibly scoped to one client.
         """
         try:
-            raw = self._test_counter_file.read_text(encoding="utf-8").strip()
+            raw = self._privacy_debug_counter_file.read_text(encoding="utf-8").strip()
             current = int(raw) if raw else 0
         except (OSError, ValueError):
             current = 0
         next_index = current + 1
-        self._test_counter_file.write_text(f"{next_index}\n", encoding="utf-8")
+        self._privacy_debug_counter_file.write_text(f"{next_index}\n", encoding="utf-8")
         tag = f"_{client_tag}" if client_tag else ""
-        raw_path = self._test_words_dir / f"test_{next_index:05d}{tag}.txt"
-        sanitized_path = self._test_words_dir / f"test_{next_index:05d}{tag}_sanitized.txt"
+        raw_path = self._privacy_debug_dir / f"test_{next_index:05d}{tag}.txt"
+        sanitized_path = self._privacy_debug_dir / f"test_{next_index:05d}{tag}_sanitized.txt"
         return raw_path, sanitized_path
 
     @staticmethod
@@ -378,7 +378,7 @@ class AgentLoop:
                 session_key.split(":", 1)[1] if ":" in session_key else session_key
             )
             client_tag = client_key.phone if client_key else ""
-            out_raw, out_sanitized = self._next_test_file_paths(client_tag=client_tag)
+            out_raw, out_sanitized = self._next_privacy_debug_paths(client_tag=client_tag)
             generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S (%A) (%Z)")
             system_prompt = self._stringify_message_content(initial_messages[0].get("content", ""))
             user_payload = initial_messages[-1].get("content", "")
@@ -408,7 +408,7 @@ class AgentLoop:
             out_raw.write_text(raw_text, encoding="utf-8")
 
             # Privacy pipeline debug companion:
-            # sanitize the same turn snapshot so test_words/ can show a raw vs
+            # Sanitize the same turn snapshot so local debug files show a raw vs
             # sanitized comparison using the identical masking rules.
             sanitized_result = self._privacy_sanitizer.sanitize_chat_payload(
                 {"messages": initial_messages},
@@ -448,7 +448,7 @@ class AgentLoop:
             # Local-only artifact: sanitized snapshot with placeholder metadata.
             out_sanitized.write_text(sanitized_text, encoding="utf-8")
         except Exception:
-            logger.exception("Failed to write test_words snapshot")
+            logger.exception("Failed to write privacy debug snapshot")
 
     @staticmethod
     def _stringify_message_content(content: Any) -> str:

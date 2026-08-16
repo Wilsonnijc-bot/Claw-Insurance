@@ -36,10 +36,13 @@ def browser_bind_host(platform_name: str) -> str:
 def helper_install_dir(platform_name: str) -> Path:
     home = Path.home()
     if platform_name == "windows":
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            return Path(local_app_data) / "nanobot-host-cdp-helper"
-        return home / "AppData" / "Local" / "nanobot-host-cdp-helper"
+        configured = str(os.environ.get("NANOBOT_CDP_HELPER_DIR") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        # Microsoft Store Python virtualizes writes under LOCALAPPDATA into its
+        # package sandbox. A normal user-profile directory remains visible to
+        # Startup entries and scheduled tasks regardless of Python packaging.
+        return home / ".nanobot" / "host-cdp-helper"
     xdg_data_home = os.environ.get("XDG_DATA_HOME")
     if xdg_data_home:
         return Path(xdg_data_home) / "nanobot-host-cdp-helper"
@@ -85,6 +88,20 @@ def linux_autostart_path() -> Path:
 
 def windows_task_name() -> str:
     return WINDOWS_HELPER_LABEL
+
+
+def windows_startup_entry_path() -> Path:
+    app_data = os.environ.get("APPDATA")
+    base = Path(app_data) if app_data else Path.home() / "AppData" / "Roaming"
+    return (
+        base
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+        / f"{WINDOWS_HELPER_LABEL}.vbs"
+    )
 
 
 def expand_home(path_value: str) -> Path:
@@ -521,6 +538,7 @@ def _windows_launcher_script_contents(
         "@echo off",
         "setlocal",
         f'set "HELPER_PY={helper_py}"',
+        'set "LOG_FILE=%~dp0helper.log"',
     ]
     if token_file is not None:
         lines.append(f'set "TOKEN_FILE={token_file}"')
@@ -532,6 +550,7 @@ def _windows_launcher_script_contents(
         launch = f'  "{candidate_path}" "%HELPER_PY%" serve --host {host} --port {port}'
         if token_file is not None:
             launch += ' --token-file "%TOKEN_FILE%"'
+        launch += ' >> "%LOG_FILE%" 2>&1'
         lines.append(launch)
         lines.append("  exit /b %ERRORLEVEL%")
         lines.append(")")
@@ -726,6 +745,17 @@ def _windows_task_command(launcher_script: Path) -> str:
     return subprocess.list2cmdline([str(launcher_script)])
 
 
+def _windows_startup_entry_contents(launcher_script: Path) -> str:
+    escaped = str(launcher_script).replace('"', '""')
+    return "\r\n".join(
+        [
+            'Set shell = CreateObject("WScript.Shell")',
+            f'shell.Run Chr(34) & "{escaped}" & Chr(34), 0, False',
+            "",
+        ]
+    )
+
+
 def install_windows_helper(
     *,
     helper_module_file: str,
@@ -749,7 +779,7 @@ def install_windows_helper(
         capture_output=True,
         text=True,
     )
-    subprocess.run(
+    create_result = subprocess.run(
         [
             "schtasks",
             "/Create",
@@ -761,16 +791,29 @@ def install_windows_helper(
             _windows_task_command(launcher_script),
             "/F",
         ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["schtasks", "/Run", "/TN", task_name],
         check=False,
         capture_output=True,
         text=True,
     )
+    task_created = create_result.returncode == 0
+    startup_entry = windows_startup_entry_path()
+    if task_created:
+        subprocess.run(
+            ["schtasks", "/Run", "/TN", task_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        startup_entry.unlink(missing_ok=True)
+    else:
+        # Some managed Windows installations deny creating even a current-user
+        # scheduled task. The per-user Startup folder provides persistence
+        # without administrator privileges; WScript keeps the helper hidden.
+        startup_entry.parent.mkdir(parents=True, exist_ok=True)
+        startup_entry.write_text(
+            _windows_startup_entry_contents(launcher_script),
+            encoding="utf-8-sig",
+        )
 
     if not wait_for_helper(DEFAULT_HELPER_URL, timeout_s=5.0):
         _start_background_helper(launcher_script, "windows")
@@ -785,7 +828,10 @@ def install_windows_helper(
         "install_dir": str(install_dir),
         "helper_script": str(helper_python_script_path("windows")),
         "launcher_script": str(launcher_script),
-        "task_name": task_name,
+        "task_name": task_name if task_created else "",
+        "startup_entry": str(startup_entry) if not task_created else "",
+        "autostart_method": "scheduled_task" if task_created else "startup_folder",
+        "task_error": str(create_result.stderr or create_result.stdout or "").strip(),
         "helper_url": DEFAULT_HELPER_URL,
         "token_path": str(token_file) if token_file is not None else "",
     }

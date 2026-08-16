@@ -105,7 +105,8 @@ def test_install_linux_helper_writes_service_and_autostart(monkeypatch, tmp_path
 
 
 def test_install_windows_helper_creates_scheduled_task(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setenv("NANOBOT_CDP_HELPER_DIR", str(tmp_path / "helper"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     monkeypatch.setattr(
         windows_helper._common,
         "wait_for_helper",
@@ -126,3 +127,49 @@ def test_install_windows_helper_creates_scheduled_task(monkeypatch, tmp_path: Pa
     assert Path(result["token_path"]).read_text(encoding="utf-8") == "windows-secret"
     assert any(command[:2] == ["schtasks", "/Create"] for command in calls)
     assert any(command[:2] == ["schtasks", "/Run"] for command in calls)
+    assert result["autostart_method"] == "scheduled_task"
+    assert result["startup_entry"] == ""
+
+
+def test_install_windows_helper_falls_back_to_user_startup_folder(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("NANOBOT_CDP_HELPER_DIR", str(tmp_path / "helper"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setattr(
+        windows_helper._common,
+        "wait_for_helper",
+        lambda helper_url=windows_helper.DEFAULT_HELPER_URL, timeout_s=5.0: True,
+    )
+
+    def fake_run(args, check=False, capture_output=False, text=False):
+        return SimpleNamespace(
+            returncode=1 if list(args)[:2] == ["schtasks", "/Create"] else 0,
+            stdout="",
+            stderr="Access is denied." if list(args)[:2] == ["schtasks", "/Create"] else "",
+        )
+
+    monkeypatch.setattr(windows_helper._common.subprocess, "run", fake_run)
+
+    result = windows_helper.install_windows_helper(helper_token="windows-secret")
+
+    startup_entry = Path(result["startup_entry"])
+    assert result["task_name"] == ""
+    assert result["autostart_method"] == "startup_folder"
+    assert result["task_error"] == "Access is denied."
+    assert startup_entry.exists()
+    assert "WScript.Shell" in startup_entry.read_text(encoding="utf-8-sig")
+    assert "run-helper.cmd" in startup_entry.read_text(encoding="utf-8-sig")
+
+
+def test_windows_launcher_writes_a_diagnostic_log(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("NANOBOT_CDP_HELPER_DIR", str(tmp_path / "helper"))
+    launcher_script, _ = windows_helper._common._write_launcher_script(
+        platform_name="windows",
+        helper_module_file=windows_helper.__file__,
+        shared_module_file=windows_helper._common.__file__,
+        host="127.0.0.1",
+        helper_token="windows-secret",
+    )
+
+    contents = launcher_script.read_text(encoding="utf-8")
+    assert 'set "LOG_FILE=%~dp0helper.log"' in contents
+    assert '>> "%LOG_FILE%" 2>&1' in contents

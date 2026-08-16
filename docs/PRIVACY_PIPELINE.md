@@ -33,7 +33,7 @@ There are actually **two related privacy paths** in the repo:
    - can block the request if risky text remains
 
 2. **Local debug snapshot sanitization**
-   - used to write readable files into `test_words/`
+   - used to write readable files into `state/debug/privacy/`
    - lets you compare raw and sanitized prompt material locally
    - does not send anything by itself
 
@@ -46,17 +46,17 @@ These two paths reuse the same core sanitizer.
 ### Core pipeline files
 
 - `nanobot/config/schema.py` — privacy config model
-- `nanobot/cli/commands.py` — decides whether to start and route through the local privacy gateway
+- `nanobot/runtime/gateway_runtime.py` — decides whether to start and route through the local privacy gateway
 - `nanobot/privacy/gateway_server.py` — local HTTP server exposing `/v1/chat/completions`
 - `nanobot/privacy/gateway.py` — request handling, sanitization, forwarding, debug persistence
 - `nanobot/privacy/sanitizer.py` — deterministic masking engine
-- `nanobot/agent/loop.py` — local raw/sanitized snapshot writer for `test_words/`
+- `nanobot/agent/loop.py` — local raw/sanitized snapshot writer for `state/debug/privacy/`
 
 ### Artifacts and tests
 
-- `test_words/test_XXXXX.txt` — raw prompt snapshot
-- `test_words/test_XXXXX_sanitized.txt` — sanitized prompt snapshot with `SANITIZER_META`
-- `test_words/privacy_XXXXX.json` — sanitized request/response record from the gateway
+- `state/debug/privacy/test_XXXXX.txt` — raw prompt snapshot
+- `state/debug/privacy/test_XXXXX_sanitized.txt` — sanitized prompt snapshot with `SANITIZER_META`
+- `state/debug/privacy/privacy_XXXXX.json` — sanitized request/response record from the gateway
 - `tests/test_privacy_sanitizer.py` — rule-level sanitizer tests
 - `tests/test_privacy_gateway.py` — gateway forwarding and fail-closed tests
 
@@ -113,31 +113,31 @@ Important notes:
 - `text_only_scope=True` means the sanitizer is focused on text blocks.
 - `enable_ner_assist` is present in config/env wiring, but there is no active NER implementation in the current sanitizer code path.
 
-### Step 2 — CLI decides whether requests should go through the local privacy gateway
+### Step 2 — Gateway runtime decides whether requests use the local privacy gateway
 
-File: `nanobot/cli/commands.py`
+File: `nanobot/runtime/gateway_runtime.py`
 
-Function: `_maybe_enable_privacy_gateway()`
+Function: `maybe_enable_privacy_gateway()`
 
 This is the routing switch.
 
 Current behavior:
 
 - read the active model/provider from config
-- if provider is **not** `custom`, do nothing
+- if provider is **not** `litellm`, do nothing
 - if privacy gateway is disabled, do nothing
 - otherwise:
   - determine the real upstream API base
   - start the local privacy gateway process
-  - rewrite `config.providers.custom.api_base` to the local gateway URL
+  - rewrite `config.providers.litellm.base_url` to the local gateway URL
 
-This means the privacy gateway is currently used specifically for the `custom` provider path.
+This means the privacy gateway is currently used specifically for the LiteLLM provider path.
 
 Related helper functions:
 
-- `_privacy_gateway_url()` builds `http://<host>:<port>/v1`
-- `_build_privacy_gateway_env()` exports the real upstream and privacy flags to the child process
-- `_start_privacy_gateway()` launches `python -m nanobot.privacy.gateway_server`
+- `privacy_gateway_url()` builds `http://<host>:<port>/v1`
+- `build_privacy_gateway_env()` exports the real upstream and privacy flags to the child process
+- `start_privacy_gateway()` launches `python -m nanobot.privacy.gateway_server`
 
 ### Step 3 — The local gateway server accepts OpenAI-compatible requests
 
@@ -153,7 +153,7 @@ Responsibilities:
 - pass the request into `PrivacyGatewayService`
 - write the normalized response back to the client
 
-`main()` rebuilds `PrivacyGatewayConfig` from environment variables set by the CLI.
+`main()` rebuilds `PrivacyGatewayConfig` from environment variables set by the gateway runtime.
 
 ### Step 4 — `PrivacyGatewayService` handles one request
 
@@ -297,10 +297,10 @@ This path is easy to confuse with the gateway, but it is separate.
 `_write_turn_snapshot()` does the following for each prompt snapshot:
 
 1. build a raw local snapshot of system prompt, history, memory, and user payload
-2. write it to `test_words/test_XXXXX.txt`
+2. write it to `state/debug/privacy/test_XXXXX.txt`
 3. run the same `TextPrivacySanitizer` on the prompt messages
 4. run `redact_text_for_debug()` on `memory/MEMORY.md` and `memory/HISTORY.md`
-5. write a sanitized snapshot to `test_words/test_XXXXX_sanitized.txt`
+5. write a sanitized snapshot to `state/debug/privacy/test_XXXXX_sanitized.txt`
 6. include `SANITIZER_META`, including `blocked`, `reasons`, and `placeholder_map`
 
 This path is for inspection and debugging. It does not itself decide cloud routing.
@@ -309,7 +309,7 @@ This path is for inspection and debugging. It does not itself decide cloud routi
 
 ## 6. Debug artifacts and what each one means
 
-### `test_words/test_XXXXX.txt`
+### `state/debug/privacy/test_XXXXX.txt`
 
 Raw local snapshot. Usually includes:
 
@@ -320,7 +320,7 @@ Raw local snapshot. Usually includes:
 - history text
 - user payload
 
-### `test_words/test_XXXXX_sanitized.txt`
+### `state/debug/privacy/test_XXXXX_sanitized.txt`
 
 Sanitized version of the same snapshot. Adds:
 
@@ -329,7 +329,7 @@ Sanitized version of the same snapshot. Adds:
 - `reasons`
 - `placeholder_map`
 
-### `test_words/privacy_XXXXX.json`
+### `state/debug/privacy/privacy_XXXXX.json`
 
 Gateway-generated sanitized request/response record. Fields include:
 
@@ -396,12 +396,12 @@ The runtime context block may also contain `Sender Name: ...`, but that line is 
 
 Current masking is based on regexes, known key names, and exact-token replay from the session cache.
 
-### The `workspace` argument is not what chooses `test_words/`
+### The `workspace` argument is not what chooses the debug directory
 
-`privacy_debug_dir()` currently returns the repo-root `test_words/` directory via:
+`privacy_debug_dir()` returns a project-local runtime directory via:
 
 ```text
-Path(__file__).resolve().parents[2] / "test_words"
+project_path("state", "debug", "privacy")
 ```
 
 So the gateway debug directory is currently anchored to the repo, not dynamically to `workspace`.
@@ -421,9 +421,9 @@ The config and environment variable exist, but there is no active NER-assisted m
 
 If you want to understand the code quickly, read in this order:
 
-1. `PRIVACY_PIPELINE.md`
+1. `docs/PRIVACY_PIPELINE.md`
 2. `nanobot/config/schema.py` — config surface
-3. `nanobot/cli/commands.py` — when routing is enabled
+3. `nanobot/runtime/gateway_runtime.py` — when routing is enabled
 4. `nanobot/privacy/gateway_server.py` — HTTP entrypoint
 5. `nanobot/privacy/gateway.py` — request lifecycle
 6. `nanobot/privacy/sanitizer.py` — masking engine
@@ -435,4 +435,4 @@ If you want to understand the code quickly, read in this order:
 
 ## 10. One-sentence mental model
 
-Nanobot currently protects cloud-bound prompts by routing `custom` provider traffic through a local OpenAI-compatible gateway that sanitizes outbound text, validates the masked result, optionally blocks unsafe payloads, and writes local debug artifacts — but it does **not** currently restore original private values back into responses.
+Nanobot currently protects cloud-bound prompts by routing configured LiteLLM provider traffic through a local OpenAI-compatible gateway that sanitizes outbound text, validates the masked result, optionally blocks unsafe payloads, and writes local debug artifacts — but it does **not** currently restore original private values back into responses.

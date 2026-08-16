@@ -123,7 +123,7 @@ class SanitizationResult:
 class TextPrivacySanitizer:
     """Sanitize text payloads before they leave the local machine.
 
-    Privacy pipeline step 5 in ``PRIVACY_PIPELINE.md``.
+    Privacy pipeline step 5 in ``docs/PRIVACY_PIPELINE.md``.
     The sanitizer is deterministic: it uses structured-field rules, regex
     matching, and a session-scoped placeholder cache rather than another model.
     """
@@ -633,11 +633,11 @@ class TextPrivacySanitizer:
 def privacy_debug_dir(workspace: Path) -> Path:
     """Return the local directory used for privacy debug payloads.
 
-    Note: the current implementation anchors this to the repo's ``test_words/``
-    directory rather than deriving it from ``workspace``.
+    The directory is anchored under project-local runtime state rather than
+    deriving it from ``workspace``.
     """
     from nanobot.utils.paths import project_path
-    return project_path("test_words")
+    return project_path("state", "debug", "privacy")
 
 
 def load_known_names(workspace: Path) -> set[str]:

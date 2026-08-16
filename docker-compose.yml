@@ -13,19 +13,46 @@ x-backend-common: &backend-common
     WEB_CDP_HELPER_PLATFORM: ${WEB_CDP_HELPER_PLATFORM-}
     WEB_HOST_PROFILE_DIR: ${WEB_HOST_PROFILE_DIR-./whatsapp-web}
     WEB_HISTORY_SYNC_ENABLED: ${WEB_HISTORY_SYNC_ENABLED-true}
+    BRIDGE_STARTUP_TIMEOUT_SECONDS: ${BRIDGE_STARTUP_TIMEOUT_SECONDS-60}
   volumes:
     - .:/workspace
   extra_hosts:
     - "host.docker.internal:host-gateway"
 
 services:
+  mock-cloud:
+    container_name: claw-insurance-mock-cloud
+    <<: *backend-common
+    entrypoint: ["python3", "-m", "nanobot.demo.mock_cloud"]
+    command: ["--port", "5050"]
+    environment:
+      MOCK_DB_API_KEY: demo-db-key
+      MOCK_INTERVIEW_API_KEY: demo-interview-key
+      MOCK_AI_API_KEY: demo-ai-key
+    restart: unless-stopped
+    ports:
+      - "5050:5050"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   nanobot-gateway:
     container_name: nanobot-gateway
     <<: *backend-common
     command: ["--api-port", "3456"]
+    depends_on:
+      mock-cloud:
+        condition: service_healthy
     restart: unless-stopped
     ports:
       - "3456:3456"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3456/api/status', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     deploy:
       resources:
         limits:
@@ -38,10 +65,11 @@ services:
   nanobot-frontend:
     container_name: nanobot-frontend
     build:
-      context: "./Insurance frontend"
+      context: "./frontend"
       dockerfile: Dockerfile
     depends_on:
-      - nanobot-gateway
+      nanobot-gateway:
+        condition: service_healthy
     restart: unless-stopped
     ports:
       - "8080:80"

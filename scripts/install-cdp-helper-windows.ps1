@@ -7,10 +7,83 @@ if ($env:OS -ne "Windows_NT") {
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 
+function Test-PythonRuntime {
+  param(
+    [Parameter(Mandatory = $true)][string]$Executable,
+    [string[]]$PrefixArgs = @()
+  )
+
+  try {
+    & $Executable @PrefixArgs -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" *> $null
+    return $LASTEXITCODE -eq 0
+  } catch {
+    return $false
+  }
+}
+
+function Add-PythonCandidate {
+  param(
+    [System.Collections.Generic.List[object]]$Candidates,
+    [string]$Executable,
+    [string[]]$PrefixArgs = @()
+  )
+
+  if (-not $Executable) {
+    return
+  }
+  $key = "$Executable|$($PrefixArgs -join ' ')"
+  if ($Candidates | Where-Object { $_.Key -eq $key }) {
+    return
+  }
+  $Candidates.Add([pscustomobject]@{
+    Key = $key
+    Executable = $Executable
+    PrefixArgs = $PrefixArgs
+  })
+}
+
+$PythonCandidates = [System.Collections.Generic.List[object]]::new()
+foreach ($commandName in @("python", "python3")) {
+  $command = Get-Command $commandName -ErrorAction SilentlyContinue
+  if ($command) {
+    Add-PythonCandidate $PythonCandidates $command.Source
+  }
+}
+
 $PyLauncher = Get-Command py -ErrorAction SilentlyContinue
-$Python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $Python -and -not $PyLauncher) {
-  throw "Python is required for the host CDP helper installer."
+if ($PyLauncher) {
+  Add-PythonCandidate $PythonCandidates $PyLauncher.Source @("-3")
+}
+
+# A stale Python Launcher or registry entry can point at a removed OneDrive
+# installation. Discover Microsoft Store Python packages directly as a robust
+# fallback, then validate every candidate before using it.
+try {
+  $StorePackages = Get-AppxPackage -Name "PythonSoftwareFoundation.Python*" -ErrorAction Stop |
+    Sort-Object Version -Descending
+  foreach ($package in $StorePackages) {
+    $majorMinor = "$($package.Version.Major).$($package.Version.Minor)"
+    foreach ($name in @("python$majorMinor.exe", "python.exe", "python3.exe")) {
+      $candidatePath = Join-Path $package.InstallLocation $name
+      if (Test-Path -LiteralPath $candidatePath) {
+        Add-PythonCandidate $PythonCandidates $candidatePath
+      }
+    }
+  }
+} catch {
+  # Non-Store Python installations are already covered by Get-Command above.
+}
+
+$PythonRuntime = $null
+foreach ($candidate in $PythonCandidates) {
+  if (Test-PythonRuntime $candidate.Executable $candidate.PrefixArgs) {
+    $PythonRuntime = $candidate
+    break
+  }
+}
+
+if (-not $PythonRuntime) {
+  throw "Python 3.10 or newer is required for the host CDP helper installer. Install Python, then run this script again."
 }
 
 $Code = @'
@@ -59,10 +132,15 @@ update_env_file(root / ".env", values)
 
 print("Host CDP helper installed and started for Windows.")
 print(f"Helper health URL on host: {DEFAULT_HELPER_URL}/healthz")
-print(f"Scheduled task: {result['task_name']}")
+if result.get("task_name"):
+    print(f"Scheduled task: {result['task_name']}")
+else:
+    print(f"Startup entry: {result.get('startup_entry', '')}")
+    print("Windows denied scheduled-task creation, so the installer used the current-user Startup folder instead.")
 print("Docker Compose will read these values from .env:")
 for key, value in values.items():
-    print(f"  {key}={value}")
+    shown = "<redacted>" if key == "WEB_CDP_HELPER_TOKEN" else value
+    print(f"  {key}={shown}")
 print("Restart Docker Compose after changing host CDP helper settings.")
 '@
 
@@ -70,13 +148,10 @@ $TempScript = Join-Path ([System.IO.Path]::GetTempPath()) ("nanobot-cdp-helper-"
 Set-Content -Path $TempScript -Value $Code -Encoding UTF8
 
 try {
-  if ($PyLauncher) {
-    & $PyLauncher.Source -3 $TempScript $RootDir
-    $ExitCode = $LASTEXITCODE
-  } else {
-    & $Python.Source $TempScript $RootDir
-    $ExitCode = $LASTEXITCODE
-  }
+  $PythonExecutable = $PythonRuntime.Executable
+  $PythonPrefixArgs = @($PythonRuntime.PrefixArgs)
+  & $PythonExecutable @PythonPrefixArgs $TempScript $RootDir
+  $ExitCode = $LASTEXITCODE
   if ($ExitCode -ne 0) {
     exit $ExitCode
   }

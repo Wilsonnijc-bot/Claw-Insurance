@@ -329,7 +329,10 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="https://api.moonshot.ai/v1",  # intl; use api.moonshot.cn for China
         strip_model_prefix=False,
-        model_overrides=(("kimi-k2.5", {"temperature": 1.0}),),
+        model_overrides=(
+            ("kimi-k2.5", {"temperature": 1.0}),
+            ("kimi-k3", {"temperature": 1.0}),
+        ),
     ),
     # MiniMax: needs "minimax/" prefix for LiteLLM routing.
     # Uses OpenAI-compatible API at api.minimax.io/v1.

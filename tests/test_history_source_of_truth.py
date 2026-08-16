@@ -199,7 +199,7 @@ async def test_auto_draft_does_not_write_unsent_content_to_session_jsonl(tmp_pat
 
 
 def test_vite_config_has_no_messages_view_fallback() -> None:
-    config_path = Path(__file__).resolve().parents[1] / "Insurance frontend" / "vite.config.ts"
+    config_path = Path(__file__).resolve().parents[1] / "frontend" / "vite.config.ts"
     content = config_path.read_text(encoding="utf-8")
 
     assert "messages-view-fallback" not in content
@@ -210,10 +210,10 @@ def test_vite_config_has_no_messages_view_fallback() -> None:
 def test_frontend_thread_files_do_not_persist_history_to_browser_storage() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     files = [
-        repo_root / "Insurance frontend" / "src" / "components" / "MessageCenter" / "MessageThread.tsx",
-        repo_root / "Insurance frontend" / "src" / "hooks" / "useNanobot.ts",
-        repo_root / "Insurance frontend" / "src" / "services" / "api.ts",
-        repo_root / "Insurance frontend" / "src" / "services" / "websocket.ts",
+        repo_root / "frontend" / "src" / "components" / "MessageCenter" / "MessageThread.tsx",
+        repo_root / "frontend" / "src" / "hooks" / "useNanobot.ts",
+        repo_root / "frontend" / "src" / "services" / "api.ts",
+        repo_root / "frontend" / "src" / "services" / "websocket.ts",
     ]
 
     for path in files:

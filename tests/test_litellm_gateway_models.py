@@ -50,6 +50,36 @@ async def test_litellm_gateway_chat_uses_litellm_proxy_model_for_kimi():
 
 
 @pytest.mark.asyncio
+async def test_litellm_gateway_forces_kimi_k3_supported_temperature():
+    provider = LiteLLMProvider(
+        api_key="sk-test",
+        api_base="http://127.0.0.1:4000",
+        default_model="kimi-k3",
+        provider_name="litellm",
+    )
+    fake_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="ok"),
+                finish_reason="stop",
+            )
+        ],
+        usage=None,
+    )
+
+    with patch("nanobot.providers.litellm_provider.acompletion", autospec=True) as mock_completion:
+        mock_completion.return_value = fake_response
+
+        await provider.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            model="kimi-k3",
+            temperature=0.1,
+        )
+
+    assert mock_completion.await_args.kwargs["temperature"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_litellm_gateway_surfaces_invalid_proxy_token_as_actionable_error():
     provider = LiteLLMProvider(
         api_key="sk-test",

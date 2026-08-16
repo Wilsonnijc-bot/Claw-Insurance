@@ -1,12 +1,16 @@
 {
-  "supabaseUrl": "https://znhoybdxcwlatsoqmbnt.supabase.co",
+  "supabaseUrl": "",
   "supabaseAnonKey": "",
-  "supabaseProjectRef": "znhoybdxcwlatsoqmbnt",
+  "supabaseProjectRef": "",
   "supabaseCatalogTables": [
     "insurance_products",
     "dental_insurance"
   ],
   "autoRestorePausedProject": false,
   "restoreTimeoutSeconds": 300,
-  "cacheTtlSeconds": 300
+  "cacheTtlSeconds": 0,
+  "dbProxy": {
+    "baseUrl": "http://mock-cloud:5050",
+    "apiKey": "demo-db-key"
+  }
 }

@@ -303,7 +303,7 @@ class HeartbeatConfig(Base):
 class PrivacyGatewayConfig(Base):
     """Local privacy gateway configuration.
 
-    Privacy pipeline step 1 in ``PRIVACY_PIPELINE.md``.
+    Privacy pipeline step 1 in ``docs/PRIVACY_PIPELINE.md``.
     These fields control whether LiteLLM endpoint traffic is rerouted through
     the local privacy gateway before leaving the machine.
     """
@@ -369,6 +369,13 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class DbProxyConfig(Base):
+    """Configuration for the read-only insurance catalog proxy."""
+
+    base_url: str = ""
+    api_key: str = ""
+
+
 class CatalogConfig(Base):
     """Insurance catalog backend configuration."""
 
@@ -378,6 +385,7 @@ class CatalogConfig(Base):
     supabase_management_token: str = ""
     supabase_catalog_table: str = ""
     supabase_catalog_tables: list[str] = Field(default_factory=list)
+    db_proxy: DbProxyConfig = Field(default_factory=DbProxyConfig)
     auto_restore_paused_project: bool = True
     restore_timeout_seconds: int = 300
     cache_ttl_seconds: int = 300

@@ -3,6 +3,13 @@ import assert from 'node:assert/strict';
 
 import { HistoryParser } from '../dist/history.js';
 
+// The test runner can execute inside the Docker gateway, where real host-helper
+// settings are present. Keep unit tests deterministic unless a helper is passed
+// explicitly to the HistoryParser constructor.
+delete process.env.WEB_CDP_HELPER_URL;
+delete process.env.WEB_CDP_HELPER_TOKEN;
+delete process.env.WEB_HOST_PROFILE_DIR;
+
 class FakeLocator {
   constructor(page, role, index = null) {
     this.page = page;
@@ -704,7 +711,7 @@ test('scrapeHistory reuses an attached CDP page when it is already usable', asyn
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -745,7 +752,7 @@ test('scrapeHistory asks the macOS helper to launch or adopt a host CDP browser 
     connector,
     'cdp',
     'http://host.docker.internal:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -781,7 +788,7 @@ test('scrapeHistory asks the macOS helper to launch or adopt a host CDP browser 
       endpointUrl: 'http://host.docker.internal:9222',
       profileDir: '/host/wa-profile',
       startUrl: 'https://web.whatsapp.com/',
-      chromePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      chromePath: 'test-chrome',
       forceNewWindow: false,
     },
   ]);
@@ -808,7 +815,7 @@ test('scrapeHistory waits for refreshed search results and does not click stale 
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -843,7 +850,7 @@ test('scrapeHistory does not reopen a CDP window for true chat_not_found results
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -904,7 +911,7 @@ test('scrapeHistory retries in a fresh CDP window when attached page search cann
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -963,7 +970,7 @@ test('scrapeHistory retries in a fresh CDP window when the clicked chat does not
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -1031,7 +1038,7 @@ test('scrapeHistory prefers the newest WhatsApp page after a fresh-window retry'
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -1100,7 +1107,7 @@ test('scrapeHistory retries in a fresh CDP window when the attached page is not 
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -1135,7 +1142,7 @@ test('scrapeHistory reports window_launch_failed when the host helper cannot lau
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();
@@ -1203,7 +1210,7 @@ test('scrapeHistory returns login_required after a fresh-window retry when Whats
     connector,
     'cdp',
     'http://127.0.0.1:9222',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    'test-chrome',
     (command, args, options) => {
       spawnCalls.push({ command, args, options });
       return new FakeSpawnedProcess();

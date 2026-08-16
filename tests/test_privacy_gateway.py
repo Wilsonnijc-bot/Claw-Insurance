@@ -66,7 +66,7 @@ def test_gateway_endpoint_sanitizes_and_forwards_exact_cloud_payload(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr("nanobot.privacy.gateway.privacy_debug_dir", lambda workspace: tmp_path / "test_words")
+    monkeypatch.setattr("nanobot.privacy.gateway.privacy_debug_dir", lambda workspace: tmp_path / "privacy_debug")
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
 
     upstream = _RecordingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
@@ -118,7 +118,7 @@ def test_gateway_endpoint_sanitizes_and_forwards_exact_cloud_payload(
     assert UNKNOWN_SENDER_NAME in forwarded_text
     assert UNKNOWN_PHONE in forwarded_text
 
-    debug_file = tmp_path / "test_words" / "privacy_00001.json"
+    debug_file = tmp_path / "privacy_debug" / "privacy_00001.json"
     assert debug_file.exists()
     debug_payload = json.loads(debug_file.read_text(encoding="utf-8"))
     assert debug_payload["raw_request"] == payload
@@ -133,7 +133,7 @@ def test_gateway_fail_closed_returns_local_safe_message_and_skips_upstream(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr("nanobot.privacy.gateway.privacy_debug_dir", lambda workspace: tmp_path / "test_words")
+    monkeypatch.setattr("nanobot.privacy.gateway.privacy_debug_dir", lambda workspace: tmp_path / "privacy_debug")
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
 
     service = PrivacyGatewayService(
@@ -153,7 +153,7 @@ def test_gateway_fail_closed_returns_local_safe_message_and_skips_upstream(
 
     assert response.status_code == 200
     assert "can't send this request to the cloud model" in body["choices"][0]["message"]["content"]
-    debug_payload = json.loads((tmp_path / "test_words" / "privacy_00001.json").read_text(encoding="utf-8"))
+    debug_payload = json.loads((tmp_path / "privacy_debug" / "privacy_00001.json").read_text(encoding="utf-8"))
     assert debug_payload["raw_request"] == payload
     assert debug_payload["raw_prompt"] == payload["messages"]
     assert debug_payload["sanitized_prompt"] == payload["messages"]

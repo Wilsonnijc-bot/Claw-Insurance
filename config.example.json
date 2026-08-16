@@ -1,31 +1,40 @@
 {
   "providers": {
     "litellm": {
-      "baseUrl": "http://127.0.0.1:4000",
-      "apiKey": "your-litellm-master-key"
+      "baseUrl": "https://api.moonshot.cn/v1",
+      "apiKey": "your-openai-compatible-api-key"
     }
   },
   "agents": {
     "defaults": {
-      "model": "kimi-v1-8k",
-      "provider": "litellm"
+      "model": "kimi-k3",
+      "provider": "litellm",
+      "temperature": 1.0
     }
   },
   "channels": {
     "whatsapp": {
       "enabled": true,
-      "deliveryMode": "send",
+      "deliveryMode": "draft",
       "bridgeUrl": "ws://localhost:3001"
     }
   },
-  "catalog": {
-    "db_proxy": {
-      "baseUrl": "http://127.0.0.1:5000",
-      "apiKey": "your-db-proxy-api-key"
+  "interviewProxy": {
+    "baseUrl": "http://mock-cloud:5050",
+    "apiKey": "demo-interview-key"
+  },
+  "privacyGateway": {
+    "enabled": true,
+    "failClosed": true,
+    "saveRedactedDebug": false,
+    "textOnlyScope": true
+  },
+  "gateway": {
+    "heartbeat": {
+      "enabled": false
     }
   },
-  "interviewProxy": {
-    "baseUrl": "http://127.0.0.1:5001",
-    "apiKey": "your-interview-proxy-api-key"
+  "tools": {
+    "restrictToWorkspace": true
   }
 }

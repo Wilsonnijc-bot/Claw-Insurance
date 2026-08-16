@@ -154,11 +154,16 @@ def start_privacy_gateway(config: Config, upstream_base: str):
     raise RuntimeError("Privacy gateway did not become ready in time")
 
 
-def get_bridge_dir() -> Path:
-    """Return the cached WhatsApp bridge directory, building it when needed."""
+def bridge_cache_dir() -> Path:
+    """Return the project-local runtime cache used by the WhatsApp bridge."""
     from nanobot.utils.paths import project_root
 
-    user_bridge = project_root() / ".bridge-build"
+    return project_root() / "state" / "cache" / "whatsapp-bridge"
+
+
+def get_bridge_dir() -> Path:
+    """Return the cached WhatsApp bridge directory, building it when needed."""
+    user_bridge = bridge_cache_dir()
 
     if not shutil.which("npm"):
         raise RuntimeError("npm not found. The Docker image must include Node.js and npm.")
@@ -330,7 +335,15 @@ def start_whatsapp_bridge(config: Config):
         start_new_session=True,
     )
 
-    deadline = time.time() + 10
+    # Importing Baileys and its transitive modules can take more than ten
+    # seconds on Docker Desktop, especially on the first Windows launch.
+    # Keep the timeout bounded while allowing operators to tune slow hosts.
+    try:
+        startup_timeout = float(os.environ.get("BRIDGE_STARTUP_TIMEOUT_SECONDS", "60"))
+    except ValueError:
+        startup_timeout = 60.0
+    startup_timeout = min(max(startup_timeout, 5.0), 120.0)
+    deadline = time.time() + startup_timeout
     while time.time() < deadline:
         if proc.poll() is not None:
             raise RuntimeError(f"WhatsApp bridge exited early with code {proc.returncode}")
@@ -340,7 +353,9 @@ def start_whatsapp_bridge(config: Config):
         time.sleep(0.2)
 
     stop_whatsapp_bridge(proc)
-    raise RuntimeError("WhatsApp bridge did not become ready in time")
+    raise RuntimeError(
+        f"WhatsApp bridge did not become ready within {startup_timeout:g} seconds"
+    )
 
 
 def stop_whatsapp_bridge(proc) -> None:

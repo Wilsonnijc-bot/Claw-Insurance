@@ -6,7 +6,6 @@
 *.pyc
 dist/
 build/
-docs/
 *.egg-info/
 *.egg
 *.pyc
@@ -42,10 +41,7 @@ supabaseconfig.json
 data/whatsapp_reply_targets.json
 secrets/*.json
 !secrets/.gitkeep
-test_words/*
-!test_words/.gitkeep
 .cli-history
-.bridge-build/
 .nanobot-bin/
 .nanobot-legacy/
 HEARTBEAT.md

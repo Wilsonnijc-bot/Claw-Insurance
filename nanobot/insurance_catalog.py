@@ -235,6 +235,21 @@ class CsvCatalogRepository:
                     rows.append(_normalize_row(raw, source_file=path.name))
         return rows
 
+
+class SupabaseCatalogRepository:
+    """Read-only Supabase-backed product catalog with a small in-process cache."""
+
+    def __init__(
+        self,
+        settings: CatalogSettings,
+        *,
+        client_factory: Callable[..., httpx.Client] = httpx.Client,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+    ) -> None:
+        self._settings = settings
+        self._client_factory = client_factory
+        self._page_size = max(page_size, 1)
+
     def _fetch_table_rows_via_proxy(
         self,
         client: httpx.Client,
@@ -268,7 +283,7 @@ class CsvCatalogRepository:
             except Exception:
                 raise CatalogUnavailableError("DB proxy returned non-JSON payload.")
 
-            # Accept either a top-level list or an object with 'rows' list
+            # Accept either a top-level list or an object with 'rows' list.
             if isinstance(payload_json, list):
                 batch_src = payload_json
             elif isinstance(payload_json, dict) and isinstance(payload_json.get("rows"), list):
@@ -288,21 +303,6 @@ class CsvCatalogRepository:
                 break
             offset += len(batch_src)
         return rows
-
-
-class SupabaseCatalogRepository:
-    """Read-only Supabase-backed product catalog with a small in-process cache."""
-
-    def __init__(
-        self,
-        settings: CatalogSettings,
-        *,
-        client_factory: Callable[..., httpx.Client] = httpx.Client,
-        page_size: int = _DEFAULT_PAGE_SIZE,
-    ) -> None:
-        self._settings = settings
-        self._client_factory = client_factory
-        self._page_size = max(page_size, 1)
 
     def get_rows(self) -> list[dict[str, Any]]:
         cache_key = (
