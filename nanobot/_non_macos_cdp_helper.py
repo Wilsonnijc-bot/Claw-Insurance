@@ -470,6 +470,14 @@ def wait_for_helper(helper_url: str = DEFAULT_HELPER_URL, timeout_s: float = 5.0
 
 def _python_candidates(platform_name: str) -> list[str]:
     candidates: list[str] = []
+    if platform_name == "windows":
+        # The installer records the validated executable it actually launched.
+        # Microsoft Store Python can report a user alias as ``sys.executable``;
+        # keeping the real package executable first avoids a login-time race
+        # while the WindowsApps execution aliases are still initializing.
+        configured = str(os.environ.get("NANOBOT_CDP_PYTHON_EXECUTABLE") or "").strip()
+        if configured:
+            candidates.append(configured)
     if sys.executable:
         candidates.append(sys.executable)
     exe = Path(sys.executable) if sys.executable else None
@@ -536,9 +544,15 @@ def _windows_launcher_script_contents(
 ) -> str:
     lines = [
         "@echo off",
-        "setlocal",
+        "setlocal EnableExtensions EnableDelayedExpansion",
         f'set "HELPER_PY={helper_py}"',
         'set "LOG_FILE=%~dp0helper.log"',
+        '>> "%LOG_FILE%" echo [time=%time%] Nanobot host CDP helper starting.',
+        'curl.exe --silent --fail --max-time 2 "http://127.0.0.1:9230/healthz" >nul 2>&1',
+        "if not errorlevel 1 (",
+        '  >> "%LOG_FILE%" echo [time=%time%] Helper is already healthy; startup skipped.',
+        "  exit /b 0",
+        ")",
     ]
     if token_file is not None:
         lines.append(f'set "TOKEN_FILE={token_file}"')
@@ -551,12 +565,15 @@ def _windows_launcher_script_contents(
         if token_file is not None:
             launch += ' --token-file "%TOKEN_FILE%"'
         launch += ' >> "%LOG_FILE%" 2>&1'
+        lines.append(f'  >> "%LOG_FILE%" echo [time=%time%] Using Python runtime: {candidate_path}')
         lines.append(launch)
-        lines.append("  exit /b %ERRORLEVEL%")
+        lines.append('  set "HELPER_EXIT=!ERRORLEVEL!"')
+        lines.append('  >> "%LOG_FILE%" echo [time=%time%] Helper exited with code !HELPER_EXIT!.')
+        lines.append("  exit /b !HELPER_EXIT!")
         lines.append(")")
     lines.extend(
         [
-            'echo python runtime not found for Nanobot host CDP helper 1>&2',
+            '>> "%LOG_FILE%" echo [time=%time%] Python runtime not found for Nanobot host CDP helper.',
             "exit /b 127",
             "",
         ]
@@ -747,10 +764,43 @@ def _windows_task_command(launcher_script: Path) -> str:
 
 def _windows_startup_entry_contents(launcher_script: Path) -> str:
     escaped = str(launcher_script).replace('"', '""')
+    startup_log = str(launcher_script.parent / "startup.log").replace('"', '""')
     return "\r\n".join(
         [
+            "Option Explicit",
+            "On Error Resume Next",
+            "Dim shell, fso, launcher, logFile, command, launchError, launchDescription",
             'Set shell = CreateObject("WScript.Shell")',
-            f'shell.Run Chr(34) & "{escaped}" & Chr(34), 0, False',
+            'Set fso = CreateObject("Scripting.FileSystemObject")',
+            f'launcher = "{escaped}"',
+            f'logFile = "{startup_log}"',
+            "WScript.Sleep 8000",
+            "If Not fso.FileExists(launcher) Then",
+            '  AppendLog "Launcher is missing: " & launcher',
+            "  WScript.Quit 2",
+            "End If",
+            'command = "cmd.exe /d /c " & Chr(34) & Chr(34) & launcher & Chr(34) & Chr(34)',
+            "Err.Clear",
+            "shell.Run command, 0, False",
+            "launchError = Err.Number",
+            "launchDescription = Err.Description",
+            "Err.Clear",
+            "If launchError <> 0 Then",
+            '  AppendLog "Launch failed (" & launchError & "): " & launchDescription',
+            "  WScript.Quit 3",
+            "End If",
+            'AppendLog "Launch command submitted."',
+            "",
+            "Sub AppendLog(message)",
+            "  Dim stream",
+            "  Err.Clear",
+            "  Set stream = fso.OpenTextFile(logFile, 8, True)",
+            "  If Err.Number = 0 Then",
+            '    stream.WriteLine Now & " " & message',
+            "    stream.Close",
+            "  End If",
+            "  Err.Clear",
+            "End Sub",
             "",
         ]
     )
@@ -812,13 +862,19 @@ def install_windows_helper(
         startup_entry.parent.mkdir(parents=True, exist_ok=True)
         startup_entry.write_text(
             _windows_startup_entry_contents(launcher_script),
-            encoding="utf-8-sig",
+            # Windows Script Host can reject a UTF-8 BOM as an invalid first
+            # character. UTF-16 is its native Unicode script encoding and also
+            # supports non-ASCII Windows user-profile paths.
+            encoding="utf-16",
         )
 
     if not wait_for_helper(DEFAULT_HELPER_URL, timeout_s=5.0):
         _start_background_helper(launcher_script, "windows")
 
-    if not wait_for_helper(DEFAULT_HELPER_URL, timeout_s=5.0):
+    # Microsoft Store Python may need several seconds to activate its packaged
+    # runtime immediately after Windows login. Give the detached helper enough
+    # time to finish that cold start before declaring installation failed.
+    if not wait_for_helper(DEFAULT_HELPER_URL, timeout_s=20.0):
         raise RuntimeError(
             "Installed the Windows host CDP helper, but it did not become healthy on "
             f"{DEFAULT_HELPER_URL}. Check the helper log files under {install_dir}."

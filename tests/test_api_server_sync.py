@@ -361,11 +361,12 @@ def test_whatsapp_helper_install_command_uses_lightweight_platform_modules() -> 
 
 
 @pytest.mark.asyncio
-async def test_send_message_rejects_cdp_draft_delivery_before_persist(tmp_path: Path) -> None:
+async def test_send_message_in_cdp_draft_mode_queues_human_approved_send(tmp_path: Path) -> None:
+    bus = MessageBus()
     session_manager = SessionManager(tmp_path)
     server = ApiServer(
         config=_draft_cdp_config(tmp_path),
-        bus=MessageBus(),
+        bus=bus,
         session_manager=session_manager,
         agent=None,
         channel_manager=SimpleNamespace(enabled_channels=[]),
@@ -375,12 +376,12 @@ async def test_send_message_rejects_cdp_draft_delivery_before_persist(tmp_path: 
         _JSONRequest(match_info={"phone": "1234567890"}, body={"content": "hello"})
     )
 
-    assert response.status == 409
-    assert json.loads(response.text) == {
-        "error": CDP_DRAFT_DISABLED_DETAIL,
-        "code": "draft_delivery_disabled",
-    }
-    assert not (tmp_path / "sessions" / "whatsapp__1234567890" / "session.jsonl").exists()
+    assert response.status == 200
+    outbound = await bus.consume_outbound()
+    assert outbound.chat_id == "1234567890@s.whatsapp.net"
+    assert outbound.content == "hello"
+    assert outbound.metadata == {"_human_approved_send": True}
+    assert (tmp_path / "sessions" / "whatsapp__1234567890" / "session.jsonl").exists()
 
 
 @pytest.mark.asyncio
@@ -463,11 +464,12 @@ async def test_send_message_persists_once_when_baileys_upsert_echo_arrives(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_ai_send_rejects_cdp_draft_delivery_before_persist(tmp_path: Path) -> None:
+async def test_ai_send_in_cdp_draft_mode_queues_human_approved_send(tmp_path: Path) -> None:
+    bus = MessageBus()
     session_manager = SessionManager(tmp_path)
     server = ApiServer(
         config=_draft_cdp_config(tmp_path),
-        bus=MessageBus(),
+        bus=bus,
         session_manager=session_manager,
         agent=None,
         channel_manager=SimpleNamespace(enabled_channels=[]),
@@ -477,12 +479,38 @@ async def test_ai_send_rejects_cdp_draft_delivery_before_persist(tmp_path: Path)
         _JSONRequest(match_info={"phone": "1234567890"}, body={"content": "approved"})
     )
 
-    assert response.status == 409
-    assert json.loads(response.text) == {
-        "error": CDP_DRAFT_DISABLED_DETAIL,
-        "code": "draft_delivery_disabled",
-    }
-    assert not (tmp_path / "sessions" / "whatsapp__1234567890" / "session.jsonl").exists()
+    assert response.status == 200
+    outbound = await bus.consume_outbound()
+    assert outbound.chat_id == "1234567890@s.whatsapp.net"
+    assert outbound.content == "approved"
+    assert outbound.metadata == {"_human_approved_send": True}
+    session = session_manager.read_persisted("whatsapp:1234567890")
+    assert session.messages[0]["is_ai_approved"] is True
+
+
+@pytest.mark.asyncio
+async def test_add_reply_target_requires_explicit_international_number(tmp_path: Path) -> None:
+    server = ApiServer(
+        config=_draft_cdp_config(tmp_path),
+        bus=MessageBus(),
+        session_manager=SessionManager(tmp_path),
+        agent=None,
+        channel_manager=SimpleNamespace(enabled_channels=[]),
+    )
+
+    rejected = await server._handle_add_reply_target(
+        _JSONRequest(body={"phone": "84952658", "label": "Hendrick"})
+    )
+    accepted = await server._handle_add_reply_target(
+        _JSONRequest(body={"phone": "+852 8495 2658", "label": "Hendrick"})
+    )
+
+    assert rejected.status == 400
+    assert "beginning with +" in json.loads(rejected.text)["error"]
+    assert accepted.status == 200
+    stored = json.loads((tmp_path / "reply_targets.json").read_text(encoding="utf-8"))
+    assert stored["direct_reply_targets"][0]["phone"] == "85284952658"
+    assert stored["direct_reply_targets"][0]["chat_id"] == "85284952658@s.whatsapp.net"
 
 
 @pytest.mark.asyncio

@@ -209,26 +209,33 @@ export class HistoryParser extends WhatsAppWebSession {
       initial = await operation(page);
     } catch (error) {
       const failure = this._mapParseError(error) as T;
-      if (this.browserMode !== 'cdp') {
+      if (this.browserMode !== 'cdp' || failure.status === 'window_launch_failed') {
         return failure;
       }
-      const retried = await this._retryParseInFreshWindow(operation);
+      const retried = await this._retryParseInReusableWindow(operation);
       return retried ?? failure;
     }
 
     if (this.browserMode === 'cdp' && initial.status === 'login_required') {
-      const retried = await this._retryParseInFreshWindow(operation);
+      const retried = await this._retryParseInReusableWindow(operation);
       return retried ?? initial;
     }
 
     return initial;
   }
 
-  private async _retryParseInFreshWindow<T extends { status: string; detail?: string }>(
+  private async _retryParseInReusableWindow<T extends { status: string; detail?: string }>(
     operation: (page: PageDriver) => Promise<T>,
   ): Promise<T | null> {
     try {
-      await this._openFreshCdpWindow();
+      // Drop only the Playwright attachment. The next _ensurePage() first
+      // reconnects to the already-running host CDP browser and therefore does
+      // not create a second WhatsApp/Chrome window. If Chrome truly vanished,
+      // the normal acquisition path may launch one replacement window.
+      this.page = null;
+      this.context = null;
+      this.browser = null;
+      this.preferNewestAttachedPage = true;
       const page = await this._prepareParsePage();
       return await operation(page);
     } catch (error) {
@@ -242,46 +249,6 @@ export class HistoryParser extends WhatsAppWebSession {
       await page.bringToFront();
     }
     return page;
-  }
-
-  private async _openFreshCdpWindow(): Promise<void> {
-    if (this.browserMode !== 'cdp') {
-      return;
-    }
-    this.page = null;
-    this.context = null;
-    this.browser = null;
-    this.preferNewestAttachedPage = true;
-    const helperResult = await this._ensureCdpBrowserViaHelper(true);
-    if (helperResult) {
-      this.browser = await this._waitForCDPBrowser();
-      if (this.browser) {
-        this.lastCdpAcquisition = helperResult.status === 'launched' ? 'helper_launched' : 'helper_reused';
-      }
-    } else {
-      await this._launchCdpBrowser(true);
-      this.browser = await this._waitForCDPBrowser();
-      if (this.browser) {
-        this.lastCdpAcquisition = 'local_launch';
-      }
-    }
-    if (!this.browser) {
-      throw new Error(
-        `CDP browser is not available at ${this.cdpEndpoint}. Start Chrome with --remote-debugging-port or set webCdpChromePath so nanobot can launch it.`,
-      );
-    }
-
-    const attached = await this._findAttachedWhatsAppPage(this.browser, false, true);
-    if (attached) {
-      this.context = attached.context;
-      this.page = attached.page;
-      this.preferNewestAttachedPage = false;
-      return;
-    }
-
-    this.context = this._pickAttachedContext(this.browser, true);
-    this.page = null;
-    this.preferNewestAttachedPage = false;
   }
 
   private async _openTargetForParse(
@@ -475,6 +442,11 @@ export class HistoryParser extends WhatsAppWebSession {
 
   private _normalizeScrapedMessages(messages: RawScrapedHistoryMessage[]): ScrapedHistoryMessage[] {
     return messages
+      // Real WhatsApp message bubbles carry data-pre-plain-text metadata.
+      // Encryption/contact banners can also have data-id attributes, but no
+      // message metadata; importing them would make the UI show a fake client
+      // message and a misleading "needs reply" state.
+      .filter((item) => Boolean(String(item.metaText || '').trim()))
       .map((item, index) => {
         const parsed = this._parseMetaText(item.metaText, index);
         return {

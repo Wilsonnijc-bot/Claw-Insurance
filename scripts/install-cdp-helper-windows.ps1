@@ -43,21 +43,9 @@ function Add-PythonCandidate {
 }
 
 $PythonCandidates = [System.Collections.Generic.List[object]]::new()
-foreach ($commandName in @("python", "python3")) {
-  $command = Get-Command $commandName -ErrorAction SilentlyContinue
-  if ($command) {
-    Add-PythonCandidate $PythonCandidates $command.Source
-  }
-}
-
-$PyLauncher = Get-Command py -ErrorAction SilentlyContinue
-if ($PyLauncher) {
-  Add-PythonCandidate $PythonCandidates $PyLauncher.Source @("-3")
-}
-
 # A stale Python Launcher or registry entry can point at a removed OneDrive
-# installation. Discover Microsoft Store Python packages directly as a robust
-# fallback, then validate every candidate before using it.
+# installation. Prefer the real Microsoft Store package executable over its
+# login-time WindowsApps alias, then validate every candidate before using it.
 try {
   $StorePackages = Get-AppxPackage -Name "PythonSoftwareFoundation.Python*" -ErrorAction Stop |
     Sort-Object Version -Descending
@@ -71,7 +59,19 @@ try {
     }
   }
 } catch {
-  # Non-Store Python installations are already covered by Get-Command above.
+  # Non-Store Python installations are covered below.
+}
+
+foreach ($commandName in @("python", "python3")) {
+  $command = Get-Command $commandName -ErrorAction SilentlyContinue
+  if ($command) {
+    Add-PythonCandidate $PythonCandidates $command.Source
+  }
+}
+
+$PyLauncher = Get-Command py -ErrorAction SilentlyContinue
+if ($PyLauncher) {
+  Add-PythonCandidate $PythonCandidates $PyLauncher.Source @("-3")
 }
 
 $PythonRuntime = $null
@@ -146,15 +146,22 @@ print("Restart Docker Compose after changing host CDP helper settings.")
 
 $TempScript = Join-Path ([System.IO.Path]::GetTempPath()) ("nanobot-cdp-helper-" + [System.Guid]::NewGuid().ToString("N") + ".py")
 Set-Content -Path $TempScript -Value $Code -Encoding UTF8
+$PreviousCdpPython = $env:NANOBOT_CDP_PYTHON_EXECUTABLE
 
 try {
   $PythonExecutable = $PythonRuntime.Executable
   $PythonPrefixArgs = @($PythonRuntime.PrefixArgs)
+  $env:NANOBOT_CDP_PYTHON_EXECUTABLE = $PythonExecutable
   & $PythonExecutable @PythonPrefixArgs $TempScript $RootDir
   $ExitCode = $LASTEXITCODE
   if ($ExitCode -ne 0) {
     exit $ExitCode
   }
 } finally {
+  if ($null -eq $PreviousCdpPython) {
+    Remove-Item Env:NANOBOT_CDP_PYTHON_EXECUTABLE -ErrorAction SilentlyContinue
+  } else {
+    $env:NANOBOT_CDP_PYTHON_EXECUTABLE = $PreviousCdpPython
+  }
   Remove-Item -Force $TempScript -ErrorAction SilentlyContinue
 }

@@ -28,15 +28,16 @@ export const AddReplyTargetModal: React.FC<AddReplyTargetModalProps> = ({
     setError('');
     setSuccess(false);
 
-    const cleaned = phone.replace(/[^0-9]/g, '');
-    if (!cleaned || cleaned.length < 5) {
-      setError('请输入有效的电话号码（至少5位数字）');
+    const trimmed = phone.trim();
+    const cleaned = trimmed.replace(/[^0-9]/g, '');
+    if (!trimmed.startsWith('+') || !/^[1-9]\d{7,14}$/.test(cleaned)) {
+      setError('请输入以 + 开头、包含国家码的完整号码');
       return;
     }
 
     setSubmitting(true);
     try {
-      const ok = await onAdd(cleaned, label || undefined, autoDraft);
+      const ok = await onAdd(`+${cleaned}`, label || undefined, autoDraft);
       if (ok) {
         setSuccess(true);
         setTimeout(() => {
@@ -107,13 +108,13 @@ export const AddReplyTargetModal: React.FC<AddReplyTargetModalProps> = ({
               type="tel"
               value={phone}
               onChange={(e) => { setPhone(e.target.value); setError(''); }}
-              placeholder="例如: 85268424658"
+              placeholder="例如: +85268424658"
               className="w-full px-3.5 py-2.5 text-sm bg-surface-warm border border-border-subtle rounded-xl focus:outline-none focus:ring-2 focus:ring-deep-trust/20 focus:border-deep-trust/40 placeholder:text-medium-gray/50 transition-all"
               autoFocus
               disabled={submitting}
             />
             <p className="text-[10px] text-medium-gray/70 mt-1.5 ml-1">
-              输入包含国家码的完整号码（不含 + 号）
+              必须以 + 开头并包含国家码，例如香港 +852
             </p>
           </div>
 

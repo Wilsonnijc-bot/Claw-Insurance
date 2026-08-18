@@ -156,8 +156,13 @@ def test_install_windows_helper_falls_back_to_user_startup_folder(monkeypatch, t
     assert result["autostart_method"] == "startup_folder"
     assert result["task_error"] == "Access is denied."
     assert startup_entry.exists()
-    assert "WScript.Shell" in startup_entry.read_text(encoding="utf-8-sig")
-    assert "run-helper.cmd" in startup_entry.read_text(encoding="utf-8-sig")
+    assert startup_entry.read_bytes().startswith((b"\xff\xfe", b"\xfe\xff"))
+    assert "WScript.Shell" in startup_entry.read_text(encoding="utf-16")
+    startup_contents = startup_entry.read_text(encoding="utf-16")
+    assert "run-helper.cmd" in startup_contents
+    assert "WScript.Sleep 8000" in startup_contents
+    assert "cmd.exe /d /c" in startup_contents
+    assert "startup.log" in startup_contents
 
 
 def test_windows_launcher_writes_a_diagnostic_log(monkeypatch, tmp_path: Path) -> None:
@@ -173,3 +178,17 @@ def test_windows_launcher_writes_a_diagnostic_log(monkeypatch, tmp_path: Path) -
     contents = launcher_script.read_text(encoding="utf-8")
     assert 'set "LOG_FILE=%~dp0helper.log"' in contents
     assert '>> "%LOG_FILE%" 2>&1' in contents
+    assert "Nanobot host CDP helper starting" in contents
+    assert "Using Python runtime" in contents
+    assert "curl.exe --silent --fail --max-time 2" in contents
+    assert "EnableDelayedExpansion" in contents
+    assert "!HELPER_EXIT!" in contents
+
+
+def test_windows_python_candidates_prefer_validated_installer_runtime(monkeypatch) -> None:
+    validated = r"C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13\python.exe"
+    monkeypatch.setenv("NANOBOT_CDP_PYTHON_EXECUTABLE", validated)
+
+    candidates = windows_helper._common._python_candidates("windows")
+
+    assert candidates[0] == validated

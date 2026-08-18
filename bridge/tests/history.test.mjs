@@ -537,6 +537,12 @@ test('scrapeHistory collects visible and older messages without sending anything
     historySnapshots: [
       [
         {
+          id: 'false_system-notice',
+          content: 'Messages and calls are end-to-end encrypted.',
+          fromMe: false,
+          metaText: '',
+        },
+        {
           id: 'true_msg-2',
           content: 'Recent reply',
           fromMe: true,
@@ -544,6 +550,12 @@ test('scrapeHistory collects visible and older messages without sending anything
         },
       ],
       [
+        {
+          id: 'false_system-notice',
+          content: 'Messages and calls are end-to-end encrypted.',
+          fromMe: false,
+          metaText: '',
+        },
         {
           id: 'false_msg-1',
           content: 'Older hello',
@@ -866,7 +878,7 @@ test('scrapeHistory does not reopen a CDP window for true chat_not_found results
   assert.equal(page.searchText, '9999999999');
 });
 
-test('scrapeHistory retries in a fresh CDP window when attached page search cannot be reset cleanly', async () => {
+test('scrapeHistory reattaches to the reusable CDP browser when attached page search cannot be reset cleanly', async () => {
   const firstPage = new FakePage({
     initialUrl: 'https://web.whatsapp.com/',
     searchVisible: true,
@@ -924,10 +936,10 @@ test('scrapeHistory retries in a fresh CDP window when attached page search cann
 
   assert.equal(result.status, 'history_scraped');
   assert.equal(result.messages[0].content, 'Hello after search reset retry');
-  assert.equal(spawnCalls.length, 1);
+  assert.equal(spawnCalls.length, 0);
 });
 
-test('scrapeHistory retries in a fresh CDP window when the clicked chat does not become ready', async () => {
+test('scrapeHistory reattaches to the reusable CDP browser when the clicked chat does not become ready', async () => {
   const firstPage = new FakePage({
     initialUrl: 'https://web.whatsapp.com/',
     searchRows: [{ top: 0, headerText: 'Saved Contact', headerFound: false }],
@@ -983,10 +995,10 @@ test('scrapeHistory retries in a fresh CDP window when the clicked chat does not
 
   assert.equal(result.status, 'history_scraped');
   assert.equal(result.messages[0].content, 'Hello after chat ready retry');
-  assert.equal(spawnCalls.length, 1);
+  assert.equal(spawnCalls.length, 0);
 });
 
-test('scrapeHistory prefers the newest WhatsApp page after a fresh-window retry', async () => {
+test('scrapeHistory prefers the newest WhatsApp page after a reusable-session retry', async () => {
   const firstPage = new FakePage({
     initialUrl: 'https://web.whatsapp.com/',
     searchVisible: true,
@@ -1051,12 +1063,12 @@ test('scrapeHistory prefers the newest WhatsApp page after a fresh-window retry'
 
   assert.equal(result.status, 'history_scraped');
   assert.equal(result.messages[0].content, 'Hello from newest page');
-  assert.equal(spawnCalls.length, 1);
+  assert.equal(spawnCalls.length, 0);
   assert.deepEqual(staleRetryPage.insertedTexts, []);
   assert.deepEqual(freshRetryPage.insertedTexts, ['1234567890']);
 });
 
-test('scrapeHistory retries in a fresh CDP window when the attached page is not ready', async () => {
+test('scrapeHistory reattaches without opening a second window when the attached page is not ready', async () => {
   const firstPage = new FakePage({
     initialUrl: 'https://web.whatsapp.com/',
     searchVisible: false,
@@ -1121,7 +1133,7 @@ test('scrapeHistory retries in a fresh CDP window when the attached page is not 
 
     assert.equal(result.status, 'history_scraped');
     assert.equal(result.messages[0].content, 'Hello after fresh window');
-    assert.equal(spawnCalls.length, 1);
+    assert.equal(spawnCalls.length, 0);
     assert.ok(connector.connectCalls.length >= 2);
     assert.ok(connector.connectCalls.every((value) => value === 'http://127.0.0.1:9222'));
   } finally {
@@ -1164,10 +1176,10 @@ test('scrapeHistory reports window_launch_failed when the host helper cannot lau
   assert.equal(result.status, 'window_launch_failed');
   assert.match(result.detail, /Host CDP helper is not installed\/running/);
   assert.equal(spawnCalls.length, 0);
-  assert.equal(helperCalls.length, 2);
+  assert.equal(helperCalls.length, 1);
 });
 
-test('scrapeHistory returns login_required after a fresh-window retry when WhatsApp Web is still not ready', async () => {
+test('scrapeHistory returns login_required after a reusable-session retry when WhatsApp Web is still not ready', async () => {
   const firstPage = new FakePage({
     initialUrl: 'https://web.whatsapp.com/',
     searchVisible: false,
@@ -1223,8 +1235,8 @@ test('scrapeHistory returns login_required after a fresh-window retry when Whats
     );
 
     assert.equal(result.status, 'login_required');
-    assert.match(result.detail, /Chrome window opened/);
-    assert.equal(spawnCalls.length, 1);
+    assert.match(result.detail, /not logged in or not ready/);
+    assert.equal(spawnCalls.length, 0);
     assert.ok(connector.connectCalls.length >= 2);
   } finally {
     Date.now = originalDateNow;
@@ -1256,5 +1268,5 @@ test('scrapeHistory maps local spawn ENOENT failures to window_launch_failed ins
 
   assert.equal(result.status, 'window_launch_failed');
   assert.match(result.detail, /No Chrome\/Chromium executable was found for CDP launch/);
-  assert.equal(spawnCalls.length, 2);
+  assert.equal(spawnCalls.length, 1);
 });

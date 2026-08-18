@@ -132,6 +132,17 @@ class MockCloudHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/":
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "service": "claw-insurance-mock-cloud",
+                    "healthEndpoint": "/healthz",
+                    "note": "The recording feature calls POST /recognize.",
+                },
+            )
+            return
         if self.path == "/healthz":
             self._send_json(
                 200,

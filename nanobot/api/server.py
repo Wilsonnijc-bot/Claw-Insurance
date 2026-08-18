@@ -76,6 +76,7 @@ class ApiServer:
     # ------------------------------------------------------------------
 
     def _setup_routes(self) -> None:
+        self.app.router.add_get("/", self._handle_root)
         self.app.router.add_get("/api/clients", self._handle_get_clients)
         self.app.router.add_get("/api/clients/{phone}", self._handle_get_client)
         self.app.router.add_get(
@@ -142,6 +143,15 @@ class ApiServer:
                 "Access-Control-Max-Age": "3600",
             },
         )
+
+    async def _handle_root(self, _request: web.Request) -> web.Response:
+        """Explain the API port when it is opened directly in a browser."""
+        return web.json_response({
+            "status": "ok",
+            "service": "claw-insurance-api",
+            "frontend": "http://localhost:8080",
+            "statusEndpoint": "/api/status",
+        })
 
     def _handle_options(self, _request: web.Request) -> web.Response:
         return self._cors_response()
@@ -497,7 +507,11 @@ class ApiServer:
 
         # 4. Wait for bridge to become reachable
         import time
-        deadline = time.time() + 15
+        # A cold runtime rebuild can take longer than 15 seconds on Windows.
+        # Match the normal gateway startup allowance so the UI does not report
+        # a false failure while the bridge is still compiling successfully.
+        startup_timeout = 60
+        deadline = time.time() + startup_timeout
         while time.time() < deadline:
             if proc.poll() is not None:
                 return {"status": "error", "message": f"Bridge exited early with code {proc.returncode}"}
@@ -508,8 +522,11 @@ class ApiServer:
                 return {"status": "ok", "message": f"Bridge restarted (PID {proc.pid})"}
             time.sleep(0.5)
 
-        proc.terminate()
-        return {"status": "error", "message": "Bridge did not become ready within 15 s"}
+        stop_whatsapp_bridge(proc)
+        return {
+            "status": "error",
+            "message": f"Bridge did not become ready within {startup_timeout} s",
+        }
 
     async def _mirror_outbound(self) -> None:
         """Mirror outbound bus messages to WebSocket clients.
@@ -1476,9 +1493,6 @@ class ApiServer:
             content = body.get("content", "").strip()
             if not content:
                 return web.json_response({"error": "Empty message"}, status=400)
-            if blocked := self._draft_delivery_disabled_response():
-                return blocked
-
             # 1. Save to session
             key = self._phone_to_session_key(phone)
             session = self.session_manager.get_or_create(key)
@@ -1491,6 +1505,7 @@ class ApiServer:
                 channel="whatsapp",
                 chat_id=self._resolve_chat_id(phone),
                 content=content,
+                metadata={"_human_approved_send": True},
             ))
 
             client_name = self._journal_client_name(phone)
@@ -1610,9 +1625,6 @@ class ApiServer:
             content = body.get("content", "").strip()
             if not content:
                 return web.json_response({"error": "Empty content"}, status=400)
-            if blocked := self._draft_delivery_disabled_response():
-                return blocked
-
             # 1. Persist the approved message to session JSONL
             key = self._phone_to_session_key(phone)
             session = self.session_manager.get_or_create(key)
@@ -1629,6 +1641,7 @@ class ApiServer:
                 channel="whatsapp",
                 chat_id=self._resolve_chat_id(phone),
                 content=content,
+                metadata={"_human_approved_send": True},
             ))
 
             client_name = self._journal_client_name(phone)
@@ -1913,10 +1926,20 @@ class ApiServer:
             if not phone:
                 return web.json_response({"error": "Missing phone number"}, status=400)
 
-            # Strip leading '+' and any non-digit chars
+            # Require an explicit E.164-style country code. Without the leading
+            # plus there is no reliable way to distinguish a local number from
+            # a complete WhatsApp number (for example 84952658 vs +85284952658).
             phone_clean = "".join(c for c in phone if c.isdigit())
-            if not phone_clean or len(phone_clean) < 5:
-                return web.json_response({"error": "Invalid phone number"}, status=400)
+            if (
+                not phone.startswith("+")
+                or not phone_clean
+                or phone_clean.startswith("0")
+                or not 8 <= len(phone_clean) <= 15
+            ):
+                return web.json_response(
+                    {"error": "Use a complete international number beginning with + (for example +85268424658)"},
+                    status=400,
+                )
 
             label = (body.get("label") or "").strip()
             auto_draft = bool(body.get("autoDraft", True))

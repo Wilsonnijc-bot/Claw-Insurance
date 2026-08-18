@@ -1347,10 +1347,16 @@ class WhatsAppChannel(BaseChannel):
     def _build_bridge_payload(self, msg: OutboundMessage) -> dict | None:
         """Build the bridge command for an outbound message."""
         metadata = msg.metadata or {}
+        human_approved_send = metadata.get("_human_approved_send") is True
         if self.config.delivery_mode == "draft" and metadata.get("_progress"):
             return None
 
-        if self.config.delivery_mode == "draft":
+        if human_approved_send:
+            # Global draft mode prevents automatic delivery. A click on the
+            # operator UI is a separate, explicit approval and may use the
+            # Baileys send path even while CDP remains history-only.
+            command_type = "send"
+        elif self.config.delivery_mode == "draft":
             if self.config.web_browser_mode == "cdp":
                 logger.info(
                     "Skipping WhatsApp draft placement in CDP mode; CDP is reserved for history parsing"
@@ -1365,7 +1371,7 @@ class WhatsAppChannel(BaseChannel):
             "to": msg.chat_id,
             "text": text,
         }
-        if self.config.delivery_mode == "draft":
+        if self.config.delivery_mode == "draft" and not human_approved_send:
             target = self._resolve_draft_target(msg.chat_id, metadata)
             if target is not None:
                 payload["target"] = target

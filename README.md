@@ -97,6 +97,22 @@ Default helper URLs:
 
 After changing host CDP helper settings, restart the Docker stack.
 
+On Windows systems that deny scheduled-task creation, the installer uses the
+current-user Startup folder. It waits briefly after login before starting the
+helper so Microsoft Store Python and WindowsApps aliases are ready. Startup
+diagnostics are written to:
+
+```text
+C:\Users\<user>\.nanobot\host-cdp-helper\startup.log
+C:\Users\<user>\.nanobot\host-cdp-helper\helper.log
+```
+
+Check the helper without exposing its token:
+
+```powershell
+curl.exe http://127.0.0.1:9230/healthz
+```
+
 On the first Windows launch, loading the Node.js WhatsApp Bridge can take longer than ten seconds. The Compose default allows 60 seconds; unusually slow hosts can override `BRIDGE_STARTUP_TIMEOUT_SECONDS` in `.env` (bounded to 5-120 seconds).
 
 ### Create local configuration files

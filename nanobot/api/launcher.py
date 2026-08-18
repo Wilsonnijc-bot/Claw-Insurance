@@ -62,6 +62,7 @@ class LauncherServer:
 
     def _setup_routes(self) -> None:
         # Login + status are always available
+        self.app.router.add_get("/", self._handle_root)
         self.app.router.add_post("/api/login", self._handle_login)
         self.app.router.add_get("/api/status", self._handle_status)
         self.app.router.add_get("/ws", self._handle_ws)
@@ -119,6 +120,16 @@ class LauncherServer:
                 "Access-Control-Max-Age": "3600",
             },
         )
+
+    async def _handle_root(self, _request: web.Request) -> web.Response:
+        """Explain the backend port when a user opens it directly."""
+        return web.json_response({
+            "status": "ok",
+            "service": "claw-insurance-api-launcher",
+            "gatewayReady": self._gateway_ready,
+            "frontend": "http://localhost:8080",
+            "statusEndpoint": "/api/status",
+        })
 
     def _handle_options(self, _request: web.Request) -> web.Response:
         return self._cors_response()

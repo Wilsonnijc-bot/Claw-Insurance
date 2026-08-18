@@ -256,6 +256,36 @@ async def test_whatsapp_cdp_draft_mode_skips_prepare_draft_command(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_whatsapp_cdp_draft_mode_sends_only_after_human_approval(tmp_path: Path) -> None:
+    channel = _make_channel(
+        WhatsAppConfig(
+            enabled=True,
+            delivery_mode="draft",
+            web_browser_mode="cdp",
+            allow_from=["+1234567890"],
+            contacts_file="",
+            group_members_file="",
+        )
+    )
+    ws = _FakeWebSocket()
+    channel._ws = ws
+    channel._connected = True
+
+    await channel.send(
+        OutboundMessage(
+            channel="whatsapp",
+            chat_id="alice@lid",
+            content="approved reply",
+            metadata={"_human_approved_send": True},
+        )
+    )
+
+    assert [json.loads(item) for item in ws.sent] == [
+        {"type": "send", "to": "alice@lid", "text": "approved reply"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_whatsapp_launch_draft_mode_emits_prepare_draft_command_for_phone_only_target(tmp_path: Path) -> None:
     targets_file = tmp_path / "reply_targets.json"
     rewrite_from_self_instruction(targets_file, individuals=["+1234567890"], groups=None)
