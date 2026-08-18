@@ -312,7 +312,9 @@ class PrivacyGatewayConfig(Base):
     listen_host: str = "127.0.0.1"
     listen_port: int = 8787
     fail_closed: bool = True
-    save_redacted_debug: bool = True
+    # Debug payloads are opt-in.  Even when enabled, only redacted payloads
+    # are stored; raw prompts may contain customer data.
+    save_redacted_debug: bool = False
     text_only_scope: bool = True
     enable_ner_assist: bool = False
 

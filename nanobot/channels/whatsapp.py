@@ -107,6 +107,7 @@ class WhatsAppChannel(BaseChannel):
         self._auth_qr: str = ""
         self._auth_message: str = ""
         self._pending_history_sync_acks: dict[str, asyncio.Future] = {}
+        self._pending_send_acks: dict[str, asyncio.Future] = {}
         self._ws_reconnect_failures: int = 0
         self._ws_max_reconnect_failures: int = 12  # 12 * 5s = 60s before escalating
         self._bridge_error: bool = False
@@ -1332,6 +1333,10 @@ class WhatsAppChannel(BaseChannel):
         self._running = False
         self._connected = False
         self._parse_queue_event.set()
+        for pending in self._pending_send_acks.values():
+            if not pending.done():
+                pending.set_result({"status": "not_connected", "detail": "WhatsApp bridge stopped"})
+        self._pending_send_acks.clear()
 
         if self._ws:
             await self._ws.close()
@@ -1371,6 +1376,9 @@ class WhatsAppChannel(BaseChannel):
             "to": msg.chat_id,
             "text": text,
         }
+        request_id = str(metadata.get("_send_request_id") or "").strip()
+        if command_type == "send" and request_id:
+            payload["requestId"] = request_id
         if self.config.delivery_mode == "draft" and not human_approved_send:
             target = self._resolve_draft_target(msg.chat_id, metadata)
             if target is not None:
@@ -1392,6 +1400,35 @@ class WhatsAppChannel(BaseChannel):
             await self._ws.send(json.dumps(payload, ensure_ascii=False))
         except Exception as e:
             logger.error("Error sending WhatsApp message: {}", e)
+
+    async def send_confirmed(
+        self,
+        msg: OutboundMessage,
+        *,
+        timeout_s: float = 15.0,
+    ) -> dict[str, object]:
+        """Send and wait until the Node bridge accepts the Baileys request.
+
+        This is a transport acceptance acknowledgement, not a recipient read
+        receipt or end-device delivery receipt.
+        """
+        request_id = str((msg.metadata or {}).get("_send_request_id") or "").strip()
+        if not request_id:
+            request_id = f"send_{uuid4().hex}"
+            msg.metadata["_send_request_id"] = request_id
+        if not self._ws or not self._connected:
+            return {"status": "not_connected", "detail": "WhatsApp bridge is not connected"}
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._pending_send_acks[request_id] = future
+        try:
+            await self.send(msg)
+            return await asyncio.wait_for(future, timeout=max(0.1, timeout_s))
+        except asyncio.TimeoutError:
+            return {"status": "timeout", "detail": "Timed out waiting for WhatsApp bridge acceptance"}
+        finally:
+            self._pending_send_acks.pop(request_id, None)
 
     async def _handle_bridge_message(self, raw: str) -> None:
         """Handle a message from the bridge."""
@@ -1549,8 +1586,11 @@ class WhatsAppChannel(BaseChannel):
                     chat_id=sender,
                     sender_id=sender,
                 )
-                capture_only = direct_reply_target is None or not direct_reply_target.enabled
-                if capture_only:
+                # Draft mode is always capture-only.  The UI observer decides
+                # whether to generate a draft; the background agent must never
+                # create an unsent reply when the UI is absent.
+                capture_only = True
+                if direct_reply_target is None or not direct_reply_target.enabled:
                     logger.info(
                         "Capturing WhatsApp direct message without auto-reply target in draft mode: {}",
                         sender,
@@ -1704,6 +1744,10 @@ class WhatsAppChannel(BaseChannel):
                 pending = self._pending_history_sync_acks.get(request_id)
                 if pending is not None and not pending.done():
                     pending.set_result(data)
+            if action == "send" and request_id:
+                pending_send = self._pending_send_acks.get(request_id)
+                if pending_send is not None and not pending_send.done():
+                    pending_send.set_result(data)
             if detail:
                 logger.info("WhatsApp bridge {} ack for {}: {} ({})", action, to, status, detail)
             else:

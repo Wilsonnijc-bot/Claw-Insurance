@@ -1,7 +1,7 @@
 ---
 name: insurance-product-advisor
 description: Local insurance product lookup and Tavily brochure research for matched WhatsApp group participants. Use when the participant asks for product information, comparison, suitability, or recommendations.
-metadata: {"nanobot":{"emoji":"🧾","requires":{"bins":["python3"]}}}
+metadata: {"nanobot":{"emoji":"🧾"}}
 ---
 
 # Insurance Product Advisor
@@ -36,10 +36,9 @@ The session can enter `skill` mode in 2 ways:
 6. If the domain plus 2 useful facts are already present, run the shortlist immediately. Do not block on collecting every remaining field first.
 7. If fewer than 2 useful facts are present, ask only the next missing fact in one short sentence.
 8. If the shortlist result includes `remaining_fields`, treat them as refinement questions, not blockers for the first recommendation pass.
-9. Save the collected facts to a temporary JSON file in the workspace.
-10. Run `scripts/find_products.py` to get `missing_fields`, `remaining_fields`, or shortlisted candidates from the configured catalog.
+9. Call the `insurance_advisor` tool with `action=shortlist`, the domain, and collected facts to get `missing_fields`, `remaining_fields`, or shortlisted candidates.
 11. If `missing_fields` is non-empty, ask only those questions and stop.
-12. If candidates exist, save them to a temporary JSON file and run `scripts/research_products.py`.
+12. If candidates exist, call the same tool with `action=research` and the candidates.
 13. Reply in Traditional Chinese with a compact top-3 comparison grounded in the catalog data and Tavily brochure research.
 
 ## First-Layer Domain Menu
@@ -85,16 +84,16 @@ Ask the participant which direction they want first when the domain is not yet c
   - `asset_usage`
   - `asset_location`
 
-## Helper Scripts
+## Constrained Tool
 
-The helper scripts live in the same skill directory under `scripts/`.
+Use only the `insurance_advisor` tool. Do not use filesystem, shell, message, or spawn tools in a customer conversation.
 
 ### 1. Catalog shortlist
 
-Write facts JSON to a temp file, then run:
+Call:
 
-```bash
-python3 <skill-dir>/scripts/find_products.py --domain "Dental" --facts-file /tmp/facts.json
+```json
+{"action":"shortlist","domain":"Dental","facts":{"age":35,"residence_location":"Hong Kong"}}
 ```
 
 Expected output fields:
@@ -121,10 +120,10 @@ Each candidate includes:
 
 ### 2. Brochure research
 
-After shortlist selection, write the `candidates` array to a temp file and run:
+After shortlist selection, call:
 
-```bash
-python3 <skill-dir>/scripts/research_products.py --candidates-file /tmp/candidates.json
+```json
+{"action":"research","candidates":[...]}
 ```
 
 This script:

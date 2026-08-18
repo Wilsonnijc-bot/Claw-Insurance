@@ -24,6 +24,7 @@ import {
   addReplyTarget as apiAddReplyTarget,
   restartBridge as apiRestartBridge,
   type ApiClient,
+  type AIDraftResult,
   type SyncResult,
 } from '../services/api';
 import { nanobotWS, type WSEvent } from '../services/websocket';
@@ -101,6 +102,7 @@ export interface UseNanobotReturn {
   selectedClientPhone: string | null;
   autoDraftPhone: string | null;
   autoDraftContent: string | null;
+  autoDraftId: string | null;
   clearAutoDraft: () => void;
   aiGeneratingPhone: string | null;
   aiGeneratingStatus: string | null;
@@ -111,8 +113,8 @@ export interface UseNanobotReturn {
   markMessagesLoaded: (phone: string, reloadToken: number) => void;
   sendMessage: (phone: string, content: string) => Promise<void>;
   deleteClient: (phone: string) => Promise<void>;
-  requestAIDraft: (phone: string) => Promise<string | null>;
-  sendAIDraft: (phone: string, content: string) => Promise<void>;
+  requestAIDraft: (phone: string) => Promise<AIDraftResult | null>;
+  sendAIDraft: (phone: string, content: string, draftId?: string | null) => Promise<void>;
   toggleAutoDraft: (phone: string, enabled: boolean) => Promise<void>;
   broadcast: (phones: string[], content: string) => Promise<void>;
   syncWhatsApp: (phone: string) => Promise<SyncResult>;
@@ -139,6 +141,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const [selectedClientPhone, setSelectedClientPhone] = useState<string | null>(null);
   const [autoDraftPhone, setAutoDraftPhone] = useState<string | null>(null);
   const [autoDraftContent, setAutoDraftContent] = useState<string | null>(null);
+  const [autoDraftId, setAutoDraftId] = useState<string | null>(null);
   const [aiGeneratingPhone, setAiGeneratingPhone] = useState<string | null>(null);
   const [aiGeneratingStatus, setAiGeneratingStatus] = useState<string | null>(null);
   const [messageReloadToken, setMessageReloadToken] = useState(0);
@@ -296,6 +299,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setWhatsappAuthMessage(null);
       setAutoDraftPhone(null);
       setAutoDraftContent(null);
+      setAutoDraftId(null);
       setAiGeneratingPhone(null);
       setAiGeneratingStatus(null);
       setMessageReloadToken(0);
@@ -359,6 +363,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setAiGeneratingStatus(null);
       setAutoDraftPhone(event.phone);
       setAutoDraftContent(event.content);
+      setAutoDraftId(event.draftId || null);
     });
 
     const unsub3 = nanobotWS.on('auto_draft', (event: WSEvent) => {
@@ -367,6 +372,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
       setAiGeneratingStatus(null);
       setAutoDraftPhone(event.phone);
       setAutoDraftContent(event.content);
+      setAutoDraftId(event.draftId || null);
     });
 
     const unsub4 = nanobotWS.on('auto_draft_changed', (event: WSEvent) => {
@@ -515,19 +521,19 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     }
   }, [clearCurrentThread, refreshClients]);
 
-  const handleRequestAIDraft = useCallback(async (phone: string): Promise<string | null> => {
+  const handleRequestAIDraft = useCallback(async (phone: string): Promise<AIDraftResult | null> => {
     try {
       const result = await apiAIDraft(phone);
-      return result.draft || null;
+      return result.draft ? result : null;
     } catch (err) {
       console.error('AI draft failed:', err);
       return null;
     }
   }, []);
 
-  const handleSendAIDraft = useCallback(async (phone: string, content: string) => {
+  const handleSendAIDraft = useCallback(async (phone: string, content: string, draftId?: string | null) => {
     try {
-      await apiSendDraft(phone, content);
+      await apiSendDraft(phone, content, draftId);
       if (selectedClientPhoneRef.current === phone) {
         bumpMessageReloadToken();
       }
@@ -555,6 +561,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
   const clearAutoDraft = useCallback(() => {
     setAutoDraftPhone(null);
     setAutoDraftContent(null);
+    setAutoDraftId(null);
   }, []);
 
   const handleBroadcast = useCallback(async (phones: string[], content: string) => {
@@ -612,6 +619,7 @@ export function useNanobot(enabled = true): UseNanobotReturn {
     selectedClientPhone,
     autoDraftPhone,
     autoDraftContent,
+    autoDraftId,
     clearAutoDraft,
     aiGeneratingPhone,
     aiGeneratingStatus,

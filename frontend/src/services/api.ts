@@ -212,15 +212,20 @@ export async function sendMessage(phone: string, content: string): Promise<void>
 // ─── AI endpoints ───────────────────────────────────────────────────
 
 /** Request AI to generate a draft reply for the latest client message. */
-export async function requestAIDraft(phone: string): Promise<{ draft: string }> {
-  return request<{ draft: string }>(`/ai-draft/${phone}`, { method: 'POST' });
+export interface AIDraftResult {
+  draft: string;
+  draftId: string | null;
+}
+
+export async function requestAIDraft(phone: string): Promise<AIDraftResult> {
+  return request<AIDraftResult>(`/ai-draft/${phone}`, { method: 'POST' });
 }
 
 /** Approve and send an AI draft to the client via WhatsApp. */
-export async function sendAIDraft(phone: string, content: string): Promise<void> {
+export async function sendAIDraft(phone: string, content: string, draftId?: string | null): Promise<void> {
   await request(`/ai-send/${phone}`, {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, draftId: draftId || undefined }),
   });
 }
 

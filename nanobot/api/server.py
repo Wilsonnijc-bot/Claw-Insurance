@@ -17,6 +17,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from aiohttp import web, WSMsgType
 from loguru import logger
@@ -67,6 +68,9 @@ class ApiServer:
         self._status_task: asyncio.Task | None = None
         self._bridge_monitor_task: asyncio.Task | None = None
         self._last_auth_status: dict[str, Any] | None = None
+        # Latest generated draft per client.  The proposed state remains local
+        # and is committed only when this exact draft is approved.
+        self._pending_drafts: dict[str, dict[str, Any]] = {}
 
         self.app = web.Application(middlewares=[self._cors_middleware])
         self._setup_routes()
@@ -725,12 +729,11 @@ class ApiServer:
             # Wait briefly for the agent loop to finish capturing the message
             await asyncio.sleep(0.3)
 
-            response = await self.agent.process_direct(
-                client_message,
+            response, draft_id = await self._generate_pending_draft(
+                phone=phone,
+                client_message=client_message,
                 session_key=key,
-                channel="whatsapp",
                 chat_id=chat_id,
-                persist_history=False,
             )
 
             if response and self._ws_clients:
@@ -738,6 +741,7 @@ class ApiServer:
                     "type": "auto_draft",
                     "phone": phone,
                     "content": response,
+                    "draftId": draft_id,
                     "timestamp": datetime.now().isoformat(),
                 })
                 client_name = self._journal_client_name(phone)
@@ -761,6 +765,93 @@ class ApiServer:
                 "phone": phone,
                 "status": "error",
             })
+
+    async def _generate_pending_draft(
+        self,
+        *,
+        phone: str,
+        client_message: str,
+        session_key: str,
+        chat_id: str,
+        on_progress: Any = None,
+    ) -> tuple[str, str | None]:
+        """Generate one client-scoped draft and retain its proposed state."""
+        process_result = getattr(self.agent, "process_direct_result", None)
+        proposed_state: dict[str, Any] | None = None
+        if callable(process_result):
+            result = await process_result(
+                client_message,
+                session_key=session_key,
+                channel="whatsapp",
+                chat_id=chat_id,
+                on_progress=on_progress,
+                persist_history=False,
+            )
+            response = result.content if result else ""
+            metadata = dict(getattr(result, "metadata", {}) or {}) if result else {}
+            candidate = metadata.get("_draft_insurance_state")
+            proposed_state = candidate if isinstance(candidate, dict) else None
+        else:
+            # Backward-compatible path for test doubles and third-party agents.
+            response = await self.agent.process_direct(
+                client_message,
+                session_key=session_key,
+                channel="whatsapp",
+                chat_id=chat_id,
+                on_progress=on_progress,
+                persist_history=False,
+            )
+
+        if not response:
+            self._pending_drafts.pop(phone, None)
+            return "", None
+
+        draft_id = f"draft_{uuid4().hex}"
+        self._pending_drafts[phone] = {
+            "draft_id": draft_id,
+            "content": response,
+            "proposed_state": proposed_state,
+            "created_at": datetime.now().isoformat(),
+        }
+        return response, draft_id
+
+    async def _send_approved_whatsapp(
+        self,
+        *,
+        phone: str,
+        content: str,
+        is_ai_approved: bool,
+    ) -> dict[str, Any]:
+        """Send through WhatsApp and wait for the bridge acceptance ack."""
+        from nanobot.bus.events import OutboundMessage
+
+        request_id = f"send_{uuid4().hex}"
+        message = OutboundMessage(
+            channel="whatsapp",
+            chat_id=self._resolve_chat_id(phone),
+            content=content,
+            metadata={
+                "_human_approved_send": True,
+                "_send_request_id": request_id,
+                "_is_ai_approved": is_ai_approved,
+            },
+        )
+        channels = getattr(self.channel_manager, "channels", {}) or {}
+        whatsapp = channels.get("whatsapp") if isinstance(channels, dict) else None
+        send_confirmed = getattr(whatsapp, "send_confirmed", None)
+        if callable(send_confirmed):
+            ack = await send_confirmed(message, timeout_s=15.0)
+            status = str((ack or {}).get("status") or "")
+            if status != "accepted":
+                detail = str((ack or {}).get("detail") or status or "WhatsApp bridge did not confirm the send")
+                raise RuntimeError(detail)
+            return {"status": "bridge_confirmed", "request_id": request_id}
+
+        # Compatibility fallback used by isolated API tests or deployments
+        # without an instantiated WhatsApp channel.  It is explicitly queued,
+        # never described as delivered.
+        await self.bus.publish_outbound(message)
+        return {"status": "queued", "request_id": request_id}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1493,20 +1584,25 @@ class ApiServer:
             content = body.get("content", "").strip()
             if not content:
                 return web.json_response({"error": "Empty message"}, status=400)
-            # 1. Save to session
+            # 1. Ask the local bridge to accept the explicit human send.
+            delivery = await self._send_approved_whatsapp(
+                phone=phone,
+                content=content,
+                is_ai_approved=False,
+            )
+
+            # 2. Persist only after the bridge has accepted (or after the
+            # compatibility queue path has accepted) the outbound command.
             key = self._phone_to_session_key(phone)
             session = self.session_manager.get_or_create(key)
-            session.add_message("me", content, message_id=f"api_{datetime.now().timestamp()}")
+            session.add_message(
+                "me",
+                content,
+                message_id=f"api_{datetime.now().timestamp()}",
+                delivery_status=delivery["status"],
+                transport_request_id=delivery["request_id"],
+            )
             self._save_whatsapp_session(session)
-
-            # 2. Send via WhatsApp channel
-            from nanobot.bus.events import OutboundMessage
-            await self.bus.publish_outbound(OutboundMessage(
-                channel="whatsapp",
-                chat_id=self._resolve_chat_id(phone),
-                content=content,
-                metadata={"_human_approved_send": True},
-            ))
 
             client_name = self._journal_client_name(phone)
             await self._append_journal(
@@ -1517,7 +1613,10 @@ class ApiServer:
                 details={"preview": self._preview_text(content)},
             )
 
-            return web.json_response({"status": "sent", "phone": phone})
+            return web.json_response({"status": delivery["status"], "phone": phone})
+        except RuntimeError as exc:
+            logger.warning("WhatsApp bridge rejected message for {}: {}", phone, exc)
+            return web.json_response({"error": str(exc), "code": "send_not_confirmed"}, status=502)
         except Exception:
             logger.exception("Error sending message to {}", phone)
             return web.json_response({"error": "Internal error"}, status=500)
@@ -1573,14 +1672,13 @@ class ApiServer:
                     "content": text,
                 })
 
-            # Run agent to generate response
-            response = await self.agent.process_direct(
-                last_client_msg,
+            # Run agent to generate a client-scoped, approval-bound draft.
+            response, draft_id = await self._generate_pending_draft(
+                phone=phone,
+                client_message=last_client_msg,
                 session_key=key,
-                channel="whatsapp",
                 chat_id=chat_id,
                 on_progress=on_progress,
-                persist_history=False,
             )
 
             if response:
@@ -1588,6 +1686,7 @@ class ApiServer:
                     "type": "ai_draft",
                     "phone": phone,
                     "content": response,
+                    "draftId": draft_id,
                     "status": "completed",
                     "timestamp": datetime.now().isoformat(),
                 })
@@ -1603,6 +1702,7 @@ class ApiServer:
                 "status": "completed",
                 "phone": phone,
                 "draft": response or "",
+                "draftId": draft_id,
             })
         except Exception:
             logger.exception("Error generating AI draft for {}", phone)
@@ -1623,26 +1723,46 @@ class ApiServer:
         try:
             body = await request.json()
             content = body.get("content", "").strip()
+            draft_id = str(body.get("draftId") or "").strip()
             if not content:
                 return web.json_response({"error": "Empty content"}, status=400)
-            # 1. Persist the approved message to session JSONL
+            pending = self._pending_drafts.get(phone)
+            if draft_id and (
+                not pending or str(pending.get("draft_id") or "") != draft_id
+            ):
+                return web.json_response(
+                    {
+                        "error": "This AI draft is stale or belongs to another client. Generate it again before sending.",
+                        "code": "stale_draft",
+                    },
+                    status=409,
+                )
+
+            # 1. Wait for local WhatsApp bridge acceptance.
+            delivery = await self._send_approved_whatsapp(
+                phone=phone,
+                content=content,
+                is_ai_approved=True,
+            )
+
+            # 2. Commit the exact approved content and its proposed state.
             key = self._phone_to_session_key(phone)
             session = self.session_manager.get_or_create(key)
             session.add_message(
                 "me", content,
                 message_id=f"ai_send_{datetime.now().timestamp()}",
                 is_ai_approved=True,
+                draft_id=draft_id,
+                delivery_status=delivery["status"],
+                transport_request_id=delivery["request_id"],
             )
+            if pending and (not draft_id or pending.get("draft_id") == draft_id):
+                commit_state = getattr(self.agent, "commit_approved_draft_state", None)
+                if callable(commit_state):
+                    commit_state(session, pending.get("proposed_state"))
             self._save_whatsapp_session(session)
-
-            # 2. Send via WhatsApp
-            from nanobot.bus.events import OutboundMessage
-            await self.bus.publish_outbound(OutboundMessage(
-                channel="whatsapp",
-                chat_id=self._resolve_chat_id(phone),
-                content=content,
-                metadata={"_human_approved_send": True},
-            ))
+            if pending and (not draft_id or pending.get("draft_id") == draft_id):
+                self._pending_drafts.pop(phone, None)
 
             client_name = self._journal_client_name(phone)
             await self._append_journal(
@@ -1653,7 +1773,10 @@ class ApiServer:
                 details={"preview": self._preview_text(content)},
             )
 
-            return web.json_response({"status": "sent", "phone": phone})
+            return web.json_response({"status": delivery["status"], "phone": phone})
+        except RuntimeError as exc:
+            logger.warning("WhatsApp bridge rejected AI draft for {}: {}", phone, exc)
+            return web.json_response({"error": str(exc), "code": "send_not_confirmed"}, status=502)
         except Exception:
             logger.exception("Error sending AI draft to {}", phone)
             return web.json_response({"error": "Internal error"}, status=500)

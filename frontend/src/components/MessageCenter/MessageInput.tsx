@@ -8,10 +8,9 @@ interface MessageInputProps {
   aiLoading: LoadingState | null;
   broadcastMode: boolean;
   onToggleBroadcast: () => void;
-  /** When set, pre-fills the input with draft content for editing. */
-  draftContent?: string | null;
-  /** Called after the draft content has been consumed (loaded into input). */
-  onDraftConsumed?: () => void;
+  /** Client-scoped controlled composer value. */
+  value: string;
+  onChange: (value: string) => void;
 }
 
 export const MessageInput: React.FC<MessageInputProps> = ({
@@ -20,22 +19,11 @@ export const MessageInput: React.FC<MessageInputProps> = ({
   aiLoading,
   broadcastMode,
   onToggleBroadcast,
-  draftContent,
-  onDraftConsumed,
+  value,
+  onChange,
 }) => {
-  const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  // Load draft content into the input when provided
-  useEffect(() => {
-    if (draftContent) {
-      setMessage(draftContent);
-      onDraftConsumed?.();
-      // Focus the textarea so the user can edit immediately
-      setTimeout(() => textareaRef.current?.focus(), 50);
-    }
-  }, [draftContent, onDraftConsumed]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -43,10 +31,10 @@ export const MessageInput: React.FC<MessageInputProps> = ({
       textareaRef.current.style.height = 'auto';
       textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 120)}px`;
     }
-  }, [message]);
+  }, [value]);
 
   const handleSend = async () => {
-    const trimmed = message.trim();
+    const trimmed = value.trim();
     if (!trimmed || sending) {
       return;
     }
@@ -54,7 +42,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
     setSending(true);
     try {
       await onSendMessage(trimmed);
-      setMessage('');
+      onChange('');
       if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
       }
@@ -92,8 +80,8 @@ export const MessageInput: React.FC<MessageInputProps> = ({
       <div className="relative">
         <textarea
           ref={textareaRef}
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={broadcastMode ? '输入广播消息...' : '输入消息或请求AI建议...'}
           disabled={aiLoading?.isGenerating || sending}
@@ -117,7 +105,7 @@ export const MessageInput: React.FC<MessageInputProps> = ({
           {/* Send Button */}
           <button
             onClick={() => void handleSend()}
-            disabled={!message.trim() || aiLoading?.isGenerating || sending}
+            disabled={!value.trim() || aiLoading?.isGenerating || sending}
             className="flex items-center gap-1 px-3 py-1.5 bg-deep-trust text-white text-xs font-semibold rounded-lg hover:bg-deep-trust/90 hover:shadow-md hover:shadow-deep-trust/15 transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-none btn-press"
           >
             <Send className="w-3.5 h-3.5" strokeWidth={1.5} />

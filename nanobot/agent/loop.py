@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import re
 import weakref
@@ -19,6 +20,7 @@ from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.insurance_advisor import InsuranceAdvisorTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -239,11 +241,13 @@ class AgentLoop:
         # Privacy pipeline companion path:
         # AgentLoop writes local raw/sanitized snapshots for inspection using
         # the same deterministic sanitizer that protects cloud-bound payloads.
+        self._privacy_config = privacy_config or PrivacyGatewayConfig()
         self._privacy_sanitizer = TextPrivacySanitizer(
-            privacy_config or PrivacyGatewayConfig(),
+            self._privacy_config,
             known_names=load_known_names(workspace),
         )
-        self._ensure_privacy_debug_dir()
+        if self._privacy_config.save_redacted_debug:
+            self._ensure_privacy_debug_dir()
         self._register_default_tools()
 
     def _context_for_session(self, session_key: str) -> ContextBuilder:
@@ -275,6 +279,7 @@ class AgentLoop:
         ))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        self.tools.register(InsuranceAdvisorTool(self.workspace))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
@@ -286,8 +291,8 @@ class AgentLoop:
         if not self._privacy_debug_counter_file.exists():
             self._privacy_debug_counter_file.write_text("0\n", encoding="utf-8")
 
-    def _next_privacy_debug_paths(self, *, client_tag: str = "") -> tuple[Path, Path]:
-        """Return the next sequential raw and sanitized privacy debug paths.
+    def _next_privacy_debug_path(self, *, client_tag: str = "") -> Path:
+        """Return the next sequential redacted privacy debug path.
 
         When *client_tag* is provided the phone is embedded in the filename
         so that debug artefacts are visibly scoped to one client.
@@ -300,9 +305,7 @@ class AgentLoop:
         next_index = current + 1
         self._privacy_debug_counter_file.write_text(f"{next_index}\n", encoding="utf-8")
         tag = f"_{client_tag}" if client_tag else ""
-        raw_path = self._privacy_debug_dir / f"test_{next_index:05d}{tag}.txt"
-        sanitized_path = self._privacy_debug_dir / f"test_{next_index:05d}{tag}_sanitized.txt"
-        return raw_path, sanitized_path
+        return self._privacy_debug_dir / f"test_{next_index:05d}{tag}_sanitized.txt"
 
     @staticmethod
     def _render_snapshot_text(
@@ -368,7 +371,7 @@ class AgentLoop:
         history: list[dict[str, Any]],
     ) -> None:
         """Write per-turn prompt/memory/history snapshot for debugging."""
-        if not initial_messages:
+        if not self._privacy_config.save_redacted_debug or not initial_messages:
             return
 
         try:
@@ -377,11 +380,10 @@ class AgentLoop:
             client_key = ClientKey.try_normalize(
                 session_key.split(":", 1)[1] if ":" in session_key else session_key
             )
-            client_tag = client_key.phone if client_key else ""
-            out_raw, out_sanitized = self._next_privacy_debug_paths(client_tag=client_tag)
+            session_hash = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:12]
+            client_tag = session_hash if client_key else ""
+            out_sanitized = self._next_privacy_debug_path(client_tag=client_tag)
             generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S (%A) (%Z)")
-            system_prompt = self._stringify_message_content(initial_messages[0].get("content", ""))
-            user_payload = initial_messages[-1].get("content", "")
             if client_key:
                 per_client_mem = client_key.memory_dir(self.workspace) / "MEMORY.md"
                 per_client_hist = client_key.memory_dir(self.workspace) / "HISTORY.md"
@@ -393,23 +395,8 @@ class AgentLoop:
             memory_text = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
             history_text = history_file.read_text(encoding="utf-8") if history_file.exists() else ""
 
-            raw_text = self._render_snapshot_text(
-                generated_at=generated_at,
-                session_key=session_key,
-                channel=channel,
-                chat_id=chat_id,
-                system_prompt=system_prompt,
-                history=history,
-                memory_text=memory_text,
-                history_text=history_text,
-                user_payload=str(user_payload),
-            )
-            # Local-only artifact: raw snapshot before privacy masking.
-            out_raw.write_text(raw_text, encoding="utf-8")
-
-            # Privacy pipeline debug companion:
-            # Sanitize the same turn snapshot so local debug files show a raw vs
-            # sanitized comparison using the identical masking rules.
+            # Debugging is deliberately redacted-only.  Raw prompt snapshots
+            # previously duplicated customer PII on disk.
             sanitized_result = self._privacy_sanitizer.sanitize_chat_payload(
                 {"messages": initial_messages},
                 headers={"x-session-affinity": session_key},
@@ -431,9 +418,9 @@ class AgentLoop:
             sanitized_history_md, _, _ = self._privacy_sanitizer.redact_text_for_debug(history_text, session_key=session_key)
             sanitized_text = self._render_snapshot_text(
                 generated_at=generated_at,
-                session_key=session_key,
+                session_key=f"session:{session_hash}",
                 channel=channel,
-                chat_id=chat_id,
+                chat_id="Unknown Chat ID",
                 system_prompt=sanitized_system,
                 history=sanitized_history,
                 memory_text=sanitized_memory,
@@ -442,7 +429,6 @@ class AgentLoop:
                 sanitizer_meta={
                     "blocked": sanitized_result.blocked,
                     "reasons": sanitized_result.reasons,
-                    "placeholder_map": sanitized_result.placeholder_map,
                 },
             )
             # Local-only artifact: sanitized snapshot with placeholder metadata.
@@ -804,17 +790,23 @@ class AgentLoop:
             if message.get("role") == "assistant":
                 for tool_call in message.get("tool_calls", []) or []:
                     function = tool_call.get("function", {}) or {}
-                    if function.get("name") != "exec":
-                        continue
                     try:
                         arguments = json.loads(function.get("arguments") or "{}")
                     except json.JSONDecodeError:
                         arguments = {}
-                    command = str(arguments.get("command", ""))
-                    if "find_products.py" in command:
-                        pending_exec[tool_call.get("id", "")] = "find_products"
-                    elif "research_products.py" in command:
-                        pending_exec[tool_call.get("id", "")] = "research_products"
+                    if function.get("name") == "insurance_advisor":
+                        action = str(arguments.get("action") or "")
+                        if action == "shortlist":
+                            pending_exec[tool_call.get("id", "")] = "find_products"
+                        elif action == "research":
+                            pending_exec[tool_call.get("id", "")] = "research_products"
+                    elif function.get("name") == "exec":
+                        # Retain state parsing for already-persisted legacy turns.
+                        command = str(arguments.get("command", ""))
+                        if "find_products.py" in command:
+                            pending_exec[tool_call.get("id", "")] = "find_products"
+                        elif "research_products.py" in command:
+                            pending_exec[tool_call.get("id", "")] = "research_products"
             elif message.get("role") == "tool":
                 tool_id = str(message.get("tool_call_id", ""))
                 action = pending_exec.get(tool_id)
@@ -899,6 +891,8 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        session_affinity: str | None = None,
+        allowed_tools: set[str] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -911,11 +905,12 @@ class AgentLoop:
 
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=self.tools.get_definitions(allowed_tools),
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
+                session_affinity=session_affinity,
             )
 
             if response.has_tool_calls:
@@ -946,7 +941,10 @@ class AgentLoop:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if allowed_tools is not None and tool_call.name not in allowed_tools:
+                        result = f"Error: Tool '{tool_call.name}' is not available in this customer conversation."
+                    else:
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -1468,7 +1466,10 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id, metadata=msg.metadata,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages,
+                session_affinity=key,
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self._save_session(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -1484,6 +1485,7 @@ class AgentLoop:
             session = Session(
                 key=source_session.key,
                 messages=copy.deepcopy(source_session.messages),
+                offline_meeting_notes=copy.deepcopy(source_session.offline_meeting_notes),
                 created_at=source_session.created_at,
                 updated_at=source_session.updated_at,
                 metadata=copy.deepcopy(source_session.metadata),
@@ -1629,6 +1631,8 @@ class AgentLoop:
             max_messages=None if use_full_history else self.memory_window,
             include_consolidated=use_full_history,
         )
+        if not persist_history:
+            history = self._without_duplicate_current_message(history, msg.content)
         initial_messages = self._context_for_session(session.key).build_messages(
             history=history,
             current_message=msg.content,
@@ -1652,7 +1656,14 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            session_affinity=session.key,
+            allowed_tools=(
+                {"insurance_advisor", "web_search", "web_fetch"}
+                if msg.channel == "whatsapp"
+                else None
+            ),
         )
 
         if final_content is None:
@@ -1677,10 +1688,37 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        outbound_metadata = dict(msg.metadata or {})
+        if not persist_history and insurance_state is not None:
+            outbound_metadata["_draft_insurance_state"] = copy.deepcopy(
+                self._get_insurance_state(session)
+            )
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            metadata=outbound_metadata,
         )
+
+    @staticmethod
+    def _without_duplicate_current_message(
+        history: list[dict[str, Any]],
+        current_message: str,
+    ) -> list[dict[str, Any]]:
+        """Remove only a trailing user entry equal to the current draft input.
+
+        Draft generation reads the already-captured WhatsApp message and also
+        passes it as ``current_message``.  Keeping both makes the model see the
+        same customer turn twice.  Earlier identical messages are preserved.
+        """
+        if not history:
+            return history
+        last = history[-1]
+        if last.get("role") != "user":
+            return history
+        previous = str(last.get("content") or "").strip()
+        current = str(current_message or "").strip()
+        if not current or previous != current:
+            return history
+        return history[:-1]
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int, *, inbound_msg: InboundMessage | None = None) -> None:
         """Save new-turn messages into session, truncating large tool results."""
@@ -1751,12 +1789,48 @@ class AgentLoop:
         persist_history: bool = True,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
+        response = await self.process_direct_result(
+            content,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            on_progress=on_progress,
+            persist_history=persist_history,
+        )
+        return response.content if response else ""
+
+    async def process_direct_result(
+        self,
+        content: str,
+        session_key: str = "cli:direct",
+        channel: str = "cli",
+        chat_id: str = "direct",
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        persist_history: bool = True,
+    ) -> OutboundMessage | None:
+        """Process directly while retaining draft metadata for approval."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(
+        return await self._process_message(
             msg,
             session_key=session_key,
             on_progress=on_progress,
             persist_history=persist_history,
         )
-        return response.content if response else ""
+
+    def commit_approved_draft_state(
+        self,
+        session: Session,
+        proposed_state: dict[str, Any] | None,
+    ) -> None:
+        """Commit state proposed during draft generation after human approval."""
+        if not isinstance(proposed_state, dict):
+            return
+        required = {
+            self._INSURANCE_FLOW_MODE_KEY,
+            self._INSURANCE_GENERIC_REPLY_COUNT_KEY,
+            self._INSURANCE_CYCLE_ACTIVE_KEY,
+            self._INSURANCE_WAITING_FOR_ANSWER_KEY,
+        }
+        if required.issubset(proposed_state):
+            self._write_insurance_state(session, proposed_state)

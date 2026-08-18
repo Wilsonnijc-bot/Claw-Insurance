@@ -243,6 +243,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        session_affinity: str | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -286,9 +287,14 @@ class LiteLLMProvider(LLMProvider):
         if self.api_base:
             kwargs["api_base"] = self.api_base
 
-        # Pass extra headers (e.g. APP-Code for AiHubMix)
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
+        # Pass configured headers (e.g. APP-Code for AiHubMix).  Conversation
+        # affinity is added only for a loopback privacy gateway, never for a
+        # cloud endpoint, and the gateway strips it before forwarding.
+        extra_headers = dict(self.extra_headers or {})
+        if session_affinity and self._is_loopback_api_base(self.api_base):
+            extra_headers["x-session-affinity"] = session_affinity
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
         
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
@@ -307,6 +313,19 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {self._format_gateway_error(e)}",
                 finish_reason="error",
             )
+
+    @staticmethod
+    def _is_loopback_api_base(api_base: str | None) -> bool:
+        """Return whether an API base points at the local machine."""
+        if not api_base:
+            return False
+        from urllib.parse import urlparse
+
+        try:
+            host = (urlparse(api_base).hostname or "").casefold()
+        except ValueError:
+            return False
+        return host in {"127.0.0.1", "localhost", "::1"}
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

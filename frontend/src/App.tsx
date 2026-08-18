@@ -28,6 +28,11 @@ interface OfflineMeetingDraftState {
   text: string;
 }
 
+interface ClientDraftState {
+  content: string;
+  draftId: string | null;
+}
+
 function App() {
   // Auth State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -45,8 +50,8 @@ function App() {
   const [showBroadcastModal, setShowBroadcastModal] = useState(false);
   const [showLogViewer, setShowLogViewer] = useState(false);
   const [showAddTarget, setShowAddTarget] = useState(false);
-  const [editingDraftContent, setEditingDraftContent] = useState<string | null>(null);
-  const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
+  const [draftsByClient, setDraftsByClient] = useState<Record<string, ClientDraftState>>({});
+  const [composerByClient, setComposerByClient] = useState<Record<string, string>>({});
   const [initialConversationLoading, setInitialConversationLoading] = useState(false);
   const [deleteCandidateId, setDeleteCandidateId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState('');
@@ -160,17 +165,18 @@ function App() {
     if (nanobot.autoDraftPhone && nanobot.autoDraftContent) {
       // Draft arrived — stop the thinking indicator
       stopGeneration();
-      // If the user is looking at the client whose draft just arrived,
-      // immediately load it into the composer textarea.
-      if (nanobot.autoDraftPhone === selectedClientId) {
-        setEditingDraftContent(nanobot.autoDraftContent);
-        setEditingDraftId(`auto_${Date.now()}`);
-      }
-      // Even if not viewing this client, store it so it'll load when they select it
-      // (we clear after consuming)
+      const phone = nanobot.autoDraftPhone;
+      setDraftsByClient((previous) => ({
+        ...previous,
+        [phone]: { content: nanobot.autoDraftContent!, draftId: nanobot.autoDraftId },
+      }));
+      setComposerByClient((previous) => ({
+        ...previous,
+        [phone]: nanobot.autoDraftContent!,
+      }));
       nanobot.clearAutoDraft();
     }
-  }, [nanobot.autoDraftPhone, nanobot.autoDraftContent, selectedClientId, nanobot, stopGeneration]);
+  }, [nanobot.autoDraftPhone, nanobot.autoDraftContent, nanobot.autoDraftId, nanobot, stopGeneration]);
 
   // Backend-driven AI generating indicator (for both auto-draft and manual paths)
   useEffect(() => {
@@ -363,8 +369,8 @@ function App() {
     setIsAuthenticated(false);
     setCurrentUser(null);
     setSelectedClientId(null);
-    setEditingDraftContent(null);
-    setEditingDraftId(null);
+    setDraftsByClient({});
+    setComposerByClient({});
     setInitialConversationLoading(false);
     setDeleteCandidateId(null);
     setDeleteError('');
@@ -441,16 +447,16 @@ function App() {
   const handleSendMessage = useCallback(
     async (content: string) => {
       if (!selectedClientId) return;
-      const wasDraftEdit = !!editingDraftId;
-
-      // Clear editing state
-      if (editingDraftId) {
-        setEditingDraftId(null);
-      }
+      const draft = draftsByClient[selectedClientId];
 
       // If this was an edited AI draft, route through sendAIDraft (saves to JSONL + sends)
-      if (wasDraftEdit && nanobot.backendConnected) {
-        await nanobot.sendAIDraft(selectedClientId, content);
+      if (draft && nanobot.backendConnected) {
+        await nanobot.sendAIDraft(selectedClientId, content, draft.draftId);
+        setDraftsByClient((previous) => {
+          const next = { ...previous };
+          delete next[selectedClientId];
+          return next;
+        });
         return;
       }
 
@@ -459,7 +465,7 @@ function App() {
       }
       await nanobot.sendMessage(selectedClientId, content);
     },
-    [selectedClientId, nanobot, editingDraftId]
+    [selectedClientId, nanobot, draftsByClient]
   );
 
   const handleRequestAI = useCallback(() => {
@@ -470,10 +476,17 @@ function App() {
       stopGeneration();
       return;
     }
-    nanobot.requestAIDraft(selectedClientId).then((draft) => {
-      if (draft && selectedClientId) {
-        setEditingDraftContent(draft);
-        setEditingDraftId(`ai_${Date.now()}`);
+    const requestedClientId = selectedClientId;
+    nanobot.requestAIDraft(requestedClientId).then((draft) => {
+      if (draft) {
+        setDraftsByClient((previous) => ({
+          ...previous,
+          [requestedClientId]: { content: draft.draft, draftId: draft.draftId },
+        }));
+        setComposerByClient((previous) => ({
+          ...previous,
+          [requestedClientId]: draft.draft,
+        }));
       }
       stopGeneration();
     }).catch(() => {
@@ -644,13 +657,21 @@ function App() {
       setDeleteCandidateId(null);
 
       if (selectedClientId === targetId) {
-        setEditingDraftContent(null);
-        setEditingDraftId(null);
         setSelectedClientId(nextClientId);
         if (nextClientId) {
           void nanobot.loadMessages(nextClientId);
         }
       }
+      setDraftsByClient((previous) => {
+        const next = { ...previous };
+        delete next[targetId];
+        return next;
+      });
+      setComposerByClient((previous) => {
+        const next = { ...previous };
+        delete next[targetId];
+        return next;
+      });
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : '删除失败');
     } finally {
@@ -903,8 +924,11 @@ function App() {
               aiLoading={aiLoading}
               broadcastMode={broadcastMode}
               onToggleBroadcast={handleToggleBroadcast}
-              draftContent={editingDraftContent}
-              onDraftConsumed={() => setEditingDraftContent(null)}
+              value={composerByClient[selectedClient.id] || ''}
+              onChange={(value) => {
+                const clientId = selectedClient.id;
+                setComposerByClient((previous) => ({ ...previous, [clientId]: value }));
+              }}
             />
           )}
         </div>

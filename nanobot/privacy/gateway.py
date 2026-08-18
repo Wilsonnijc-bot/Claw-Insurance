@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ class GatewayResponse:
 
 
 class PrivacyDebugStore:
-    """Persist raw and sanitized request/response payloads locally.
+    """Persist sanitized request/response payloads locally.
 
     Privacy pipeline step 4 side effect: write gateway-facing artifacts into
     ``state/debug/privacy/privacy_XXXXX.json`` so the sanitized request
@@ -42,7 +43,6 @@ class PrivacyDebugStore:
     def write(
         self,
         *,
-        raw_request: dict[str, Any],
         result: SanitizationResult,
         upstream_url: str,
         response_status: int,
@@ -59,14 +59,12 @@ class PrivacyDebugStore:
         path = self.dir / f"privacy_{next_index:05d}.json"
         payload = {
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "session_key": result.session_key,
+            "session_key": f"session:{hashlib.sha256(result.session_key.encode('utf-8')).hexdigest()[:12]}",
             "blocked": result.blocked,
             "reasons": result.reasons,
             "upstream_url": upstream_url,
-            "placeholder_map": result.placeholder_map,
-            "raw_request": raw_request,
+            # Do not persist the reverse mapping: its keys are the raw PII.
             "sanitized_request": result.sanitized_payload,
-            "raw_prompt": raw_request.get("messages"),
             "sanitized_prompt": result.sanitized_payload.get("messages"),
             "response_status": response_status,
             "sanitized_response": response_body,
@@ -114,7 +112,6 @@ class PrivacyGatewayService:
             blocked = TextPrivacySanitizer.build_blocked_response(model=model)
             if self.config.save_redacted_debug:
                 self.debug_store.write(
-                    raw_request=payload,
                     result=result,
                     upstream_url=f"{self.upstream_base}/chat/completions",
                     response_status=200,
@@ -134,6 +131,7 @@ class PrivacyGatewayService:
         content_type = response.headers.get("content-type", "application/json")
         try:
             response_body = response.json()
+            response_body = self._sanitize_cloud_response(response_body, headers=headers)
             raw_body = json.dumps(response_body).encode("utf-8")
             content_type = "application/json"
         except ValueError:
@@ -143,7 +141,6 @@ class PrivacyGatewayService:
         if self.config.save_redacted_debug:
             # Persist the sanitized request/response pair for inspection.
             self.debug_store.write(
-                raw_request=payload,
                 result=result,
                 upstream_url=f"{self.upstream_base}/chat/completions",
                 response_status=response.status_code,
@@ -151,6 +148,55 @@ class PrivacyGatewayService:
             )
 
         return GatewayResponse(status_code=response.status_code, body=raw_body, content_type=content_type)
+
+    def _sanitize_cloud_response(
+        self,
+        response_body: Any,
+        *,
+        headers: dict[str, str] | None,
+    ) -> Any:
+        """Apply the same deterministic PII filter to cloud model output.
+
+        This happens locally before the Agent sees assistant text or tool
+        arguments.  The WhatsApp channel may later restore the one verified
+        sender-name placeholder from local message metadata.
+        """
+        if not isinstance(response_body, dict):
+            return response_body
+        choices = response_body.get("choices")
+        if not isinstance(choices, list):
+            return response_body
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, (str, list, dict)):
+                result = self.sanitizer.sanitize_chat_payload(
+                    {"messages": [{"role": "assistant", "content": content}]},
+                    headers=headers,
+                )
+                sanitized = result.sanitized_payload.get("messages") or []
+                if sanitized:
+                    message["content"] = sanitized[0].get("content")
+
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict) or not isinstance(function.get("arguments"), str):
+                    continue
+                result = self.sanitizer.sanitize_chat_payload(
+                    {"messages": [{"role": "assistant", "content": function["arguments"]}]},
+                    headers=headers,
+                )
+                sanitized = result.sanitized_payload.get("messages") or []
+                if sanitized:
+                    function["arguments"] = sanitized[0].get("content", function["arguments"])
+        return response_body
 
     @staticmethod
     def _build_upstream_headers(headers: dict[str, str] | None) -> dict[str, str]:

@@ -380,7 +380,9 @@ async def test_send_message_in_cdp_draft_mode_queues_human_approved_send(tmp_pat
     outbound = await bus.consume_outbound()
     assert outbound.chat_id == "1234567890@s.whatsapp.net"
     assert outbound.content == "hello"
-    assert outbound.metadata == {"_human_approved_send": True}
+    assert outbound.metadata["_human_approved_send"] is True
+    assert outbound.metadata["_is_ai_approved"] is False
+    assert str(outbound.metadata["_send_request_id"]).startswith("send_")
     assert (tmp_path / "sessions" / "whatsapp__1234567890" / "session.jsonl").exists()
 
 
@@ -483,7 +485,9 @@ async def test_ai_send_in_cdp_draft_mode_queues_human_approved_send(tmp_path: Pa
     outbound = await bus.consume_outbound()
     assert outbound.chat_id == "1234567890@s.whatsapp.net"
     assert outbound.content == "approved"
-    assert outbound.metadata == {"_human_approved_send": True}
+    assert outbound.metadata["_human_approved_send"] is True
+    assert outbound.metadata["_is_ai_approved"] is True
+    assert str(outbound.metadata["_send_request_id"]).startswith("send_")
     session = session_manager.read_persisted("whatsapp:1234567890")
     assert session.messages[0]["is_ai_approved"] is True
 

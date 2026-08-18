@@ -99,7 +99,7 @@ def main() -> None:
         listen_host=host,
         listen_port=port,
         fail_closed=os.environ.get("NANOBOT_PRIVACY_FAIL_CLOSED", "true").lower() not in {"0", "false", "no"},
-        save_redacted_debug=os.environ.get("NANOBOT_PRIVACY_SAVE_REDACTED_DEBUG", "true").lower() not in {"0", "false", "no"},
+        save_redacted_debug=os.environ.get("NANOBOT_PRIVACY_SAVE_REDACTED_DEBUG", "false").lower() not in {"0", "false", "no"},
         text_only_scope=os.environ.get("NANOBOT_PRIVACY_TEXT_ONLY_SCOPE", "true").lower() not in {"0", "false", "no"},
         enable_ner_assist=os.environ.get("NANOBOT_PRIVACY_ENABLE_NER_ASSIST", "false").lower() in {"1", "true", "yes"},
     )

@@ -110,6 +110,7 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        session_affinity: str | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -120,6 +121,8 @@ class LLMProvider(ABC):
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            session_affinity: Local-only conversation key used by an on-device
+                privacy gateway. Providers must not forward it to cloud APIs.
         
         Returns:
             LLMResponse with content and/or tool calls.

@@ -132,9 +132,11 @@ async def test_skill_mode_with_missing_fields_stays_in_skill_mode(tmp_path: Path
                 tool_calls=[
                     ToolCallRequest(
                         id="call1",
-                        name="exec",
+                        name="insurance_advisor",
                         arguments={
-                            "command": "python3 nanobot/skills/insurance-product-advisor/scripts/find_products.py --domain Dental --facts-file /tmp/facts.json"
+                            "action": "shortlist",
+                            "domain": "Dental",
+                            "facts": {},
                         },
                     )
                 ],
@@ -145,7 +147,7 @@ async def test_skill_mode_with_missing_fields_stays_in_skill_mode(tmp_path: Path
     loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
 
     async def _execute(name: str, params: dict) -> str:
-        assert name == "exec"
+        assert name == "insurance_advisor"
         return """
         {
           "domain": "dental",
@@ -196,9 +198,10 @@ async def test_research_completion_resets_to_generic_mode(tmp_path: Path) -> Non
                 tool_calls=[
                     ToolCallRequest(
                         id="research1",
-                        name="exec",
+                        name="insurance_advisor",
                         arguments={
-                            "command": "python3 nanobot/skills/insurance-product-advisor/scripts/research_products.py --candidates-file /tmp/candidates.json"
+                            "action": "research",
+                            "candidates": [{"plan_id": "d1"}],
                         },
                     )
                 ],
@@ -209,8 +212,7 @@ async def test_research_completion_resets_to_generic_mode(tmp_path: Path) -> Non
     loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
 
     async def _execute(name: str, params: dict) -> str:
-        command = params["command"]
-        if "find_products.py" in command:
+        if params["action"] == "shortlist":
             return """
             {
               "domain": "dental",
@@ -255,9 +257,11 @@ async def test_no_fit_completion_resets_to_generic_mode(tmp_path: Path) -> None:
                 tool_calls=[
                     ToolCallRequest(
                         id="find1",
-                        name="exec",
+                        name="insurance_advisor",
                         arguments={
-                            "command": "python3 nanobot/skills/insurance-product-advisor/scripts/find_products.py --domain Dental --facts-file /tmp/facts.json"
+                            "action": "shortlist",
+                            "domain": "Dental",
+                            "facts": {},
                         },
                     )
                 ],

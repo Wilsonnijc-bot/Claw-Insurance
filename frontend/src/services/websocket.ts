@@ -31,6 +31,7 @@ export interface WSEvent {
   channel?: string;
   chat_id?: string;
   content?: string;
+  draftId?: string;
   sender?: string;
   timestamp?: string;
   status?: string;

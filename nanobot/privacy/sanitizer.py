@@ -236,8 +236,11 @@ class TextPrivacySanitizer:
                 item_type = str(block.get("type", ""))
                 if item_type in _TEXT_BLOCK_TYPES and isinstance(block.get("text"), str):
                     block["text"] = self._sanitize_text(block["text"], placeholder_map, reasons)
-                elif item_type == "image_url" and not self.config.text_only_scope:
-                    block = block
+                elif item_type == "image_url" and self.config.text_only_scope:
+                    # Text masking cannot inspect pixels.  In fail-closed mode
+                    # this reason prevents an unredacted customer image from
+                    # leaving the machine; callers may add local OCR later.
+                    reasons.append("image content cannot be privacy-sanitized")
                 new_items.append(block)
             clean["content"] = new_items
         elif isinstance(content, dict):

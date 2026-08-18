@@ -1783,7 +1783,7 @@ async def test_whatsapp_draft_mode_targeted_direct_message_reaches_bus(tmp_path:
     assert msg.metadata["sender_phone"] == "+1234567890"
     assert msg.metadata["sender"] == "123@s.whatsapp.net"
     assert msg.metadata["sender_name"] == "Alice Chan"
-    assert msg.metadata["capture_only"] is False
+    assert msg.metadata["capture_only"] is True
     assert msg.metadata["auto_reply_target"] is True
     assert msg.metadata["reply_target_phone"] == "1234567890"
     assert msg.metadata["reply_target_push_name"] == "Alice Chan"

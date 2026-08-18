@@ -121,11 +121,11 @@ def test_gateway_endpoint_sanitizes_and_forwards_exact_cloud_payload(
     debug_file = tmp_path / "privacy_debug" / "privacy_00001.json"
     assert debug_file.exists()
     debug_payload = json.loads(debug_file.read_text(encoding="utf-8"))
-    assert debug_payload["raw_request"] == payload
     assert debug_payload["sanitized_request"] == forwarded
-    assert debug_payload["raw_prompt"] == payload["messages"]
     assert debug_payload["sanitized_prompt"] == forwarded["messages"]
-    assert debug_payload["placeholder_map"]
+    assert "raw_request" not in debug_payload
+    assert "raw_prompt" not in debug_payload
+    assert "placeholder_map" not in debug_payload
     assert debug_payload["sanitized_response"]["choices"][0]["message"]["content"] == "Hi Unknown Sender Name"
 
 
@@ -154,6 +154,6 @@ def test_gateway_fail_closed_returns_local_safe_message_and_skips_upstream(
     assert response.status_code == 200
     assert "can't send this request to the cloud model" in body["choices"][0]["message"]["content"]
     debug_payload = json.loads((tmp_path / "privacy_debug" / "privacy_00001.json").read_text(encoding="utf-8"))
-    assert debug_payload["raw_request"] == payload
-    assert debug_payload["raw_prompt"] == payload["messages"]
+    assert "raw_request" not in debug_payload
+    assert "raw_prompt" not in debug_payload
     assert debug_payload["sanitized_prompt"] == payload["messages"]

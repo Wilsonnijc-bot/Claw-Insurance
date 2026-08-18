@@ -12,6 +12,7 @@ interface SendCommand {
   type: 'send';
   to: string;
   text: string;
+  requestId?: string;
 }
 
 interface PrepareDraftCommand {
@@ -151,8 +152,25 @@ export class BridgeServer {
 
   private async handleCommand(cmd: BridgeCommand): Promise<BridgeMessage> {
     if (cmd.type === 'send' && this.wa) {
-      await this.wa.sendMessage(cmd.to, cmd.text);
-      return { type: 'ack', action: cmd.type, to: cmd.to, status: 'sent' };
+      try {
+        await this.wa.sendMessage(cmd.to, cmd.text);
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: cmd.to,
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'accepted',
+        };
+      } catch (error) {
+        return {
+          type: 'ack',
+          action: cmd.type,
+          to: cmd.to,
+          ...(cmd.requestId ? { requestId: cmd.requestId } : {}),
+          status: 'failed',
+          detail: String(error),
+        };
+      }
     }
 
     if (cmd.type === 'prepare_draft') {

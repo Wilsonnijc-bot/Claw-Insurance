@@ -44,7 +44,6 @@ class MessageBus:
         if (
             self._inbound_observers
             and msg.channel == "whatsapp"
-            and not msg.metadata.get("capture_only")
             and not msg.metadata.get("is_self_chat")
         ):
             msg.metadata["capture_only"] = True
