@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -22,7 +23,7 @@ def test_application_release_version_has_one_source_of_truth() -> None:
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
 
-    assert version == "1.0.0"
+    assert re.fullmatch(r"\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?", version)
     assert f"CLAW_VERSION={version}" in env_example
 
 
@@ -44,6 +45,8 @@ def test_multiarch_publish_script_builds_both_platforms_and_images() -> None:
     assert "claw-insurance-backend" in content
     assert "claw-insurance-frontend" in content
     assert content.count("--push") >= 2
+    assert 'docker buildx ls --format "{{.Name}}"' in content
+    assert "docker buildx inspect $Builder *> $null" not in content
 
 
 def test_docker_image_declares_prebuilt_bridge() -> None:
