@@ -165,6 +165,29 @@ def test_install_windows_helper_falls_back_to_user_startup_folder(monkeypatch, t
     assert "startup.log" in startup_contents
 
 
+def test_frozen_windows_helper_launcher_does_not_require_python(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("NANOBOT_CDP_HELPER_DIR", str(tmp_path / "helper"))
+    executable = tmp_path / "release" / "nanobot-cdp-helper.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"standalone-helper")
+
+    launcher_script, _ = windows_helper._common._write_launcher_script(
+        platform_name="windows",
+        helper_module_file=windows_helper.__file__,
+        shared_module_file=windows_helper._common.__file__,
+        host="0.0.0.0",
+        helper_token="windows-secret",
+        frozen_executable=str(executable),
+    )
+
+    installed = windows_helper._common.helper_executable_path("windows")
+    contents = launcher_script.read_text(encoding="utf-8")
+    assert installed.read_bytes() == b"standalone-helper"
+    assert str(installed) in contents
+    assert " serve --host 0.0.0.0 --port 9230" in contents
+    assert "python" not in contents.lower()
+
+
 def test_windows_launcher_writes_a_diagnostic_log(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("NANOBOT_CDP_HELPER_DIR", str(tmp_path / "helper"))
     launcher_script, _ = windows_helper._common._write_launcher_script(

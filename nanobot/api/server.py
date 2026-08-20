@@ -477,6 +477,7 @@ class ApiServer:
         import subprocess
         from nanobot.runtime.gateway_runtime import (
             bridge_cache_dir,
+            bridge_start_command,
             build_whatsapp_bridge_env,
             get_bridge_dir,
             stop_whatsapp_bridge,
@@ -503,7 +504,7 @@ class ApiServer:
         # 3. Restart bridge
         env = build_whatsapp_bridge_env(self.config)
         proc = subprocess.Popen(
-            ["npm", "start"],
+            bridge_start_command(bridge_dir),
             cwd=bridge_dir,
             env=env,
             start_new_session=True,

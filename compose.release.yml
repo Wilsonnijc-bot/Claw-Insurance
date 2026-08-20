@@ -1,0 +1,85 @@
+x-backend-common: &backend-common
+  image: ${BACKEND_IMAGE:-hendrickyan/claw-insurance-backend}:v${CLAW_VERSION:?Set CLAW_VERSION in .env}
+  pull_policy: always
+  working_dir: /app
+  environment:
+    NANOBOT_PROJECT_ROOT: /app
+    WEB_BROWSER_MODE: ${WEB_BROWSER_MODE:-cdp}
+    WEB_CDP_URL: ${WEB_CDP_URL:-http://host.docker.internal:9222}
+    WEB_CDP_HELPER_URL: ${WEB_CDP_HELPER_URL:-http://host.docker.internal:9230}
+    WEB_CDP_HELPER_TOKEN: ${WEB_CDP_HELPER_TOKEN:-}
+    WEB_CDP_HELPER_PLATFORM: ${WEB_CDP_HELPER_PLATFORM:-}
+    WEB_HOST_PROFILE_DIR: ${WEB_HOST_PROFILE_DIR:-./whatsapp-web}
+    WEB_HISTORY_SYNC_ENABLED: ${WEB_HISTORY_SYNC_ENABLED:-true}
+    BRIDGE_STARTUP_TIMEOUT_SECONDS: ${BRIDGE_STARTUP_TIMEOUT_SECONDS:-60}
+  volumes:
+    - ./config.json:/app/config.json:ro
+    - ./google.json:/app/google.json:ro
+    - ./supabase.json:/app/supabase.json:ro
+    - ./secrets:/app/secrets:ro
+    - ./runtime/data:/app/data
+    - ./runtime/sessions:/app/sessions
+    - ./runtime/state:/app/state
+    - ./runtime/memory:/app/memory
+    - ./runtime/media:/app/media
+    - ./runtime/cron:/app/cron
+    - ./runtime/skills:/app/skills
+    - ./whatsapp-auth:/app/whatsapp-auth
+    - ./whatsapp-web:/app/whatsapp-web
+    - ./whatsapp-web-debug:/app/whatsapp-web-debug
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  mock-cloud:
+    <<: *backend-common
+    container_name: claw-insurance-mock-cloud
+    entrypoint: ["python3", "-m", "nanobot.demo.mock_cloud"]
+    command: ["--port", "5050"]
+    environment:
+      MOCK_DB_API_KEY: demo-db-key
+      MOCK_INTERVIEW_API_KEY: demo-interview-key
+      MOCK_AI_API_KEY: demo-ai-key
+    restart: unless-stopped
+    ports:
+      - "5050:5050"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nanobot-gateway:
+    <<: *backend-common
+    container_name: nanobot-gateway
+    command: ["--api-port", "3456"]
+    depends_on:
+      mock-cloud:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "3456:3456"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3456/api/status', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  nanobot-frontend:
+    image: ${FRONTEND_IMAGE:-hendrickyan/claw-insurance-frontend}:v${CLAW_VERSION:?Set CLAW_VERSION in .env}
+    pull_policy: always
+    container_name: nanobot-frontend
+    depends_on:
+      nanobot-gateway:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "8080:80"

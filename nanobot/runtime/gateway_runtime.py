@@ -161,8 +161,33 @@ def bridge_cache_dir() -> Path:
     return project_root() / "state" / "cache" / "whatsapp-bridge"
 
 
+def prebuilt_bridge_dir() -> Path | None:
+    """Return the immutable bridge bundled in the Docker image, when configured."""
+    configured = str(os.environ.get("NANOBOT_PREBUILT_BRIDGE_DIR") or "").strip()
+    if not configured:
+        return None
+
+    bridge_dir = Path(configured).resolve()
+    entrypoint = bridge_dir / "dist" / "index.js"
+    if not entrypoint.is_file():
+        raise RuntimeError(
+            "The prebuilt WhatsApp bridge is incomplete: "
+            f"{entrypoint} does not exist. Rebuild the Docker image."
+        )
+    if not (bridge_dir / "node_modules").is_dir():
+        raise RuntimeError(
+            "The prebuilt WhatsApp bridge has no node_modules directory. "
+            "Rebuild the Docker image with npm ci."
+        )
+    return bridge_dir
+
+
 def get_bridge_dir() -> Path:
-    """Return the cached WhatsApp bridge directory, building it when needed."""
+    """Return the image-bundled bridge or a deterministic development cache."""
+    prebuilt = prebuilt_bridge_dir()
+    if prebuilt is not None:
+        return prebuilt
+
     user_bridge = bridge_cache_dir()
 
     if not shutil.which("npm"):
@@ -190,13 +215,24 @@ def get_bridge_dir() -> Path:
     shutil.copytree(source, user_bridge, ignore=shutil.ignore_patterns("node_modules", "dist"))
 
     try:
-        subprocess.run(["npm", "install"], cwd=user_bridge, check=True, capture_output=True)
+        subprocess.run(["npm", "ci"], cwd=user_bridge, check=True, capture_output=True)
         subprocess.run(["npm", "run", "build"], cwd=user_bridge, check=True, capture_output=True)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
         raise RuntimeError(f"WhatsApp bridge build failed: {stderr[:500]}") from exc
 
     return user_bridge
+
+
+def bridge_start_command(bridge_dir: Path) -> list[str]:
+    """Return the direct Node command for an already-built bridge."""
+    node = shutil.which("node")
+    if not node:
+        raise RuntimeError("node not found. The Docker image must include Node.js.")
+    entrypoint = bridge_dir / "dist" / "index.js"
+    if not entrypoint.is_file():
+        raise RuntimeError(f"WhatsApp bridge entrypoint not found: {entrypoint}")
+    return [node, str(entrypoint)]
 
 
 def bridge_needs_refresh(source: Path, cached: Path) -> bool:
@@ -267,6 +303,13 @@ def ensure_whatsapp_bridge_browser(bridge_dir: Path, config: Config, env: dict[s
         logger.info("Using CDP browser mode for WhatsApp Web; skipping Playwright Chromium install")
         return
 
+    if os.environ.get("NANOBOT_PREBUILT_BRIDGE_DIR", "").strip():
+        raise RuntimeError(
+            "The release container cannot download Playwright Chromium at startup. "
+            "Set channels.whatsapp.web_browser_mode to 'cdp' and install the host "
+            "CDP helper, or build a custom image that already contains Chromium."
+        )
+
     try:
         subprocess.run(
             ["npx", "playwright", "install", "chromium"],
@@ -329,7 +372,7 @@ def start_whatsapp_bridge(config: Config):
 
     logger.info("Starting WhatsApp bridge")
     proc = subprocess.Popen(
-        ["npm", "start"],
+        bridge_start_command(bridge_dir),
         cwd=bridge_dir,
         env=env,
         start_new_session=True,

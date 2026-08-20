@@ -62,6 +62,11 @@ def helper_launcher_script_path(platform_name: str) -> Path:
     return helper_install_dir(platform_name) / f"run-helper{suffix}"
 
 
+def helper_executable_path(platform_name: str) -> Path:
+    suffix = ".exe" if platform_name == "windows" else ""
+    return helper_install_dir(platform_name) / f"nanobot-cdp-helper{suffix}"
+
+
 def helper_stdout_log_path(platform_name: str) -> Path:
     return helper_install_dir(platform_name) / "helper.stdout.log"
 
@@ -534,6 +539,22 @@ def _launcher_script_contents(
     return "\n".join(lines)
 
 
+def _frozen_launcher_script_contents(
+    executable: Path,
+    *,
+    host: str,
+    port: int,
+    token_file: Path | None,
+) -> str:
+    command = (
+        f'exec {shlex.quote(str(executable))} serve --host {shlex.quote(host)} '
+        f'--port {port}'
+    )
+    if token_file is not None:
+        command += f' --token-file {shlex.quote(str(token_file))}'
+    return "\n".join(["#!/bin/sh", "set -eu", command, ""])
+
+
 def _windows_launcher_script_contents(
     python_candidates: list[str],
     *,
@@ -579,6 +600,30 @@ def _windows_launcher_script_contents(
         ]
     )
     return "\r\n".join(lines)
+
+
+def _windows_frozen_launcher_script_contents(
+    executable: Path,
+    *,
+    host: str,
+    port: int,
+    token_file: Path | None,
+) -> str:
+    launch = f'"{executable}" serve --host {host} --port {port}'
+    if token_file is not None:
+        launch += f' --token-file "{token_file}"'
+    return "\r\n".join(
+        [
+            "@echo off",
+            "setlocal EnableExtensions",
+            'set "LOG_FILE=%~dp0helper.log"',
+            'curl.exe --silent --fail --max-time 2 "http://127.0.0.1:9230/healthz" >nul 2>&1',
+            "if not errorlevel 1 exit /b 0",
+            f'{launch} >> "%LOG_FILE%" 2>&1',
+            "exit /b %ERRORLEVEL%",
+            "",
+        ]
+    )
 
 
 def _linux_systemd_unit_contents(launcher_script: Path, working_directory: Path) -> str:
@@ -637,12 +682,8 @@ def _write_launcher_script(
     shared_module_file: str,
     host: str,
     helper_token: str = "",
+    frozen_executable: str = "",
 ) -> tuple[Path, Path | None]:
-    helper_py, _shared_py = _write_helper_source_files(
-        platform_name=platform_name,
-        helper_module_file=helper_module_file,
-        shared_module_file=shared_module_file,
-    )
     install_dir = helper_install_dir(platform_name)
     install_dir.mkdir(parents=True, exist_ok=True)
     token_file: Path | None = None
@@ -650,6 +691,38 @@ def _write_launcher_script(
         token_file = write_helper_token(helper_token, platform_name=platform_name)
 
     launcher_script = helper_launcher_script_path(platform_name)
+    if frozen_executable:
+        source_executable = Path(frozen_executable).resolve()
+        installed_executable = helper_executable_path(platform_name)
+        if source_executable != installed_executable.resolve():
+            shutil.copy2(source_executable, installed_executable)
+        if platform_name != "windows":
+            installed_executable.chmod(0o755)
+        contents = (
+            _windows_frozen_launcher_script_contents(
+                installed_executable,
+                host=host,
+                port=DEFAULT_HELPER_PORT,
+                token_file=token_file,
+            )
+            if platform_name == "windows"
+            else _frozen_launcher_script_contents(
+                installed_executable,
+                host=host,
+                port=DEFAULT_HELPER_PORT,
+                token_file=token_file,
+            )
+        )
+        launcher_script.write_text(contents, encoding="utf-8")
+        if platform_name != "windows":
+            launcher_script.chmod(0o755)
+        return launcher_script, token_file
+
+    helper_py, _shared_py = _write_helper_source_files(
+        platform_name=platform_name,
+        helper_module_file=helper_module_file,
+        shared_module_file=shared_module_file,
+    )
     if platform_name == "windows":
         launcher_script.write_text(
             _windows_launcher_script_contents(
@@ -702,6 +775,7 @@ def install_linux_helper(
     helper_module_file: str,
     shared_module_file: str,
     helper_token: str = "",
+    frozen_executable: str = "",
 ) -> dict[str, str]:
     install_dir = helper_install_dir("linux")
     install_dir.mkdir(parents=True, exist_ok=True)
@@ -711,6 +785,7 @@ def install_linux_helper(
         shared_module_file=shared_module_file,
         host=helper_bind_host("linux"),
         helper_token=helper_token or load_or_create_helper_token("linux"),
+        frozen_executable=frozen_executable,
     )
 
     service_path = linux_systemd_service_path()
@@ -749,7 +824,8 @@ def install_linux_helper(
 
     return {
         "install_dir": str(install_dir),
-        "helper_script": str(helper_python_script_path("linux")),
+        "helper_script": "" if frozen_executable else str(helper_python_script_path("linux")),
+        "helper_executable": str(helper_executable_path("linux")) if frozen_executable else "",
         "launcher_script": str(launcher_script),
         "service_file": str(service_path),
         "autostart_file": str(autostart_path),
@@ -811,6 +887,7 @@ def install_windows_helper(
     helper_module_file: str,
     shared_module_file: str,
     helper_token: str = "",
+    frozen_executable: str = "",
 ) -> dict[str, str]:
     install_dir = helper_install_dir("windows")
     install_dir.mkdir(parents=True, exist_ok=True)
@@ -820,6 +897,7 @@ def install_windows_helper(
         shared_module_file=shared_module_file,
         host=helper_bind_host("windows"),
         helper_token=helper_token or load_or_create_helper_token("windows"),
+        frozen_executable=frozen_executable,
     )
 
     task_name = windows_task_name()
@@ -882,7 +960,8 @@ def install_windows_helper(
 
     return {
         "install_dir": str(install_dir),
-        "helper_script": str(helper_python_script_path("windows")),
+        "helper_script": "" if frozen_executable else str(helper_python_script_path("windows")),
+        "helper_executable": str(helper_executable_path("windows")) if frozen_executable else "",
         "launcher_script": str(launcher_script),
         "task_name": task_name if task_created else "",
         "startup_entry": str(startup_entry) if not task_created else "",

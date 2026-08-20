@@ -14,12 +14,14 @@ RUN apt-get update && \
 
 WORKDIR /app
 ENV NANOBOT_PROJECT_ROOT=/app
+ENV NANOBOT_PREBUILT_BRIDGE_DIR=/app/bridge
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+ENV PATH="/app/.venv/bin:$PATH"
 
-# Install Python dependencies first (cached layer)
-COPY pyproject.toml README.md LICENSE ./
-RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
-    uv pip install --system --no-cache . && \
-    rm -rf nanobot bridge
+# Install the locked Python dependencies first (cached layer).
+COPY pyproject.toml uv.lock README.md LICENSE ./
+RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy the full source and install
 COPY nanobot/ nanobot/
@@ -27,12 +29,12 @@ COPY bridge/ bridge/
 COPY config.example.json /app/config.json
 COPY google.example.json /app/google.json
 COPY supabase.example.json /app/supabase.json
-RUN uv pip install --system --no-cache . && \
+RUN uv sync --frozen --no-dev && \
     python3 -c "import google.cloud.speech_v2"
 
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
-RUN npm ci && npm run build
+RUN npm ci && npm run build && npm prune --omit=dev
 WORKDIR /app
 
 # Create project-local runtime directories

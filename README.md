@@ -204,6 +204,66 @@ docker compose restart nanobot-gateway
 
 Changes to `config.json` normally need `docker compose restart nanobot-gateway`. Changes to backend dependencies, the frontend, a Dockerfile, or Compose should use `docker compose up -d --build`.
 
+## Customer Release Runtime
+
+`docker-compose.yml` is the source-development stack: it builds local images
+and mounts the repository at `/workspace`. Customer installations use
+`compose.release.yml`, which pulls two immutable release images and mounts only
+configuration and persistent runtime data:
+
+- `${BACKEND_IMAGE}:v${CLAW_VERSION}` — Python gateway, Nanobot core, mock cloud,
+  and the prebuilt WhatsApp Bridge
+- `${FRONTEND_IMAGE}:v${CLAW_VERSION}` — React static application served by Nginx
+
+Both image repositories share the publishing version stored in `VERSION`.
+The release script requires the customer bundle's `.env.example` to contain the
+same version. Customer Compose refuses to start when `CLAW_VERSION` is missing,
+instead of silently pulling an unintended tag. Copy `.env.example` to `.env` to
+select the release version or override repository names. The default
+repositories are:
+
+```text
+hendrickyan/claw-insurance-backend
+hendrickyan/claw-insurance-frontend
+```
+
+One-command customer setup requires Docker Desktop and Chrome. Release bundles
+include a native `cdp-helper` executable, so customers do not need Python. A
+Python 3.10+ fallback is used only when running these scripts directly from the
+source repository without the bundled helper:
+
+```powershell
+.\scripts\setup-windows.ps1
+```
+
+```bash
+bash scripts/setup-macos.sh
+bash scripts/setup-linux.sh
+```
+
+The setup command creates missing local configuration files and runtime
+directories, installs the host CDP helper, pulls both release images, and starts
+the stack. Use `-SkipCdpHelper` on Windows or `SKIP_CDP_HELPER=true` on macOS and
+Linux when WhatsApp Web history synchronization is not required.
+
+The Docker image contains an already compiled WhatsApp Bridge and its locked
+Node dependencies. Container startup runs that compiled entrypoint directly;
+it does not run `npm install` or rebuild TypeScript at runtime.
+
+### Publish a multi-platform release
+
+Create the two Docker Hub repositories once, sign in with `docker login`, then
+run the release script from a clean Git worktree:
+
+```powershell
+.\scripts\publish-multiarch.ps1
+```
+
+The script reads `VERSION`, builds both images for `linux/amd64` and
+`linux/arm64`, pushes the versioned tags plus `latest`, and inspects the
+published image indexes. Pass `-SkipLatest` when only the immutable version tag
+should be updated.
+
 ## Key Features
 
 - RAG-powered insurance reply generation using configured catalog data

@@ -7,14 +7,19 @@ dist/
 build/
 .git
 .env
+.env.*
+!.env.example
 .assets
 node_modules/
 bridge/dist/
 workspace/
 config.json
+google.json
+supabase.json
 googleconfig.json
 supabaseconfig.json
 secrets/
+runtime/
 data/
 sessions/
 state/
@@ -25,3 +30,7 @@ whatsapp-auth/
 whatsapp-web/
 whatsapp-web-debug/
 docs/
+*.db
+*.sqlite
+*.sqlite3
+*.log

@@ -128,11 +128,12 @@ def wait_for_helper(helper_url: str = DEFAULT_HELPER_URL, timeout_s: float = 5.0
     return _common.wait_for_helper(helper_url, timeout_s=timeout_s)
 
 
-def install_windows_helper(helper_token: str = "") -> dict[str, str]:
+def install_windows_helper(helper_token: str = "", frozen_executable: str = "") -> dict[str, str]:
     return _common.install_windows_helper(
         helper_module_file=__file__,
         shared_module_file=_common.__file__,
         helper_token=helper_token,
+        frozen_executable=frozen_executable,
     )
 
 

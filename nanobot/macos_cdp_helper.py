@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -40,6 +41,11 @@ def helper_python_script_path() -> Path:
 def helper_launcher_script_path() -> Path:
     """Return the installed helper launcher shell script path."""
     return helper_install_dir() / "run-helper.sh"
+
+
+def helper_executable_path() -> Path:
+    """Return the installed standalone helper executable path."""
+    return helper_install_dir() / "nanobot-cdp-helper"
 
 
 def helper_stdout_log_path() -> Path:
@@ -340,11 +346,22 @@ def _launcher_script_contents(python_candidates: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _frozen_launcher_script_contents(executable: Path) -> str:
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            "set -eu",
+            f"exec {shlex.quote(str(executable))} serve --host {DEFAULT_HELPER_HOST} --port {DEFAULT_HELPER_PORT}",
+            "",
+        ]
+    )
+
+
 def _launchctl_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
-def install_launchd_helper() -> dict[str, str]:
+def install_launchd_helper(frozen_executable: str = "") -> dict[str, str]:
     """Install and start the per-user launchd helper on macOS."""
     if os.uname().sysname != "Darwin":
         raise RuntimeError("The macOS CDP helper can only be installed on macOS.")
@@ -353,16 +370,28 @@ def install_launchd_helper() -> dict[str, str]:
     install_dir.mkdir(parents=True, exist_ok=True)
     helper_launch_agent_path().parent.mkdir(parents=True, exist_ok=True)
 
-    source_path = Path(__file__).resolve()
-    helper_python_script_path().write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
-
-    python_candidates = []
-    for candidate in [sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]:
-        if candidate and candidate not in python_candidates:
-            python_candidates.append(candidate)
-
     launcher_script = helper_launcher_script_path()
-    launcher_script.write_text(_launcher_script_contents(python_candidates), encoding="utf-8")
+    if frozen_executable:
+        source_executable = Path(frozen_executable).resolve()
+        installed_executable = helper_executable_path()
+        if source_executable != installed_executable.resolve():
+            shutil.copy2(source_executable, installed_executable)
+        installed_executable.chmod(0o755)
+        launcher_script.write_text(
+            _frozen_launcher_script_contents(installed_executable),
+            encoding="utf-8",
+        )
+    else:
+        source_path = Path(__file__).resolve()
+        helper_python_script_path().write_text(
+            source_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        python_candidates = []
+        for candidate in [sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]:
+            if candidate and candidate not in python_candidates:
+                python_candidates.append(candidate)
+        launcher_script.write_text(_launcher_script_contents(python_candidates), encoding="utf-8")
     launcher_script.chmod(0o755)
 
     plist_payload = {
@@ -405,7 +434,8 @@ def install_launchd_helper() -> dict[str, str]:
 
     return {
         "install_dir": str(install_dir),
-        "helper_script": str(helper_python_script_path()),
+        "helper_script": "" if frozen_executable else str(helper_python_script_path()),
+        "helper_executable": str(helper_executable_path()) if frozen_executable else "",
         "launcher_script": str(launcher_script),
         "launch_agent": str(helper_launch_agent_path()),
         "helper_url": DEFAULT_HELPER_URL,
