@@ -1,0 +1,41 @@
+{
+  "providers": {
+    "litellm": {
+      "baseUrl": "https://YOUR_LITELLM_DOMAIN/v1",
+      "apiKey": "CUSTOMER_VIRTUAL_KEY"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "YOUR_MODEL_ALIAS",
+      "provider": "litellm",
+      "temperature": 1.0
+    }
+  },
+  "channels": {
+    "whatsapp": {
+      "enabled": true,
+      "deliveryMode": "draft",
+      "bridgeUrl": "ws://localhost:3001"
+    }
+  },
+  "interviewProxy": {
+    "baseUrl": "https://YOUR_INTERVIEW_PROXY_DOMAIN",
+    "apiKey": "CUSTOMER_VIRTUAL_KEY"
+  },
+  "privacyGateway": {
+    "enabled": true,
+    "failClosed": true,
+    "saveRedactedDebug": false,
+    "textOnlyScope": true
+  },
+  "gateway": {
+    "heartbeat": {
+      "enabled": false
+    }
+  },
+  "tools": {
+    "restrictToWorkspace": true
+  }
+}
+

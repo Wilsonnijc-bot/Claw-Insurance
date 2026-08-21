@@ -1,0 +1,17 @@
+{
+  "supabaseUrl": "",
+  "supabaseAnonKey": "",
+  "supabaseProjectRef": "",
+  "supabaseCatalogTables": [
+    "insurance_products",
+    "dental_insurance"
+  ],
+  "autoRestorePausedProject": false,
+  "restoreTimeoutSeconds": 300,
+  "cacheTtlSeconds": 0,
+  "dbProxy": {
+    "baseUrl": "https://YOUR_DB_PROXY_DOMAIN",
+    "apiKey": "CUSTOMER_VIRTUAL_KEY"
+  }
+}
+

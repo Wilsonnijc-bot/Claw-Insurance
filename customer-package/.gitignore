@@ -1,0 +1,13 @@
+.env
+config.json
+google.json
+supabase.json
+runtime/
+whatsapp-auth/
+whatsapp-web/
+whatsapp-web-debug/
+secrets/*
+!secrets/.gitkeep
+cdp-helper/nanobot-cdp-helper
+cdp-helper/nanobot-cdp-helper.exe
+
